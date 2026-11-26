@@ -1,9 +1,11 @@
-import { app, BrowserWindow, ipcMain, Menu, nativeImage, shell, Tray } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, shell, Tray } from "electron";
 import { execFile } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { createElectronClipboardAdapter } from "./services/clipboardSyncManager";
 import { ControlClient, type PairRequestItem } from "./services/controlClient";
 import { EasyTierManager } from "./services/easytierManager";
 import {
@@ -30,6 +32,7 @@ import {
 } from "./services/hostAgentAuth";
 import { AgentClientError, HostAgentClient } from "./services/hostAgentClient";
 import { HostAgentServer } from "./services/hostAgentServer";
+import { createHostTransferExtraRoute } from "./services/hostTransferService";
 import {
   getHostMasterMute,
   listHostDisplays,
@@ -54,12 +57,15 @@ import type {
   AppRuntimeState,
   BootstrapConfig,
   ConnectDeviceResult,
+  DeviceAgentSessionResult,
   DeviceInfo,
   HostHardwareInfo,
   ProvisionStage,
+  RemoteFileListing,
   SessionHotkeyAction,
   StreamPreset,
   SystemActionType,
+  TransferTaskItem,
 } from "./types";
 
 const execFileAsync = promisify(execFile);
@@ -152,6 +158,13 @@ const hostAgentServer = new HostAgentServer({
   getMeshCidr: getDefaultMeshCidr,
   allowLoopback: true,
   handlers: {
+    onExtraRoute: createHostTransferExtraRoute({
+      clipboard: createElectronClipboardAdapter({ clipboard, nativeImage }),
+      onFileReceived: (info) => {
+        pushPairLog(`收到传输文件 [${info.filename}] (${Math.round(info.size / 1024)} KB)`);
+        emitState();
+      },
+    }),
     getHostInfo: async () => {
       const s = store.get();
       const muted = await getHostMasterMute().catch(() => false);
@@ -171,7 +184,15 @@ const hostAgentServer = new HostAgentServer({
         autoLockOnDisconnect: s.autoLockOnDisconnect,
         apolloPort: hostInfoCache.apolloPort,
         apolloReady: hostInfoCache.apolloRunning && apolloAuthReady,
-        capabilities: ["displays", "audio_mute", "privacy_screen", "system_actions", "temp_password"],
+        capabilities: [
+          "displays",
+          "audio_mute",
+          "privacy_screen",
+          "system_actions",
+          "temp_password",
+          "files",
+          "clipboard",
+        ],
       };
     },
     listDisplays: async () => listHostDisplays(),
@@ -803,6 +824,272 @@ ipcMain.handle("session:runSystemAction", async (_evt, action: SystemActionType)
 );
 ipcMain.handle("session:setAutoLock", async (_evt, enabled: boolean) =>
   sessionManager.setAutoLockOnDisconnect(Boolean(enabled)),
+);
+
+// --- Stage 3 session file / clipboard IPC ---
+ipcMain.handle("session:listRemoteFiles", async (_evt, dirPath?: string) =>
+  sessionManager.listRemoteFiles(typeof dirPath === "string" && dirPath.trim() ? dirPath : undefined),
+);
+
+ipcMain.handle(
+  "session:uploadFiles",
+  async (_evt, args: { localPaths?: string[]; targetDir?: string } = {}) =>
+    sessionManager.uploadFiles(
+      Array.isArray(args.localPaths) ? args.localPaths : [],
+      typeof args.targetDir === "string" && args.targetDir.trim() ? args.targetDir : undefined,
+    ),
+);
+
+ipcMain.handle("session:pickAndUploadFiles", async (_evt, targetDir?: string) => {
+  const picked = await dialog.showOpenDialog({
+    title: "选择要上传到被控端的文件",
+    properties: ["openFile", "multiSelections"],
+  });
+  if (picked.canceled || picked.filePaths.length === 0) return [] as TransferTaskItem[];
+  return sessionManager.uploadFiles(
+    picked.filePaths,
+    typeof targetDir === "string" && targetDir.trim() ? targetDir : undefined,
+  );
+});
+
+ipcMain.handle(
+  "session:downloadRemoteFile",
+  async (_evt, args: { remotePath?: string; suggestedName?: string } = {}) => {
+    const remotePath = typeof args.remotePath === "string" ? args.remotePath.trim() : "";
+    if (!remotePath) throw new Error("缺少远端文件路径");
+    const suggestedName =
+      typeof args.suggestedName === "string" && args.suggestedName.trim()
+        ? args.suggestedName.trim()
+        : path.win32.basename(remotePath);
+    const saved = await dialog.showSaveDialog({
+      title: "另存远端文件",
+      defaultPath: path.join(app.getPath("downloads"), suggestedName),
+    });
+    if (saved.canceled || !saved.filePath) return null as TransferTaskItem | null;
+    return sessionManager.downloadRemoteFile(remotePath, saved.filePath);
+  },
+);
+
+ipcMain.handle("session:setClipboardSync", async (_evt, enabled: boolean) =>
+  sessionManager.setClipboardSync(Boolean(enabled)),
+);
+
+ipcMain.handle("session:syncClipboardNow", async () => sessionManager.syncClipboardNow());
+
+// --- Stage 3 device-level transfer IPC (works without a video session) ---
+
+/**
+ * Authenticates a Host Companion Agent session for a device without launching
+ * Apollo/Moonlight, so the DevicesView file transfer modal can browse and
+ * exchange files on its own.
+ */
+ipcMain.handle(
+  "device:prepareAgent",
+  async (
+    _evt,
+    device: DeviceInfo,
+    opts?: { password?: string; rememberPassword?: boolean },
+  ): Promise<DeviceAgentSessionResult> => {
+    if (!device || !device.mesh_ip) {
+      return { ok: false, message: "设备信息不完整", agentPort: DEFAULT_AGENT_PORT, agentToken: "" };
+    }
+    const session = await ensureRemoteAgentSession(device, opts);
+    if (!session.ok) {
+      return {
+        ok: false,
+        needsPassword: session.needsPassword,
+        retryAfterSec: session.retryAfterSec,
+        message: session.message,
+        agentPort: device.agent_port || DEFAULT_AGENT_PORT,
+        agentToken: "",
+      };
+    }
+    if (!session.agentConnected || !session.token) {
+      return {
+        ok: false,
+        message: "目标主机未启用 Host Companion Agent，无法使用文件快传。",
+        agentPort: session.port,
+        agentToken: "",
+      };
+    }
+    return {
+      ok: true,
+      message: "已连接文件通道",
+      agentPort: session.port,
+      agentToken: session.token,
+    };
+  },
+);
+
+interface TransferTargetArgs {
+  meshIp?: string;
+  port?: number;
+  token?: string;
+  dirPath?: string;
+  localPaths?: string[];
+  targetDir?: string;
+  remotePath?: string;
+  suggestedName?: string;
+}
+
+function resolveTransferTarget(args: TransferTargetArgs): { host: string; port: number; token: string } {
+  const host = typeof args.meshIp === "string" ? args.meshIp.trim() : "";
+  const token = typeof args.token === "string" ? args.token.trim() : "";
+  const port = Number(args.port) || DEFAULT_AGENT_PORT;
+  if (!host) throw new Error("缺少目标主机 Mesh IP");
+  if (!token) throw new Error("文件通道未授权，请重新验证访问密码");
+  return { host, port, token };
+}
+
+ipcMain.handle("transfer:listFiles", async (_evt, args: TransferTargetArgs = {}): Promise<RemoteFileListing> => {
+  const target = resolveTransferTarget(args);
+  return agentClient.listRemoteFiles(
+    target.host,
+    target.port,
+    target.token,
+    typeof args.dirPath === "string" && args.dirPath.trim() ? args.dirPath : undefined,
+  );
+});
+
+ipcMain.handle(
+  "transfer:uploadFiles",
+  async (_evt, args: TransferTargetArgs = {}): Promise<TransferTaskItem[]> => {
+    const target = resolveTransferTarget(args);
+    const paths = (Array.isArray(args.localPaths) ? args.localPaths : [])
+      .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+      .filter(Boolean);
+    if (paths.length === 0) return [];
+    const targetDir =
+      typeof args.targetDir === "string" && args.targetDir.trim() ? args.targetDir : undefined;
+
+    const results: TransferTaskItem[] = [];
+    for (const localPath of paths) {
+      const filename = path.basename(localPath) || localPath;
+      const task: TransferTaskItem = {
+        id: crypto.randomUUID(),
+        direction: "upload",
+        filename,
+        transferred: 0,
+        total: 0,
+        status: "running",
+        localPath,
+      };
+      try {
+        task.total = fs.statSync(localPath).size;
+        const result = await agentClient.uploadFileStream(
+          target.host,
+          target.port,
+          target.token,
+          localPath,
+          { targetDir },
+        );
+        task.status = "done";
+        task.transferred = result.size;
+        task.total = result.size;
+        task.filename = result.filename;
+        task.remotePath = result.path;
+      } catch (err) {
+        task.status = "error";
+        task.message = err instanceof Error ? err.message : String(err);
+      }
+      results.push(task);
+    }
+    return results;
+  },
+);
+
+ipcMain.handle(
+  "transfer:pickAndUploadFiles",
+  async (_evt, args: TransferTargetArgs = {}): Promise<TransferTaskItem[]> => {
+    const target = resolveTransferTarget(args);
+    const picked = await dialog.showOpenDialog({
+      title: "选择要上传到被控端的文件",
+      properties: ["openFile", "multiSelections"],
+    });
+    if (picked.canceled || picked.filePaths.length === 0) return [];
+    const targetDir =
+      typeof args.targetDir === "string" && args.targetDir.trim() ? args.targetDir : undefined;
+
+    const results: TransferTaskItem[] = [];
+    for (const localPath of picked.filePaths) {
+      const filename = path.basename(localPath) || localPath;
+      const task: TransferTaskItem = {
+        id: crypto.randomUUID(),
+        direction: "upload",
+        filename,
+        transferred: 0,
+        total: 0,
+        status: "running",
+        localPath,
+      };
+      try {
+        task.total = fs.statSync(localPath).size;
+        const result = await agentClient.uploadFileStream(
+          target.host,
+          target.port,
+          target.token,
+          localPath,
+          { targetDir },
+        );
+        task.status = "done";
+        task.transferred = result.size;
+        task.total = result.size;
+        task.filename = result.filename;
+        task.remotePath = result.path;
+      } catch (err) {
+        task.status = "error";
+        task.message = err instanceof Error ? err.message : String(err);
+      }
+      results.push(task);
+    }
+    return results;
+  },
+);
+
+ipcMain.handle(
+  "transfer:downloadFile",
+  async (_evt, args: TransferTargetArgs = {}): Promise<TransferTaskItem | null> => {
+    const target = resolveTransferTarget(args);
+    const remotePath = typeof args.remotePath === "string" ? args.remotePath.trim() : "";
+    if (!remotePath) throw new Error("缺少远端文件路径");
+    const suggestedName =
+      typeof args.suggestedName === "string" && args.suggestedName.trim()
+        ? args.suggestedName.trim()
+        : path.win32.basename(remotePath);
+    const saved = await dialog.showSaveDialog({
+      title: "另存远端文件",
+      defaultPath: path.join(app.getPath("downloads"), suggestedName),
+    });
+    if (saved.canceled || !saved.filePath) return null;
+
+    const task: TransferTaskItem = {
+      id: crypto.randomUUID(),
+      direction: "download",
+      filename: path.basename(saved.filePath),
+      transferred: 0,
+      total: 0,
+      status: "running",
+      remotePath,
+      localPath: saved.filePath,
+    };
+    try {
+      const result = await agentClient.downloadFileStream(
+        target.host,
+        target.port,
+        target.token,
+        remotePath,
+        saved.filePath,
+      );
+      task.status = "done";
+      task.transferred = result.size;
+      task.total = result.size;
+      task.localPath = result.path;
+    } catch (err) {
+      task.status = "error";
+      task.message = err instanceof Error ? err.message : String(err);
+    }
+    return task;
+  },
 );
 
 ipcMain.handle(

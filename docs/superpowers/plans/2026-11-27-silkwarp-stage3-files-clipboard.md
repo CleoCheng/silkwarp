@@ -23,11 +23,11 @@
 | A4 | 传输路由：list / upload / download / clipboard GET+POST，流式落盘与 `.part` 生命周期 | `electron/services/hostTransferService.ts` | ✅ 已完成 |
 | A5 | 客户端扩展：`listRemoteFiles` / `uploadFileStream` / `downloadFileStream` / `getRemoteClipboard` / `setRemoteClipboard` | `electron/services/hostAgentClient.ts` | ✅ 已完成 |
 | A6 | 测试：单元 + 真实 HTTP 回环集成（鉴权、2 MB 上传、重名、下载、413、剪贴板、中断清理） | `scripts/test_stage3_transfer.cjs` | ✅ 已完成 |
-| B1 | 主进程接线：`main.ts` 构造 `createHostTransferExtraRoute`，注入 Electron `clipboard` 适配器与接收目录 | `electron/main.ts`、`electron/services/clipboardAdapter.ts` | 待办 |
-| B2 | 剪贴板轮询与回环抑制：主控端 `setInterval` 读本机剪贴板 → 指纹比对 → `setRemoteClipboard`；反向同理 | `electron/main.ts`、`electron/services/clipboardSync.ts` | 待办 |
-| B3 | IPC / preload / bridge：`transfer:*` 通道、`webUtils.getPathForFile` 拖拽桥 | `electron/preload.ts`、`src/bridge.ts`、`electron/types.ts` | 待办 |
-| B4 | 渲染层：远端文件抽屉（面包屑、roots 快捷入口、上传/下载进度）、拖拽投放区、剪贴板开关 | `src/components/*` | 待办 |
-| B5 | 实机验收 + 全量回归 + 提交 | — | 待办 |
+| B1 | 主进程接线：`main.ts` 构造 `createHostTransferExtraRoute`，注入 Electron `clipboard` 适配器与接收目录 | `electron/main.ts`、`electron/services/clipboardSyncManager.ts` | ✅ 已完成 |
+| B2 | 剪贴板轮询与回环抑制：主控端 `setInterval` 读本机剪贴板 → 指纹比对 → `setRemoteClipboard`；反向同理 | `electron/services/clipboardSyncManager.ts`、`electron/services/streamSessionManager.ts` | ✅ 已完成 |
+| B3 | IPC / preload / bridge：`session:*` / `transfer:*` 通道、`webUtils.getPathForFile` 拖拽桥 | `electron/preload.ts`、`src/bridge.ts`、`electron/types.ts` | ✅ 已完成 |
+| B4 | 渲染层：远端文件抽屉（roots 快捷入口、面包屑、上传/下载进度）、拖拽投放区、剪贴板开关 | `src/components/SessionBar.tsx`、`src/components/DevicesView.tsx` | ✅ 已完成 |
+| B5 | 实机验收 + 全量回归 + 提交 | — | ✅ 自动化回归已完成 |
 
 ## Part A 实现摘要
 
@@ -113,21 +113,18 @@ setRemoteClipboard(host, port, token, payload)
 - 30 个用例，覆盖 4 组单元（净化/唯一/约束/指纹）+ 11 组 HTTP 集成（鉴权、上传、列表、下载、受限目录、超限、声明超限、中断清理、文件名来源、并发同名、剪贴板三态）。
 - Windows 回环 SYN 丢失沿用阶段 2 的"换端口重试启动"规避；临时目录 `mkdtemp` 并 `test.after` 清理。
 
-## Part B 实施步骤（待办）
+## Part B 实现摘要（已完成）
 
-1. **主进程接线**（`electron/main.ts`）：
-   - 在 `HostAgentServer` 的 `handlers.onExtraRoute` 注入 `createHostTransferExtraRoute({ clipboard: electronClipboardAdapter, defaultReceiveDir, restrictToRoots: false })`；
-   - `electronClipboardAdapter`：`read()` 读 `clipboard.readText()` / `readImage().toPNG()` / `readBuffer("FileNameW")` 解析文件列表；`write()` 按 kind 调用 `clipboard.writeText` / `writeImage(nativeImage.createFromBuffer)` / 写 `FileNameW` 缓冲区。
-2. **剪贴板同步循环**：
-   - 主控端与被控端各起一个 `setInterval`（建议 800 ms），读取本机剪贴板 → `computeClipboardFingerprint` → 与 `lastAppliedFingerprint` 比对 → 变化才推送远端；
-   - 应用远端载荷后把其指纹写入 `lastAppliedFingerprint`，形成闭环抑制；
-   - 会话断开、隐私幕布开启、设置关闭时暂停轮询。
-3. **IPC / preload / bridge**：
-   - `transfer:listRemoteFiles`、`transfer:upload`、`transfer:download`、`transfer:getClipboard`、`transfer:setClipboard`、`transfer:setSyncEnabled`；
-   - `preload.ts` 用 `webUtils.getPathForFile` 暴露拖拽路径桥；
-   - `src/bridge.ts` 增加对应类型化方法。
-4. **渲染层**：文件抽屉（roots 快捷入口、面包屑、目录/文件列表、上传/下载进度条）、拖拽投放区、剪贴板同步开关。
-5. **验证**：`npx tsc -p tsconfig.node.json`、全部 `node --test`、`python -m unittest discover -s server/control-plane/tests -v`、实机验收。
+1. **`electron/services/clipboardSyncManager.ts`**（零顶层 `electron` import）
+   - `MAX_CLIPBOARD_AUTO_FILES_BYTES = 50 MiB`；`createElectronClipboardAdapter(deps?)` 缺省时惰性 `require("electron")`；
+   - Windows `CF_HDROP` 走 `powershell.exe -STA -NoProfile -NonInteractive -EncodedCommand`，脚本内 `Add-Type -AssemblyName System.Windows.Forms;`，JSON 行以 `<<<SILKWARP_CFILES>>>` / `<<<SILKWARP_END>>>` 分帧，超时 3000 ms；
+   - `read()` 优先级：文件 → PNG 图片（≤10 MiB）→ 文本 → `empty`；
+   - `ClipboardSyncManager`：`enabled` / `lastLocalFp` / `lastRemoteFp` / `lastKind` / `lastSyncedAt` / `lastError` / `inFlight`，`start()` 900 ms 轮询，`syncOnce()` 单飞，文件自动镜像受 50 MiB 约束，反向文件下载到 `~/Desktop/SilkWarpRecv` 并写回本地 `CF_HDROP`。
+2. **`electron/services/streamSessionManager.ts`**：会话内持有 `ClipboardSyncManager` 与最近 12 条 `TransferTaskItem`；新增 `listRemoteFiles` / `uploadFiles` / `downloadRemoteFile` / `setClipboardSync` / `syncClipboardNow`，进度以 ~10 Hz 节流广播。
+3. **`electron/main.ts`**：`onExtraRoute` 注入 `createHostTransferExtraRoute`，能力声明追加 `files` / `clipboard`；新增 `session:*` 与 `device:prepareAgent` / `transfer:*` IPC（无需视频会话即可传文件）。
+4. **`preload.ts` / `src/bridge.ts`**：暴露 `webUtils.getPathForFile` 与全部 Stage 3 方法，预览模式提供完整内存态 mock。
+5. **渲染层**：`SessionBar` 折叠/展开双形态拖放、剪贴板开关 + 立即同步 + 状态徽标、传输进度条、可折叠远程文件浏览器；`DevicesView` 新增「传文件」与 Mesh 文件快传模态框（复用访问密码弹窗）。
+6. **测试**：`test_stage3_transfer.cjs` 增加 11 个剪贴板用例（文本/图片/文件双向回环抑制、50 MiB 跳过、反向下载、单飞锁、适配器优先级与超限拒绝）。
 
 ## 验证命令
 

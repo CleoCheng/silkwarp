@@ -1,12 +1,15 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 import type {
   ActiveSessionState,
   AppRuntimeState,
   ConnectDeviceResult,
+  DeviceAgentSessionResult,
   DeviceInfo,
+  RemoteFileListing,
   SessionHotkeyAction,
   StreamPreset,
   SystemActionType,
+  TransferTaskItem,
   UserInfo,
 } from "./types";
 
@@ -100,6 +103,52 @@ const api = {
     ipcRenderer.invoke("session:runSystemAction", action),
   setSessionAutoLock: (enabled: boolean): Promise<ActiveSessionState | null> =>
     ipcRenderer.invoke("session:setAutoLock", enabled),
+  // --- Stage 3: session-scoped file transfer + clipboard sync ---
+  listSessionFiles: (dirPath?: string): Promise<RemoteFileListing> =>
+    ipcRenderer.invoke("session:listRemoteFiles", dirPath),
+  uploadSessionFiles: (localPaths: string[], targetDir?: string): Promise<TransferTaskItem[]> =>
+    ipcRenderer.invoke("session:uploadFiles", { localPaths, targetDir }),
+  pickAndUploadSessionFiles: (targetDir?: string): Promise<TransferTaskItem[]> =>
+    ipcRenderer.invoke("session:pickAndUploadFiles", targetDir),
+  downloadSessionFile: (remotePath: string, suggestedName?: string): Promise<TransferTaskItem | null> =>
+    ipcRenderer.invoke("session:downloadRemoteFile", { remotePath, suggestedName }),
+  setSessionClipboardSync: (enabled: boolean): Promise<ActiveSessionState | null> =>
+    ipcRenderer.invoke("session:setClipboardSync", enabled),
+  syncSessionClipboardNow: (): Promise<ActiveSessionState | null> =>
+    ipcRenderer.invoke("session:syncClipboardNow"),
+  // --- Stage 3: device-scoped file transfer (no video session needed) ---
+  prepareDeviceAgent: (
+    device: DeviceInfo,
+    opts?: ConnectOptions,
+  ): Promise<DeviceAgentSessionResult> => ipcRenderer.invoke("device:prepareAgent", device, opts),
+  listDeviceFiles: (args: {
+    meshIp: string;
+    port: number;
+    token: string;
+    dirPath?: string;
+  }): Promise<RemoteFileListing> => ipcRenderer.invoke("transfer:listFiles", args),
+  uploadDeviceFiles: (args: {
+    meshIp: string;
+    port: number;
+    token: string;
+    localPaths: string[];
+    targetDir?: string;
+  }): Promise<TransferTaskItem[]> => ipcRenderer.invoke("transfer:uploadFiles", args),
+  pickAndUploadDeviceFiles: (args: {
+    meshIp: string;
+    port: number;
+    token: string;
+    targetDir?: string;
+  }): Promise<TransferTaskItem[]> => ipcRenderer.invoke("transfer:pickAndUploadFiles", args),
+  downloadDeviceFile: (args: {
+    meshIp: string;
+    port: number;
+    token: string;
+    remotePath: string;
+    suggestedName?: string;
+  }): Promise<TransferTaskItem | null> => ipcRenderer.invoke("transfer:downloadFile", args),
+  /** Electron 35: `File.path` was removed; resolve OS paths via `webUtils`. */
+  getPathForFile: (file: File): string => webUtils.getPathForFile(file),
   setAccessPassword: (payload: AccessPasswordPayload): Promise<AppRuntimeState> =>
     ipcRenderer.invoke("host:setAccessPassword", payload),
   rotateTempPassword: (): Promise<AppRuntimeState> => ipcRenderer.invoke("host:rotateTempPassword"),

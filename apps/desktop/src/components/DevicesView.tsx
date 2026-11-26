@@ -1,7 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowDownToLine,
+  ChevronLeft,
   Cpu,
   Edit3,
+  File as FileIcon,
+  Folder,
+  FolderOpen,
   KeyRound,
   Loader2,
   Lock,
@@ -10,15 +15,23 @@ import {
   Power,
   RefreshCw,
   Trash2,
+  Upload,
   Wifi,
   WifiOff,
   X,
   Zap,
 } from "lucide-react";
-import type { ConnectDeviceResult, DeviceInfo, StreamPreset } from "../../electron/types";
+import { getBridge } from "../bridge";
+import type {
+  ConnectDeviceResult,
+  DeviceInfo,
+  RemoteFileListing,
+  StreamPreset,
+  TransferTaskItem,
+} from "../../electron/types";
 import type { ConnectOptions } from "../../electron/preload";
 
-type ConnectMode = "connect" | "stream" | "rustdesk";
+type ConnectMode = "connect" | "stream" | "rustdesk" | "transfer";
 
 interface PasswordPrompt {
   device: DeviceInfo;
@@ -31,6 +44,7 @@ const MODE_LABELS: Record<ConnectMode, string> = {
   connect: "高清串流",
   stream: "高清串流",
   rustdesk: "RustDesk 办公",
+  transfer: "Mesh 文件快传",
 };
 
 interface DevicesViewProps {
@@ -57,6 +71,16 @@ const QUICK_PRESETS: Array<{ label: string; preset: Pick<StreamPreset, "resoluti
   { label: "极致原画 · 4K 60帧", preset: { resolution: "3840x2160", fps: 60, bitrateMbps: 60 } },
 ];
 
+/**
+ * `dragenter`/`dragover` expose the payload only through `types`; `files` is
+ * empty until `drop`, and some sources omit the `Files` entry entirely.
+ */
+function isFileDrag(data: DataTransfer | null): boolean {
+  if (!data) return false;
+  if (data.files.length > 0) return true;
+  return Array.from(data.types).includes("Files");
+}
+
 export function DevicesView({
   devices,
   selfDeviceId,
@@ -82,6 +106,17 @@ export function DevicesView({
   const [passwordError, setPasswordError] = useState("");
   const [retryCountdown, setRetryCountdown] = useState(0);
   const [submittingPassword, setSubmittingPassword] = useState(false);
+
+  const bridge = useMemo(() => getBridge(), []);
+  const [transferDevice, setTransferDevice] = useState<DeviceInfo | null>(null);
+  const [transferToken, setTransferToken] = useState("");
+  const [transferPort, setTransferPort] = useState(19580);
+  const [transferListing, setTransferListing] = useState<RemoteFileListing | null>(null);
+  const [transferBusy, setTransferBusy] = useState(false);
+  const [transferError, setTransferError] = useState("");
+  const [transferTasks, setTransferTasks] = useState<TransferTaskItem[]>([]);
+  const [transferDragActive, setTransferDragActive] = useState(false);
+  const transferDragDepth = useRef(0);
 
   useEffect(() => {
     if (retryCountdown <= 0) return;
@@ -154,6 +189,10 @@ export function DevicesView({
     setPasswordError("");
     try {
       const { device, mode } = passwordPrompt;
+      if (mode === "transfer") {
+        await openTransferModal(device, { password, rememberPassword });
+        return;
+      }
       const invoke = mode === "rustdesk" ? onRustDesk : mode === "stream" ? onStream : onConnect;
       setConnectingId(device.id);
       const res = await invoke(device, { password, rememberPassword });
@@ -189,6 +228,192 @@ export function DevicesView({
     } catch (err) {
       notify(err instanceof Error ? err.message : "更新失败");
     }
+  }
+
+  // --- Stage 3: Mesh file quick-transfer modal ----------------------------
+
+  function closeTransferModal() {
+    setTransferDevice(null);
+    setTransferToken("");
+    setTransferListing(null);
+    setTransferError("");
+    setTransferTasks([]);
+    setTransferDragActive(false);
+    transferDragDepth.current = 0;
+  }
+
+  async function loadDeviceFiles(dirPath?: string, tokenOverride?: string) {
+    const device = transferDevice;
+    if (!device) return;
+    const token = tokenOverride ?? transferToken;
+    if (!token) return;
+    setTransferBusy(true);
+    setTransferError("");
+    try {
+      const listing = await bridge.listDeviceFiles({
+        meshIp: device.mesh_ip,
+        port: transferPort,
+        token,
+        dirPath,
+      });
+      setTransferListing(listing);
+    } catch (err) {
+      setTransferError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTransferBusy(false);
+    }
+  }
+
+  /**
+   * Opens the transfer modal and authenticates the file channel. A host with a
+   * password surfaces the existing Access Password prompt; the modal is only
+   * opened once a token is issued.
+   */
+  async function openTransferModal(d: DeviceInfo, opts?: ConnectOptions) {
+    setConnectingId(d.id);
+    try {
+      const res = await bridge.prepareDeviceAgent(d, opts);
+      if (!res.ok) {
+        if (res.needsPassword) {
+          setPasswordPrompt({
+            device: d,
+            mode: "transfer",
+            message: res.message || "此主机需要访问密码",
+            retryAfterSec: res.retryAfterSec,
+          });
+          setPasswordDraft(opts?.password ?? "");
+          setPasswordError(opts?.password ? res.message || "访问密码错误" : "");
+          setRetryCountdown(res.retryAfterSec ?? 0);
+          return;
+        }
+        notify(res.message || "无法建立文件通道");
+        return;
+      }
+      closePasswordPrompt();
+      setTransferDevice(d);
+      setTransferPort(res.agentPort);
+      setTransferToken(res.agentToken);
+      setTransferTasks([]);
+      setTransferError("");
+      setTransferBusy(true);
+      try {
+        const listing = await bridge.listDeviceFiles({
+          meshIp: d.mesh_ip,
+          port: res.agentPort,
+          token: res.agentToken,
+        });
+        setTransferListing(listing);
+      } catch (err) {
+        setTransferError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setTransferBusy(false);
+      }
+    } catch (err) {
+      notify(err instanceof Error ? err.message : String(err));
+    } finally {
+      setConnectingId("");
+    }
+  }
+
+  async function uploadPathsToDevice(paths: string[]) {
+    const device = transferDevice;
+    if (!device || !transferToken || paths.length === 0) return;
+    setTransferBusy(true);
+    try {
+      const tasks = await bridge.uploadDeviceFiles({
+        meshIp: device.mesh_ip,
+        port: transferPort,
+        token: transferToken,
+        localPaths: paths,
+        targetDir: transferListing?.currentPath,
+      });
+      setTransferTasks((prev) => [...tasks, ...prev].slice(0, 12));
+      const failed = tasks.filter((task) => task.status === "error");
+      if (failed.length > 0) {
+        notify(`${failed.length} 个文件上传失败：${failed[0].message || failed[0].filename}`);
+      } else {
+        notify(`已上传 ${tasks.length} 个文件到「${device.name}」`);
+      }
+      await loadDeviceFiles(transferListing?.currentPath);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTransferBusy(false);
+    }
+  }
+
+  async function handlePickAndUpload() {
+    const device = transferDevice;
+    if (!device || !transferToken) return;
+    setTransferBusy(true);
+    try {
+      const tasks = await bridge.pickAndUploadDeviceFiles({
+        meshIp: device.mesh_ip,
+        port: transferPort,
+        token: transferToken,
+        targetDir: transferListing?.currentPath,
+      });
+      if (tasks.length === 0) return;
+      setTransferTasks((prev) => [...tasks, ...prev].slice(0, 12));
+      notify(`已上传 ${tasks.length} 个文件到「${device.name}」`);
+      await loadDeviceFiles(transferListing?.currentPath);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTransferBusy(false);
+    }
+  }
+
+  async function handleDownloadEntry(entry: { path: string; name: string }) {
+    const device = transferDevice;
+    if (!device || !transferToken) return;
+    setTransferBusy(true);
+    try {
+      const task = await bridge.downloadDeviceFile({
+        meshIp: device.mesh_ip,
+        port: transferPort,
+        token: transferToken,
+        remotePath: entry.path,
+        suggestedName: entry.name,
+      });
+      if (task) {
+        setTransferTasks((prev) => [task, ...prev].slice(0, 12));
+        if (task.status === "done") notify(`已下载「${task.filename}」到本机`);
+        else notify(task.message || "下载失败");
+      }
+    } catch (err) {
+      notify(err instanceof Error ? err.message : String(err));
+    } finally {
+      setTransferBusy(false);
+    }
+  }
+
+  function collectDroppedPaths(data: DataTransfer | null): string[] {
+    if (!data) return [];
+    const paths: string[] = [];
+    for (const file of Array.from(data.files)) {
+      let resolved = "";
+      try {
+        resolved = bridge.getPathForFile(file);
+      } catch {
+        resolved = "";
+      }
+      if (!resolved) resolved = (file as { path?: string }).path || "";
+      if (resolved) paths.push(resolved);
+    }
+    return paths;
+  }
+
+  function handleTransferDrop(e: React.DragEvent) {
+    e.preventDefault();
+    transferDragDepth.current = 0;
+    setTransferDragActive(false);
+    const paths = collectDroppedPaths(e.dataTransfer);
+    if (paths.length === 0) {
+      notify("未能解析拖入文件的本地路径");
+      return;
+    }
+    void uploadPathsToDevice(paths);
   }
 
   return (
@@ -442,6 +667,18 @@ export function DevicesView({
                           办公模式 (0ms光标)
                         </button>
                       )}
+                      {d.online && !isSelf && (
+                        <button
+                          type="button"
+                          disabled={isBusy}
+                          onClick={() => void openTransferModal(d)}
+                          className="inline-flex items-center gap-1 rounded-lg border border-sky-500/35 bg-sky-500/10 px-2.5 py-1 text-[11px] font-semibold text-sky-200 hover:bg-sky-500/20 disabled:opacity-40"
+                          title="无需启动视频串流，直接通过 Mesh 浏览、上传、下载文件"
+                        >
+                          <Upload className="w-3 h-3" />
+                          传文件
+                        </button>
+                      )}
                     </div>
 
                     <div className="flex items-center gap-1 ml-auto">
@@ -467,6 +704,195 @@ export function DevicesView({
               </article>
             );
           })}
+        </div>
+      )}
+
+      {/* Mesh File Quick Transfer Modal */}
+      {transferDevice && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-2xl rounded-2xl border border-edge bg-panel p-5 space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <FolderOpen className="w-4 h-4 text-sky-300" />
+                  <h3 className="font-bold text-slate-100">Mesh 文件快传 · {transferDevice.name}</h3>
+                </div>
+                <p className="text-[11px] text-slate-400">
+                  不启动视频串流，直接经 Mesh 内网与目标主机交换文件（{transferDevice.mesh_ip}:{transferPort}）。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={closeTransferModal}
+                className="text-slate-400 hover:text-slate-100"
+                aria-label="关闭文件快传"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div
+              onDragEnter={(e) => {
+                if (!isFileDrag(e.dataTransfer)) return;
+                e.preventDefault();
+                transferDragDepth.current += 1;
+                setTransferDragActive(true);
+              }}
+              onDragOver={(e) => {
+                if (!isFileDrag(e.dataTransfer)) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = "copy";
+              }}
+              onDragLeave={(e) => {
+                if (!isFileDrag(e.dataTransfer)) return;
+                transferDragDepth.current = Math.max(0, transferDragDepth.current - 1);
+                if (transferDragDepth.current === 0) setTransferDragActive(false);
+              }}
+              onDrop={handleTransferDrop}
+              className={`rounded-xl border-2 border-dashed px-4 py-3 text-center text-xs transition-colors ${
+                transferDragActive
+                  ? "border-sky-400/80 bg-sky-500/15 text-sky-100"
+                  : "border-edge bg-obsidian/60 text-slate-400"
+              }`}
+            >
+              <Upload className="mx-auto mb-1 h-4 w-4" />
+              将文件拖到这里上传，或
+              <button
+                type="button"
+                disabled={transferBusy}
+                onClick={() => void handlePickAndUpload()}
+                className="mx-1 rounded border border-sky-500/40 bg-sky-500/10 px-1.5 py-0.5 text-[11px] font-semibold text-sky-200 hover:bg-sky-500/20 disabled:opacity-40"
+              >
+                选择文件上传
+              </button>
+              到当前目录
+            </div>
+
+            {transferError && (
+              <div className="rounded-xl border border-red-500/35 bg-red-500/10 px-3 py-2 text-[11px] text-red-200">
+                {transferError}
+              </div>
+            )}
+
+            <div className="space-y-1.5">
+              <div className="flex flex-wrap items-center gap-1">
+                {transferListing?.roots.map((root) => (
+                  <button
+                    key={root.path}
+                    type="button"
+                    onClick={() => void loadDeviceFiles(root.path)}
+                    className={`rounded-lg border px-2 py-0.5 text-[10px] font-semibold ${
+                      transferListing.currentPath === root.path
+                        ? "border-sky-500/50 bg-sky-500/15 text-sky-200"
+                        : "border-edge bg-panelHover text-slate-300 hover:text-white"
+                    }`}
+                  >
+                    {root.label}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  disabled={transferBusy || !transferListing?.parentPath}
+                  onClick={() => transferListing?.parentPath && void loadDeviceFiles(transferListing.parentPath)}
+                  className="ml-auto inline-flex items-center gap-0.5 rounded-lg border border-edge bg-panelHover px-2 py-0.5 text-[10px] text-slate-300 hover:text-white disabled:opacity-30"
+                >
+                  <ChevronLeft className="w-3 h-3" /> 上级目录
+                </button>
+                <button
+                  type="button"
+                  disabled={transferBusy}
+                  onClick={() => void loadDeviceFiles(transferListing?.currentPath)}
+                  className="rounded-lg border border-edge bg-panelHover p-1 text-slate-300 hover:text-white disabled:opacity-40"
+                  aria-label="刷新远端目录"
+                >
+                  <RefreshCw className={`w-3 h-3 ${transferBusy ? "animate-spin" : ""}`} />
+                </button>
+              </div>
+
+              <div className="max-h-64 space-y-0.5 overflow-y-auto rounded-xl border border-edge bg-obsidian/60 p-1.5">
+                {!transferListing || transferListing.entries.length === 0 ? (
+                  <div className="px-3 py-6 text-center text-[11px] text-slate-500">
+                    {transferBusy ? "正在读取远端目录…" : "此目录为空，可拖入文件上传"}
+                  </div>
+                ) : (
+                  transferListing.entries.map((entry) => (
+                    <div key={entry.path} className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-panelHover">
+                      {entry.isDirectory ? (
+                        <Folder className="w-3.5 h-3.5 shrink-0 text-amber-300" />
+                      ) : (
+                        <FileIcon className="w-3.5 h-3.5 shrink-0 text-slate-400" />
+                      )}
+                      {entry.isDirectory ? (
+                        <button
+                          type="button"
+                          onClick={() => void loadDeviceFiles(entry.path)}
+                          className="min-w-0 flex-1 truncate text-left text-[11px] text-slate-200 hover:text-sky-200"
+                          title={entry.path}
+                        >
+                          {entry.name}
+                        </button>
+                      ) : (
+                        <span className="min-w-0 flex-1 truncate text-[11px] text-slate-300" title={entry.path}>
+                          {entry.name}
+                        </span>
+                      )}
+                      {!entry.isDirectory && (
+                        <>
+                          <span className="shrink-0 text-[10px] text-slate-500">
+                            {entry.size >= 1024 * 1024
+                              ? `${(entry.size / (1024 * 1024)).toFixed(1)} MB`
+                              : `${Math.max(1, Math.round(entry.size / 1024))} KB`}
+                          </span>
+                          <button
+                            type="button"
+                            disabled={transferBusy}
+                            onClick={() => void handleDownloadEntry(entry)}
+                            className="inline-flex shrink-0 items-center gap-0.5 rounded border border-emerald-500/35 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-40"
+                          >
+                            <ArrowDownToLine className="w-2.5 h-2.5" /> 另存为
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            {transferTasks.length > 0 && (
+              <div className="max-h-32 space-y-1 overflow-y-auto">
+                {transferTasks.map((task) => {
+                  const percent =
+                    task.total > 0
+                      ? Math.min(100, Math.round((task.transferred / task.total) * 100))
+                      : task.status === "done"
+                        ? 100
+                        : 0;
+                  return (
+                    <div key={task.id} className="rounded-lg border border-edge bg-obsidian/60 px-2 py-1">
+                      <div className="flex items-center gap-1.5 text-[10px]">
+                        <span className="min-w-0 flex-1 truncate text-slate-200">{task.filename}</span>
+                        <span
+                          className={`shrink-0 rounded-full border px-1.5 text-[9px] font-bold ${
+                            task.status === "done"
+                              ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-200"
+                              : task.status === "error"
+                                ? "border-red-500/35 bg-red-500/10 text-red-200"
+                                : "border-sky-500/35 bg-sky-500/10 text-sky-200"
+                          }`}
+                        >
+                          {task.status === "done" ? "完成" : task.status === "error" ? "失败" : `${percent}%`}
+                        </span>
+                      </div>
+                      {task.status === "error" && task.message && (
+                        <div className="mt-0.5 truncate text-[9px] text-red-300">{task.message}</div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       )}
 

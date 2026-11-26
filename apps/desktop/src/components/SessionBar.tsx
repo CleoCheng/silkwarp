@@ -1,12 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowDownToLine,
+  ArrowUpFromLine,
   AudioLines,
   ChevronDown,
+  ChevronLeft,
   ChevronUp,
+  ClipboardCheck,
+  ClipboardCopy,
   Crosshair,
+  File as FileIcon,
+  Folder,
+  FolderOpen,
   Gauge,
   Keyboard,
   Layers,
+  Loader2,
   Lock,
   Maximize2,
   Minimize2,
@@ -17,17 +26,21 @@ import {
   Radio,
   RefreshCw,
   Unplug,
+  Upload,
   Wifi,
   Zap,
 } from "lucide-react";
 import { getBridge } from "../bridge";
 import type {
   ActiveSessionState,
+  ClipboardKind,
   DisplayMode,
+  RemoteFileListing,
   StreamAppTarget,
   StreamPreset,
   SystemActionType,
   SystemKeyCaptureMode,
+  TransferTaskItem,
 } from "../../electron/types";
 
 const RESOLUTION_PRESETS: Array<{ label: string; value: string }> = [
@@ -145,6 +158,241 @@ const SYSTEM_ACTION_ORDER: SystemActionType[] = [
 
 const CONFIRM_TIMEOUT_MS = 4000;
 
+const CLIPBOARD_KIND_LABELS: Record<ClipboardKind, string> = {
+  empty: "空",
+  text: "文本",
+  image: "图片",
+  files: "文件",
+};
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 KB";
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+/** Resolves an OS path for a dropped `File`, falling back to the legacy `.path`. */
+function resolveDroppedPath(bridge: ReturnType<typeof getBridge>, file: File): string {
+  try {
+    const resolved = bridge.getPathForFile(file);
+    if (resolved) return resolved;
+  } catch {
+    // webUtils is unavailable outside Electron; fall through to `.path`.
+  }
+  return (file as { path?: string }).path || "";
+}
+
+function collectDroppedPaths(bridge: ReturnType<typeof getBridge>, data: DataTransfer | null): string[] {
+  if (!data) return [];
+  const paths: string[] = [];
+  for (const file of Array.from(data.files)) {
+    const resolved = resolveDroppedPath(bridge, file);
+    if (resolved) paths.push(resolved);
+  }
+  return paths;
+}
+
+/**
+ * `dragenter`/`dragover` expose the payload only through `types`; `files` is
+ * empty until `drop`, and some sources omit the `Files` entry entirely, so both
+ * are accepted.
+ */
+function isFileDrag(data: DataTransfer | null): boolean {
+  if (!data) return false;
+  if (data.files.length > 0) return true;
+  return Array.from(data.types).includes("Files");
+}
+
+function TransferRow({ task }: { task: TransferTaskItem }) {
+  const percent =
+    task.total > 0 ? Math.min(100, Math.round((task.transferred / task.total) * 100)) : task.status === "done" ? 100 : 0;
+  const statusClass =
+    task.status === "done"
+      ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-200"
+      : task.status === "error"
+        ? "border-red-400/30 bg-red-500/10 text-red-200"
+        : "border-sky-400/30 bg-sky-500/10 text-sky-200";
+  const statusLabel = task.status === "done" ? "完成" : task.status === "error" ? "失败" : `${percent}%`;
+
+  return (
+    <div className="rounded-lg border border-white/10 bg-black/25 px-2 py-1.5">
+      <div className="flex items-center gap-1.5">
+        {task.direction === "upload" ? (
+          <ArrowUpFromLine className="h-3 w-3 shrink-0 text-sky-300" />
+        ) : (
+          <ArrowDownToLine className="h-3 w-3 shrink-0 text-emerald-300" />
+        )}
+        <span className="min-w-0 flex-1 truncate text-[10px] font-semibold text-slate-200" title={task.filename}>
+          {task.filename}
+        </span>
+        <span className={`shrink-0 rounded-full border px-1.5 py-0.5 text-[9px] font-bold ${statusClass}`}>
+          {task.status === "running" && <Loader2 className="mr-0.5 inline h-2 w-2 animate-spin" />}
+          {statusLabel}
+        </span>
+      </div>
+      <div className="mt-1 h-1 overflow-hidden rounded-full bg-white/10">
+        <div
+          className={`h-full rounded-full transition-all ${
+            task.status === "error" ? "bg-red-400" : task.status === "done" ? "bg-emerald-400" : "bg-sky-400"
+          }`}
+          style={{ width: `${task.status === "error" ? 100 : percent}%` }}
+        />
+      </div>
+      <div className="mt-0.5 flex items-center justify-between text-[9px] text-slate-500">
+        <span>
+          {formatBytes(task.transferred)} / {task.total > 0 ? formatBytes(task.total) : "未知大小"}
+        </span>
+        {task.message && <span className="max-w-[60%] truncate text-red-300">{task.message}</span>}
+      </div>
+    </div>
+  );
+}
+
+function FileBrowser({
+  bridge,
+  notifyError,
+}: {
+  bridge: ReturnType<typeof getBridge>;
+  notifyError: (message: string) => void;
+}) {
+  const [listing, setListing] = useState<RemoteFileListing | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+
+  async function load(dirPath?: string) {
+    setLoading(true);
+    try {
+      setListing(await bridge.listSessionFiles(dirPath));
+    } catch (err) {
+      notifyError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function handleUpload() {
+    if (uploading) return;
+    setUploading(true);
+    try {
+      await bridge.pickAndUploadSessionFiles(listing?.currentPath);
+      await load(listing?.currentPath);
+    } catch (err) {
+      notifyError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex flex-wrap gap-1">
+        {listing?.roots.map((root) => (
+          <button
+            key={root.path}
+            type="button"
+            onClick={() => void load(root.path)}
+            className={`rounded-md border px-1.5 py-0.5 text-[9px] font-semibold ${
+              listing.currentPath === root.path
+                ? "border-sky-400/60 bg-sky-400/15 text-sky-100"
+                : "border-white/10 bg-black/20 text-slate-300 hover:text-white"
+            }`}
+          >
+            {root.label}
+          </button>
+        ))}
+        <button
+          type="button"
+          disabled={uploading}
+          onClick={() => void handleUpload()}
+          className="ml-auto inline-flex items-center gap-1 rounded-md border border-sky-400/40 bg-sky-400/10 px-1.5 py-0.5 text-[9px] font-semibold text-sky-200 hover:bg-sky-400/20 disabled:opacity-40"
+        >
+          {uploading ? <Loader2 className="h-2.5 w-2.5 animate-spin" /> : <Upload className="h-2.5 w-2.5" />}
+          选择文件上传
+        </button>
+      </div>
+
+      <div className="flex items-center gap-1 text-[9px] text-slate-500">
+        <button
+          type="button"
+          disabled={loading || !listing?.parentPath}
+          onClick={() => listing?.parentPath && void load(listing.parentPath)}
+          className="inline-flex items-center gap-0.5 rounded border border-white/10 bg-black/20 px-1.5 py-0.5 text-slate-300 hover:text-white disabled:opacity-30"
+        >
+          <ChevronLeft className="h-2.5 w-2.5" /> 上级目录
+        </button>
+        <span className="min-w-0 flex-1 truncate font-mono" title={listing?.currentPath}>
+          {listing?.currentPath || "加载中…"}
+        </span>
+        <button
+          type="button"
+          disabled={loading}
+          onClick={() => void load(listing?.currentPath)}
+          className="rounded border border-white/10 bg-black/20 p-0.5 text-slate-300 hover:text-white disabled:opacity-40"
+        >
+          <RefreshCw className={`h-2.5 w-2.5 ${loading ? "animate-spin" : ""}`} />
+        </button>
+      </div>
+
+      <div className="max-h-40 space-y-0.5 overflow-y-auto rounded-lg border border-white/10 bg-black/20 p-1">
+        {!listing || listing.entries.length === 0 ? (
+          <div className="px-2 py-2 text-center text-[9px] text-slate-500">
+            {loading ? "正在读取远端目录…" : "此目录为空"}
+          </div>
+        ) : (
+          listing.entries.map((entry) => (
+            <div
+              key={entry.path}
+              className="flex items-center gap-1.5 rounded px-1.5 py-1 hover:bg-white/5"
+            >
+              {entry.isDirectory ? (
+                <Folder className="h-3 w-3 shrink-0 text-amber-300" />
+              ) : (
+                <FileIcon className="h-3 w-3 shrink-0 text-slate-400" />
+              )}
+              {entry.isDirectory ? (
+                <button
+                  type="button"
+                  onClick={() => void load(entry.path)}
+                  className="min-w-0 flex-1 truncate text-left text-[10px] text-slate-200 hover:text-sky-200"
+                  title={entry.path}
+                >
+                  {entry.name}
+                </button>
+              ) : (
+                <span className="min-w-0 flex-1 truncate text-[10px] text-slate-300" title={entry.path}>
+                  {entry.name}
+                </span>
+              )}
+              {!entry.isDirectory && (
+                <>
+                  <span className="shrink-0 text-[9px] text-slate-500">{formatBytes(entry.size)}</span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void bridge
+                        .downloadSessionFile(entry.path, entry.name)
+                        .catch((err) => notifyError(err instanceof Error ? err.message : String(err)))
+                    }
+                    className="shrink-0 rounded border border-emerald-400/30 bg-emerald-500/10 px-1 py-0.5 text-[9px] font-semibold text-emerald-200 hover:bg-emerald-500/20"
+                  >
+                    下载到本地
+                  </button>
+                </>
+              )}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function SessionBar() {
   const bridge = useMemo(() => getBridge(), []);
   const [state, setState] = useState<ActiveSessionState | null>(null);
@@ -154,7 +402,11 @@ export function SessionBar() {
   const [busy, setBusy] = useState(false);
   const [pendingConfirm, setPendingConfirm] = useState<SystemActionType | null>(null);
   const [actionBanner, setActionBanner] = useState<{ ok: boolean; text: string } | null>(null);
+  const [dragActive, setDragActive] = useState(false);
+  const [fileDrawerOpen, setFileDrawerOpen] = useState(false);
+  const [clipboardBusy, setClipboardBusy] = useState(false);
   const dragRef = useRef<{ lastX: number; moved: boolean } | null>(null);
+  const dragDepthRef = useRef(0);
   const confirmTimerRef = useRef<number | null>(null);
   const bannerTimerRef = useRef<number | null>(null);
 
@@ -306,6 +558,101 @@ export function SessionBar() {
     window.addEventListener("pointerup", onUp);
   }
 
+  // --- Stage 3: OS drag-and-drop file transfer ---
+
+  function handleDragEnter(e: React.DragEvent) {
+    if (!isFileDrag(e.dataTransfer)) return;
+    e.preventDefault();
+    dragDepthRef.current += 1;
+    setDragActive(true);
+  }
+
+  function handleDragOver(e: React.DragEvent) {
+    if (!isFileDrag(e.dataTransfer)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  }
+
+  function handleDragLeave(e: React.DragEvent) {
+    if (!isFileDrag(e.dataTransfer)) return;
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setDragActive(false);
+  }
+
+  async function handleDrop(e: React.DragEvent) {
+    e.preventDefault();
+    dragDepthRef.current = 0;
+    setDragActive(false);
+    const paths = collectDroppedPaths(bridge, e.dataTransfer);
+    if (paths.length === 0) {
+      showBanner(false, "未能解析拖入文件的本地路径");
+      return;
+    }
+    try {
+      const tasks = await bridge.uploadSessionFiles(paths);
+      const failed = tasks.filter((task) => task.status === "error");
+      if (failed.length > 0) {
+        showBanner(false, `${failed.length} 个文件上传失败：${failed[0].message || failed[0].filename}`);
+      } else {
+        showBanner(true, `已上传 ${tasks.length} 个文件到主机 SilkWarpRecv`);
+      }
+    } catch (err) {
+      showBanner(false, err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  // --- Stage 3: clipboard sync controls ---
+
+  async function handleClipboardToggle(next: boolean) {
+    if (clipboardBusy) return;
+    setClipboardBusy(true);
+    try {
+      applySession(await bridge.setSessionClipboardSync(next));
+    } catch (err) {
+      showBanner(false, err instanceof Error ? err.message : String(err));
+    } finally {
+      setClipboardBusy(false);
+    }
+  }
+
+  async function handleClipboardSyncNow() {
+    if (clipboardBusy) return;
+    setClipboardBusy(true);
+    try {
+      applySession(await bridge.syncSessionClipboardNow());
+    } catch (err) {
+      showBanner(false, err instanceof Error ? err.message : String(err));
+    } finally {
+      setClipboardBusy(false);
+    }
+  }
+
+  function clipboardStatusBadge(state: ActiveSessionState): { text: string; className: string } {
+    if (!state.clipboardSyncEnabled) {
+      return { text: "已暂停", className: "border-white/10 bg-black/20 text-slate-400" };
+    }
+    if (state.clipboardError) {
+      return {
+        text: state.clipboardError.slice(0, 24),
+        className: "border-red-400/30 bg-red-500/10 text-red-200",
+      };
+    }
+    if (state.clipboardLastSyncAt) {
+      return {
+        text: `已同步 ${CLIPBOARD_KIND_LABELS[state.clipboardLastKind] ?? state.clipboardLastKind}`,
+        className: "border-emerald-400/30 bg-emerald-500/10 text-emerald-200",
+      };
+    }
+    return { text: "待同步", className: "border-white/10 bg-black/20 text-slate-400" };
+  }
+
+  const dragProps = {
+    onDragEnter: handleDragEnter,
+    onDragOver: handleDragOver,
+    onDragLeave: handleDragLeave,
+    onDrop: (e: React.DragEvent) => void handleDrop(e),
+  };
+
   if (!state) {
     return (
       <div className="flex h-full w-full items-center justify-center bg-transparent">
@@ -333,8 +680,19 @@ export function SessionBar() {
 
   if (!expanded) {
     return (
-      <div className="flex h-full w-full items-center bg-transparent px-1 py-1">
-        <div className="flex h-full w-full items-center gap-2 rounded-full border border-white/10 bg-[#0d1220]/85 px-2.5 shadow-[0_8px_30px_rgba(0,0,0,0.45)] backdrop-blur-xl">
+      <div className="flex h-full w-full items-center bg-transparent px-1 py-1" {...dragProps}>
+        <div
+          className={`relative flex h-full w-full items-center gap-2 rounded-full border px-2.5 shadow-[0_8px_30px_rgba(0,0,0,0.45)] backdrop-blur-xl transition-colors ${
+            dragActive
+              ? "border-sky-400/80 bg-sky-500/25 ring-2 ring-sky-400/60"
+              : "border-white/10 bg-[#0d1220]/85"
+          }`}
+        >
+          {dragActive && (
+            <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center gap-1.5 rounded-full bg-[#0b1220]/95 text-[11px] font-bold text-sky-200">
+              <Upload className="h-3.5 w-3.5" /> 拖放即传至主机 SilkWarpRecv
+            </div>
+          )}
           <button
             type="button"
             aria-label="拖动悬浮条"
@@ -358,6 +716,21 @@ export function SessionBar() {
               中继保护
             </span>
           )}
+
+          <button
+            type="button"
+            aria-label={state.clipboardSyncEnabled ? "暂停双向剪贴板同步" : "开启双向剪贴板同步"}
+            title={state.clipboardSyncEnabled ? "双向剪贴板同步已开启（点击暂停）" : "双向剪贴板同步已暂停（点击开启）"}
+            onClick={() => void handleClipboardToggle(!state.clipboardSyncEnabled)}
+            disabled={clipboardBusy || !state.agentConnected}
+            className={`rounded-full p-1 disabled:opacity-40 ${
+              state.clipboardSyncEnabled
+                ? "bg-sky-400/20 text-sky-200 hover:bg-sky-400/30"
+                : "text-slate-500 hover:bg-white/10 hover:text-slate-200"
+            }`}
+          >
+            <ClipboardCopy className="h-3.5 w-3.5" />
+          </button>
 
           <button
             type="button"
@@ -394,8 +767,19 @@ export function SessionBar() {
   }
 
   return (
-    <div className="flex h-full w-full bg-transparent p-1">
-      <div className="flex h-full w-full flex-col overflow-hidden rounded-2xl border border-white/10 bg-[#0d1220]/92 shadow-[0_16px_50px_rgba(0,0,0,0.6)] backdrop-blur-2xl">
+    <div className="flex h-full w-full bg-transparent p-1" {...dragProps}>
+      <div
+        className={`relative flex h-full w-full flex-col overflow-hidden rounded-2xl border shadow-[0_16px_50px_rgba(0,0,0,0.6)] backdrop-blur-2xl transition-colors ${
+          dragActive ? "border-sky-400/80 bg-[#0d1220]/98 ring-2 ring-sky-400/50" : "border-white/10 bg-[#0d1220]/92"
+        }`}
+      >
+        {dragActive && (
+          <div className="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-sky-400/70 bg-[#0b1220]/92 text-center">
+            <Upload className="h-8 w-8 text-sky-300" />
+            <div className="text-sm font-bold text-sky-100">拖放即传至主机 SilkWarpRecv</div>
+            <div className="text-[10px] text-slate-400">松开鼠标后立即开始 Mesh 直连上传</div>
+          </div>
+        )}
         {/* Title bar */}
         <div
           onPointerDown={startDrag}
@@ -770,9 +1154,105 @@ export function SessionBar() {
             )}
           </div>
 
-          {/* Stage 3 banner */}
-          <div className="rounded-lg border border-dashed border-white/10 bg-black/10 px-2 py-1 text-[9px] text-slate-500">
-            阶段 3 即将接入：拖拽传文件 · 双向剪贴板同步
+          {/* Stage 3: clipboard sync + file transfer */}
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between">
+              <SectionTitle icon={<ClipboardCopy className="h-3 w-3 text-fuchsia-300" />}>
+                剪贴板与文件快传
+              </SectionTitle>
+              <span
+                className={`rounded-full border px-1.5 py-0.5 text-[9px] font-semibold ${clipboardStatusBadge(state).className}`}
+                title={state.clipboardError || undefined}
+              >
+                {clipboardStatusBadge(state).text}
+              </span>
+            </div>
+
+            {!state.agentConnected ? (
+              <div className="rounded-lg border border-dashed border-white/10 bg-black/10 px-2 py-1.5 text-[10px] text-slate-500">
+                Host Companion Agent 未连接，文件与剪贴板通道不可用
+              </div>
+            ) : (
+              <>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    disabled={clipboardBusy}
+                    onClick={() => void handleClipboardToggle(!state.clipboardSyncEnabled)}
+                    className={`inline-flex flex-1 items-center justify-center gap-1 rounded-md border px-2 py-1 text-[10px] font-semibold transition-colors disabled:opacity-50 ${
+                      state.clipboardSyncEnabled
+                        ? "border-sky-400/60 bg-sky-400/15 text-sky-100"
+                        : "border-white/10 bg-black/20 text-slate-400 hover:text-white"
+                    }`}
+                  >
+                    <ClipboardCheck className="h-3 w-3" />
+                    双向剪贴板同步 (Ctrl+C/V)
+                  </button>
+                  <button
+                    type="button"
+                    disabled={clipboardBusy || !state.clipboardSyncEnabled}
+                    onClick={() => void handleClipboardSyncNow()}
+                    className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-black/20 px-2 py-1 text-[10px] text-slate-300 hover:text-white disabled:opacity-40"
+                  >
+                    {clipboardBusy ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-3 w-3" />
+                    )}
+                    立即同步
+                  </button>
+                </div>
+
+                {state.clipboardError && (
+                  <div className="rounded-lg border border-amber-400/30 bg-amber-500/10 px-2 py-1 text-[9px] text-amber-100">
+                    {state.clipboardError}
+                  </div>
+                )}
+
+                {state.transfers.length > 0 && (
+                  <div className="max-h-32 space-y-1 overflow-y-auto">
+                    {state.transfers.map((task) => (
+                      <TransferRow key={task.id} task={task} />
+                    ))}
+                  </div>
+                )}
+
+                <div className="flex flex-wrap gap-1">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void bridge
+                        .pickAndUploadSessionFiles()
+                        .then((tasks) => {
+                          if (tasks.length > 0) showBanner(true, `已上传 ${tasks.length} 个文件`);
+                        })
+                        .catch((err) => showBanner(false, err instanceof Error ? err.message : String(err)))
+                    }
+                    className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-black/20 px-2 py-1 text-[10px] text-slate-300 hover:text-white"
+                  >
+                    <Upload className="h-3 w-3" /> 选择文件上传
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFileDrawerOpen((open) => !open)}
+                    className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[10px] font-semibold ${
+                      fileDrawerOpen
+                        ? "border-sky-400/50 bg-sky-400/10 text-sky-100"
+                        : "border-white/10 bg-black/20 text-slate-300 hover:text-white"
+                    }`}
+                  >
+                    <FolderOpen className="h-3 w-3" />
+                    {fileDrawerOpen ? "收起文件管理" : "展开文件管理"}
+                  </button>
+                </div>
+
+                {fileDrawerOpen && <FileBrowser bridge={bridge} notifyError={(msg) => showBanner(false, msg)} />}
+
+                <div className="rounded-lg border border-dashed border-white/10 bg-black/10 px-2 py-1 text-[9px] text-slate-500">
+                  直接拖放文件到悬浮条即可上传；超过 50 MiB 的剪贴板文件请使用上方文件管理。
+                </div>
+              </>
+            )}
           </div>
         </div>
 

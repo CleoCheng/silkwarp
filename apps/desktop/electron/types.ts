@@ -1,6 +1,13 @@
 import type { DisplayMonitorInfo, SystemActionType } from "./services/hostAgentServer";
+import type { ClipboardKind, RemoteFileEntry, RemoteRootDir } from "./services/transferValidation";
 
 export type { DisplayMonitorInfo, SystemActionType } from "./services/hostAgentServer";
+export type {
+  ClipboardKind,
+  ClipboardPayload,
+  RemoteFileEntry,
+  RemoteRootDir,
+} from "./services/transferValidation";
 
 export interface UserInfo {
   id: string;
@@ -110,6 +117,42 @@ export interface ActiveSessionState {
   privacyActive: boolean;
   privacySupported: boolean;
   autoLockOnDisconnect: boolean;
+  clipboardSyncEnabled: boolean;
+  clipboardLastKind: ClipboardKind;
+  clipboardLastSyncAt: number | null;
+  clipboardError: string;
+  transfers: TransferTaskItem[];
+}
+
+/** One upload/download shown in the session bar and the device transfer modal. */
+export interface TransferTaskItem {
+  id: string;
+  direction: "upload" | "download";
+  filename: string;
+  transferred: number;
+  total: number;
+  status: "running" | "done" | "error";
+  message?: string;
+  remotePath?: string;
+  localPath?: string;
+}
+
+/** Result of browsing one remote directory through the Host Companion Agent. */
+export interface RemoteFileListing {
+  currentPath: string;
+  parentPath: string | null;
+  roots: RemoteRootDir[];
+  entries: RemoteFileEntry[];
+}
+
+/** Structured outcome of `device:prepareAgent` / `transfer:*` IPC calls. */
+export interface DeviceAgentSessionResult {
+  ok: boolean;
+  needsPassword?: boolean;
+  retryAfterSec?: number;
+  message: string;
+  agentPort: number;
+  agentToken: string;
 }
 
 export interface PeerStatus {

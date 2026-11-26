@@ -1,7 +1,7 @@
 # SilkWarp 阶段 3 设计规格书：Mesh 直连文件传输与双向剪贴板
 
 - **日期**：2026-11-27
-- **状态**：Part A 已落地（阶段 3 / 共 3 阶段）
+- **状态**：Part A + Part B 已落地（阶段 3 / 共 3 阶段）
 - **适用范围**：`apps/desktop/`（Electron 主进程、Host Companion Agent 扩展、渲染层桥接）
 - **依赖前置**：阶段 2 的 `HostAgentServer` / `HostAgentClient` / Bearer 鉴权 / `onExtraRoute` 扩展钩子
 

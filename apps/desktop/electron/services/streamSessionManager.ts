@@ -1,18 +1,28 @@
 import type { ChildProcess } from "node:child_process";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import type {
   ActiveSessionState,
   BootstrapConfig,
   DeviceInfo,
   DisplayMonitorInfo,
   PeerStatus,
+  RemoteFileListing,
   SessionHotkeyAction,
   StreamPreset,
   SystemActionType,
+  TransferTaskItem,
 } from "../types";
+import {
+  ClipboardSyncManager,
+  createElectronClipboardAdapter,
+  type ClipboardSyncStatus,
+} from "./clipboardSyncManager";
 import { FloatingBarWindow } from "./floatingBarWindow";
 import { DEFAULT_AGENT_PORT } from "./hostAgentAuth";
 import { HostAgentClient } from "./hostAgentClient";
+import type { ClipboardAdapter } from "./hostTransferService";
 import type { StateStore } from "./store";
 import {
   computeEffectivePreset,
@@ -29,6 +39,10 @@ import { WindowTracker } from "./windowTracker";
 
 const RELOAD_DEBOUNCE_MS = 250;
 const PROCESS_EXIT_TIMEOUT_MS = 2000;
+/** How many finished/running transfers stay visible in the session bar. */
+const MAX_TRANSFER_TASKS = 12;
+/** Progress IPC updates are coalesced to ~10 Hz per transfer. */
+const TRANSFER_PROGRESS_THROTTLE_MS = 100;
 
 function parseResolution(resolution: string): { width: number; height: number } {
   const match = /^(\d{3,4})x(\d{3,4})$/.exec(resolution);
@@ -69,14 +83,22 @@ export class StreamSessionManager {
   private reloadTimer: NodeJS.Timeout | null = null;
   private reloadChain: Promise<void> = Promise.resolve();
 
+  private clipboardSync: ClipboardSyncManager | null = null;
+  private clipboardAdapterOverride: ClipboardAdapter | null = null;
+  private transfers: TransferTaskItem[] = [];
+  private transferEmitTimers = new Map<string, NodeJS.Timeout>();
+  private transferLastEmit = new Map<string, number>();
+
   constructor(
     store: StateStore,
     onStateChange: (state: ActiveSessionState | null) => void,
     agentClient = new HostAgentClient(),
+    options: { clipboardAdapter?: ClipboardAdapter } = {},
   ) {
     this.store = store;
     this.onStateChange = onStateChange;
     this.agentClient = agentClient;
+    this.clipboardAdapterOverride = options.clipboardAdapter ?? null;
   }
 
   getState(): ActiveSessionState | null {
@@ -217,6 +239,7 @@ export class StreamSessionManager {
         })
         .catch(() => {});
     }
+    this.stopClipboardSync();
 
     this.agentHost = device.mesh_ip;
     this.agentPort = agentContext?.agentPort || device.agent_port || DEFAULT_AGENT_PORT;
@@ -257,6 +280,11 @@ export class StreamSessionManager {
       privacyActive: false,
       privacySupported: true,
       autoLockOnDisconnect: false,
+      clipboardSyncEnabled: this.clipboardSync ? this.clipboardSync.enabled : true,
+      clipboardLastKind: "empty",
+      clipboardLastSyncAt: null,
+      clipboardError: "",
+      transfers: this.snapshotTransfers(),
     };
     this.active = active;
 
@@ -277,6 +305,7 @@ export class StreamSessionManager {
 
     if (this.agentConnected) {
       await this.hydrateAgentState(active, generation);
+      this.startClipboardSync();
     }
 
     if (generation !== this.generation || this.active !== active) {
@@ -418,6 +447,250 @@ export class StreamSessionManager {
 
     active.reconnecting = false;
     this.broadcast();
+  }
+
+  // -------------------------------------------------------------------------
+  // Stage 3: bidirectional clipboard + Mesh file transfer
+  // -------------------------------------------------------------------------
+
+  private startClipboardSync(): void {
+    if (!this.agentConnected || !this.agentToken || !this.active) return;
+
+    if (!this.clipboardSync) {
+      const adapter = this.clipboardAdapterOverride ?? createElectronClipboardAdapter();
+      this.clipboardSync = new ClipboardSyncManager({
+        getTarget: () => this.getAgentContext(),
+        adapter,
+        client: this.agentClient,
+        onStatusChange: (status: ClipboardSyncStatus) => this.applyClipboardStatus(status),
+      });
+    }
+    this.clipboardSync.setEnabled(this.active.clipboardSyncEnabled);
+    this.clipboardSync.start();
+  }
+
+  private clearTransferTimers(): void {
+    for (const timer of this.transferEmitTimers.values()) clearTimeout(timer);
+    this.transferEmitTimers.clear();
+    this.transferLastEmit.clear();
+  }
+
+  private stopClipboardSync(): void {
+    this.clipboardSync?.stop();
+  }
+
+  private applyClipboardStatus(status: ClipboardSyncStatus): void {
+    const active = this.active;
+    if (!active) return;
+    const changed =
+      active.clipboardSyncEnabled !== status.enabled ||
+      active.clipboardLastKind !== status.lastKind ||
+      active.clipboardLastSyncAt !== status.lastSyncedAt ||
+      active.clipboardError !== status.lastError;
+    if (!changed) return;
+    active.clipboardSyncEnabled = status.enabled;
+    active.clipboardLastKind = status.lastKind;
+    active.clipboardLastSyncAt = status.lastSyncedAt;
+    active.clipboardError = status.lastError;
+    this.broadcast();
+  }
+
+  setClipboardSync(enabled: boolean): ActiveSessionState | null {
+    const active = this.active;
+    if (!active) return null;
+    active.clipboardSyncEnabled = Boolean(enabled);
+    if (this.clipboardSync) {
+      this.clipboardSync.setEnabled(active.clipboardSyncEnabled);
+    } else if (active.clipboardSyncEnabled) {
+      this.startClipboardSync();
+    }
+    this.broadcast();
+    return active;
+  }
+
+  async syncClipboardNow(): Promise<ActiveSessionState | null> {
+    const active = this.active;
+    if (!active) return null;
+    if (!this.clipboardSync) this.startClipboardSync();
+    await this.clipboardSync?.syncOnce();
+    this.broadcast();
+    return this.active;
+  }
+
+  private snapshotTransfers(): TransferTaskItem[] {
+    return this.transfers.map((item) => ({ ...item }));
+  }
+
+  private upsertTransfer(item: TransferTaskItem): void {
+    const index = this.transfers.findIndex((existing) => existing.id === item.id);
+    if (index >= 0) {
+      this.transfers[index] = { ...item };
+    } else {
+      this.transfers.unshift({ ...item });
+      if (this.transfers.length > MAX_TRANSFER_TASKS) {
+        this.transfers.length = MAX_TRANSFER_TASKS;
+      }
+    }
+    this.publishTransfers();
+  }
+
+  /**
+   * Progress callbacks fire per socket chunk (~64 KiB), so raw IPC broadcasts
+   * would flood the renderer. Running updates are coalesced to ~10 Hz while
+   * terminal states (done/error) publish immediately.
+   */
+  private publishTransfers(immediate = false): void {
+    const active = this.active;
+    if (!active) return;
+    active.transfers = this.snapshotTransfers();
+
+    const now = Date.now();
+    const running = this.transfers.filter((item) => item.status === "running");
+    if (immediate || running.length === 0) {
+      for (const timer of this.transferEmitTimers.values()) clearTimeout(timer);
+      this.transferEmitTimers.clear();
+      this.transferLastEmit.clear();
+      this.broadcast();
+      return;
+    }
+
+    for (const item of running) {
+      if (this.transferEmitTimers.has(item.id)) continue;
+      const last = this.transferLastEmit.get(item.id) ?? 0;
+      const wait = Math.max(0, TRANSFER_PROGRESS_THROTTLE_MS - (now - last));
+      const timer = setTimeout(() => {
+        this.transferEmitTimers.delete(item.id);
+        this.transferLastEmit.set(item.id, Date.now());
+        const current = this.active;
+        if (!current) return;
+        current.transfers = this.snapshotTransfers();
+        this.broadcast();
+      }, wait);
+      timer.unref?.();
+      this.transferEmitTimers.set(item.id, timer);
+    }
+  }
+
+  async listRemoteFiles(dirPath?: string): Promise<RemoteFileListing> {
+    if (!this.agentConnected || !this.agentToken) {
+      throw new Error("Host Companion Agent 未连接，无法浏览远端文件。");
+    }
+    return this.agentClient.listRemoteFiles(this.agentHost, this.agentPort, this.agentToken, dirPath);
+  }
+
+  /**
+   * Uploads local files one after another (bounded concurrency of one keeps the
+   * Mesh link and the host's `.part` allocator predictable) while emitting
+   * throttled progress into `ActiveSessionState.transfers`.
+   */
+  async uploadFiles(localPaths: string[], targetDir?: string): Promise<TransferTaskItem[]> {
+    if (!this.agentConnected || !this.agentToken) {
+      throw new Error("Host Companion Agent 未连接，无法上传文件。");
+    }
+    const paths = (Array.isArray(localPaths) ? localPaths : [])
+      .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+      .filter(Boolean);
+    if (paths.length === 0) return [];
+
+    const results: TransferTaskItem[] = [];
+    for (const localPath of paths) {
+      const taskId = crypto.randomUUID();
+      const filename = path.basename(localPath) || localPath;
+      let total = 0;
+      try {
+        total = fs.statSync(localPath).size;
+      } catch {
+        total = 0;
+      }
+
+      const task: TransferTaskItem = {
+        id: taskId,
+        direction: "upload",
+        filename,
+        transferred: 0,
+        total,
+        status: "running",
+        localPath,
+      };
+      this.upsertTransfer(task);
+
+      try {
+        const result = await this.agentClient.uploadFileStream(
+          this.agentHost,
+          this.agentPort,
+          this.agentToken,
+          localPath,
+          {
+            targetDir,
+            onProgress: (progress) => {
+              task.transferred = progress.transferred;
+              task.total = progress.total || total;
+              this.upsertTransfer(task);
+            },
+          },
+        );
+        task.status = "done";
+        task.transferred = result.size;
+        task.total = result.size;
+        task.filename = result.filename;
+        task.remotePath = result.path;
+        this.upsertTransfer(task);
+      } catch (err) {
+        task.status = "error";
+        task.message = err instanceof Error ? err.message : String(err);
+        this.upsertTransfer(task);
+      }
+      results.push({ ...task });
+    }
+
+    this.publishTransfers(true);
+    return results;
+  }
+
+  async downloadRemoteFile(remotePath: string, localSavePath: string): Promise<TransferTaskItem> {
+    if (!this.agentConnected || !this.agentToken) {
+      throw new Error("Host Companion Agent 未连接，无法下载文件。");
+    }
+    const task: TransferTaskItem = {
+      id: crypto.randomUUID(),
+      direction: "download",
+      filename: path.basename(localSavePath) || path.basename(remotePath),
+      transferred: 0,
+      total: 0,
+      status: "running",
+      remotePath,
+      localPath: localSavePath,
+    };
+    this.upsertTransfer(task);
+
+    try {
+      const result = await this.agentClient.downloadFileStream(
+        this.agentHost,
+        this.agentPort,
+        this.agentToken,
+        remotePath,
+        localSavePath,
+        {
+          onProgress: (progress) => {
+            task.transferred = progress.transferred;
+            task.total = progress.total || task.total;
+            this.upsertTransfer(task);
+          },
+        },
+      );
+      task.status = "done";
+      task.transferred = result.size;
+      task.total = result.size;
+      task.localPath = result.path;
+      this.upsertTransfer(task);
+    } catch (err) {
+      task.status = "error";
+      task.message = err instanceof Error ? err.message : String(err);
+      this.upsertTransfer(task);
+    }
+
+    this.publishTransfers(true);
+    return { ...task };
   }
 
   getAgentContext(): { connected: boolean; host: string; port: number; token: string } | null {
@@ -687,6 +960,9 @@ export class StreamSessionManager {
       this.agentConnected = false;
       this.agentToken = "";
       this.agentHost = "";
+      this.stopClipboardSync();
+      this.clearTransferTimers();
+      this.transfers = [];
       await this.stopCurrentProcess();
       this.floatingBar?.destroy();
       this.floatingBar = null;

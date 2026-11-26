@@ -23,6 +23,11 @@ const {
   createHostTransferExtraRoute,
 } = require("../dist-electron/services/hostTransferService.js");
 
+const {
+  ClipboardSyncManager,
+  MAX_CLIPBOARD_AUTO_FILES_BYTES,
+} = require("../dist-electron/services/clipboardSyncManager.js");
+
 const { AgentAuthManager } = require("../dist-electron/services/hostAgentAuth.js");
 const { HostAgentServer } = require("../dist-electron/services/hostAgentServer.js");
 const { AgentClientError, HostAgentClient } = require("../dist-electron/services/hostAgentClient.js");
@@ -965,4 +970,370 @@ test("HTTP: clipboard text fingerprint matches the shared helper", async () => {
 test("constants: 2 GiB upload ceiling and 10 MiB clipboard image ceiling", () => {
   assert.equal(MAX_UPLOAD_FILE_BYTES, 2 * 1024 * 1024 * 1024);
   assert.equal(MAX_CLIPBOARD_IMAGE_BYTES, 10 * 1024 * 1024);
+  assert.equal(MAX_CLIPBOARD_AUTO_FILES_BYTES, 50 * 1024 * 1024);
+});
+
+// ---------------------------------------------------------------------------
+// 10. ClipboardSyncManager: loop suppression
+// ---------------------------------------------------------------------------
+
+/**
+ * In-memory double of the parts of HostAgentClient the sync manager uses.
+ * `remote` models the host clipboard, `setCalls` records pushes so the tests can
+ * assert that a mirrored value is never echoed back.
+ */
+function makeSyncHarness(options = {}) {
+  const remote = {
+    payload: options.remote ?? { kind: "empty", updatedAt: Date.now() },
+    setCalls: [],
+    getCalls: 0,
+  };
+  const local = {
+    payload: options.local ?? { kind: "empty", updatedAt: Date.now() },
+    writes: [],
+  };
+  const uploads = [];
+  const downloads = [];
+
+  const adapter = {
+    read: async () => local.payload,
+    write: async (payload) => {
+      local.payload = payload;
+      local.writes.push(payload);
+      return { ok: true, kind: payload.kind };
+    },
+  };
+
+  const client = {
+    setRemoteClipboard: async (_host, _port, _token, payload) => {
+      remote.setCalls.push(payload);
+      remote.payload = { ...payload, updatedAt: Date.now() };
+      return { ok: true, kind: payload.kind, fingerprint: computeClipboardFingerprint(payload) };
+    },
+    getRemoteClipboard: async () => {
+      remote.getCalls += 1;
+      return { ok: true, payload: remote.payload };
+    },
+    uploadFileStream: async (_host, _port, _token, localFilePath) => {
+      uploads.push(localFilePath);
+      return {
+        ok: true,
+        filename: path.basename(localFilePath),
+        path: `C:\\remote\\SilkWarpRecv\\${path.basename(localFilePath)}`,
+        size: fs.statSync(localFilePath).size,
+      };
+    },
+    listRemoteFiles: async () => ({ currentPath: "C:\\remote", parentPath: null, roots: [], entries: [] }),
+    downloadFileStream: async (_host, _port, _token, remotePath, localSavePath) => {
+      downloads.push({ remotePath, localSavePath });
+      fs.mkdirSync(path.dirname(localSavePath), { recursive: true });
+      fs.writeFileSync(localSavePath, "downloaded");
+      return { ok: true, path: localSavePath, size: 10 };
+    },
+  };
+
+  const manager = new ClipboardSyncManager({
+    getTarget: () => ({ connected: true, host: "127.0.0.1", port: 19580, token: "test-token" }),
+    adapter,
+    client,
+    defaultReceiveDir: options.receiveDir ?? makeTempDir("clip-recv"),
+  });
+
+  return { manager, remote, local, adapter, client, uploads, downloads };
+}
+
+test("ClipboardSyncManager: local text syncs to the host exactly once (no echo on later ticks)", async () => {
+  const harness = makeSyncHarness();
+  harness.local.payload = { kind: "text", text: "主控端复制的中文文本", updatedAt: Date.now() };
+
+  await harness.manager.syncOnce();
+  assert.equal(harness.remote.setCalls.length, 1, "first tick must push the local text");
+  assert.equal(harness.remote.setCalls[0].kind, "text");
+  assert.equal(harness.remote.setCalls[0].text, "主控端复制的中文文本");
+  assert.equal(harness.manager.lastKind, "text");
+  assert.equal(typeof harness.manager.lastSyncedAt, "number");
+
+  // The host now reports the same text back; it must be recognised as our own
+  // write and neither re-pushed nor re-applied locally.
+  for (let i = 0; i < 3; i += 1) {
+    await harness.manager.syncOnce();
+  }
+  assert.equal(harness.remote.setCalls.length, 1, "identical local clipboard must not be re-pushed");
+  assert.equal(harness.local.writes.length, 0, "our own text must never be written back locally");
+  assert.equal(harness.manager.lastError, "");
+});
+
+test("ClipboardSyncManager: remote text applies locally without echoing back to the host", async () => {
+  const harness = makeSyncHarness();
+  harness.remote.payload = { kind: "text", text: "来自被控端的剪贴板", updatedAt: Date.now() };
+
+  await harness.manager.syncOnce();
+  assert.equal(harness.local.writes.length, 1, "remote text must be written to the local clipboard");
+  assert.equal(harness.local.writes[0].text, "来自被控端的剪贴板");
+  assert.equal(harness.remote.setCalls.length, 0, "nothing was locally changed, so nothing is pushed");
+  assert.equal(harness.manager.lastKind, "text");
+
+  // The local clipboard now holds the applied text; subsequent ticks must be
+  // silent in both directions.
+  for (let i = 0; i < 3; i += 1) {
+    await harness.manager.syncOnce();
+  }
+  assert.equal(harness.local.writes.length, 1, "the applied text must not be re-applied");
+  assert.equal(harness.remote.setCalls.length, 0, "the applied text must not be echoed to the host");
+});
+
+test("ClipboardSyncManager: disabled toggle stops all automatic synchronisation", async () => {
+  const harness = makeSyncHarness();
+  harness.local.payload = { kind: "text", text: "暂停期间复制的内容", updatedAt: Date.now() };
+  harness.remote.payload = { kind: "text", text: "暂停期间远端内容", updatedAt: Date.now() };
+
+  harness.manager.setEnabled(false);
+  assert.equal(harness.manager.enabled, false);
+
+  for (let i = 0; i < 3; i += 1) {
+    await harness.manager.syncOnce();
+  }
+  assert.equal(harness.remote.setCalls.length, 0, "disabled manager must not push");
+  assert.equal(harness.remote.getCalls, 0, "disabled manager must not even poll the host");
+  assert.equal(harness.local.writes.length, 0, "disabled manager must not apply remote payloads");
+
+  // Re-enabling resumes on the next explicit tick.
+  harness.manager.setEnabled(true);
+  await harness.manager.syncOnce();
+  assert.ok(harness.remote.setCalls.length + harness.local.writes.length > 0, "re-enabled manager must sync");
+});
+
+test("ClipboardSyncManager: clipboard image syncs both ways without loops", async () => {
+  const pngBase64 = TINY_PNG_BASE64;
+  const harness = makeSyncHarness();
+  harness.local.payload = { kind: "image", imageBase64: pngBase64, updatedAt: Date.now() };
+
+  await harness.manager.syncOnce();
+  assert.equal(harness.remote.setCalls.length, 1);
+  assert.equal(harness.remote.setCalls[0].kind, "image");
+  assert.equal(harness.remote.setCalls[0].imageBase64, pngBase64);
+
+  await harness.manager.syncOnce();
+  assert.equal(harness.remote.setCalls.length, 1, "image echo must be suppressed");
+
+  // Reverse direction: a fresh remote image reaches the local clipboard.
+  harness.remote.payload = {
+    kind: "image",
+    imageBase64: Buffer.from("silkwarp-second-image").toString("base64"),
+    updatedAt: Date.now(),
+  };
+  await harness.manager.syncOnce();
+  assert.equal(harness.local.writes.length, 1, "remote image must be applied locally");
+  assert.equal(harness.manager.lastKind, "image");
+});
+
+test("ClipboardSyncManager: clipboard files upload once then suppress the echoed file list", async () => {
+  const receiveDir = makeTempDir("clip-files-recv");
+  const sourceDir = makeTempDir("clip-files-src");
+  const first = path.join(sourceDir, "a.txt");
+  const second = path.join(sourceDir, "b.bin");
+  fs.writeFileSync(first, "alpha");
+  fs.writeFileSync(second, crypto.randomBytes(2048));
+
+  const harness = makeSyncHarness({ receiveDir });
+  harness.local.payload = { kind: "files", files: [first, second], updatedAt: Date.now() };
+
+  await harness.manager.syncOnce();
+  assert.deepEqual(harness.uploads, [first, second], "each clipboard file is uploaded once");
+  assert.equal(harness.remote.setCalls.length, 1);
+  assert.equal(harness.remote.setCalls[0].kind, "files");
+  assert.equal(harness.remote.setCalls[0].files.length, 2);
+  assert.equal(harness.manager.lastKind, "files");
+
+  await harness.manager.syncOnce();
+  assert.equal(harness.remote.setCalls.length, 1, "the uploaded file list must not be pushed again");
+  assert.equal(harness.local.writes.length, 0, "the echoed remote path list must not replace local files");
+});
+
+test("ClipboardSyncManager: clipboard files over 50 MiB are skipped instead of uploaded", async () => {
+  const sourceDir = makeTempDir("clip-huge-src");
+  const huge = path.join(sourceDir, "huge.bin");
+  // Sparse file: fs.stat reports the size without writing 51 MiB to disk.
+  fs.writeFileSync(huge, "");
+  fs.truncateSync(huge, MAX_CLIPBOARD_AUTO_FILES_BYTES + 1);
+
+  const harness = makeSyncHarness();
+  harness.local.payload = { kind: "files", files: [huge], updatedAt: Date.now() };
+
+  await harness.manager.syncOnce();
+  assert.deepEqual(harness.uploads, [], "oversized clipboard files must not be uploaded");
+  assert.equal(harness.remote.setCalls.length, 0);
+  assert.match(harness.manager.lastError, /50 MiB/);
+
+  // The skipped selection is remembered, so it is not retried on every tick.
+  await harness.manager.syncOnce();
+  assert.deepEqual(harness.uploads, []);
+});
+
+test("ClipboardSyncManager: remote clipboard files download into SilkWarpRecv and update both fingerprints", async () => {
+  const receiveDir = makeTempDir("clip-pull-recv");
+  const harness = makeSyncHarness({ receiveDir });
+  harness.remote.payload = {
+    kind: "files",
+    files: ["C:\\Host\\Desktop\\报告.pdf"],
+    updatedAt: Date.now(),
+  };
+
+  await harness.manager.syncOnce();
+  assert.equal(harness.downloads.length, 1);
+  assert.equal(harness.downloads[0].remotePath, "C:\\Host\\Desktop\\报告.pdf");
+  assert.equal(path.dirname(harness.downloads[0].localSavePath), receiveDir);
+  assert.equal(path.basename(harness.downloads[0].localSavePath), "报告.pdf");
+
+  assert.equal(harness.local.writes.length, 1, "downloaded paths must land on the local file clipboard");
+  assert.equal(harness.local.writes[0].kind, "files");
+  assert.deepEqual(harness.local.writes[0].files, [harness.downloads[0].localSavePath]);
+  assert.equal(harness.manager.lastKind, "files");
+
+  // Local CF_HDROP now exposes local paths — pushing them back would re-upload
+  // the same file under a new name, so the fingerprint must already match.
+  for (let i = 0; i < 2; i += 1) {
+    await harness.manager.syncOnce();
+  }
+  assert.equal(harness.uploads.length, 0, "downloaded files must never be uploaded back");
+  assert.equal(harness.local.writes.length, 1);
+});
+
+test("ClipboardSyncManager: empty clipboards and single-flight guard produce no traffic", async () => {
+  const harness = makeSyncHarness();
+
+  await harness.manager.syncOnce();
+  assert.equal(harness.remote.setCalls.length, 0);
+  assert.equal(harness.local.writes.length, 0);
+  assert.equal(harness.manager.lastKind, "empty");
+
+  // Concurrent ticks: the in-flight lock drops the second call entirely.
+  harness.local.payload = { kind: "text", text: "并发保护", updatedAt: Date.now() };
+  await Promise.all([harness.manager.syncOnce(), harness.manager.syncOnce(), harness.manager.syncOnce()]);
+  assert.equal(harness.remote.setCalls.length, 1, "single-flight lock must collapse concurrent ticks");
+
+  // A disconnected target stops all work.
+  const idle = new ClipboardSyncManager({
+    getTarget: () => ({ connected: false, host: "127.0.0.1", port: 19580, token: "" }),
+    adapter: harness.adapter,
+    client: harness.client,
+  });
+  await idle.syncOnce();
+  assert.equal(harness.remote.getCalls > 0, true);
+});
+
+test("ClipboardSyncManager: adapter write failures surface as lastError without echoing", async () => {
+  const harness = makeSyncHarness();
+  const failingAdapter = {
+    read: async () => ({ kind: "empty", updatedAt: Date.now() }),
+    write: async () => ({ ok: false, kind: "text", message: "剪贴板被占用" }),
+  };
+  const manager = new ClipboardSyncManager({
+    getTarget: () => ({ connected: true, host: "127.0.0.1", port: 19580, token: "t" }),
+    adapter: failingAdapter,
+    client: harness.client,
+  });
+
+  harness.remote.payload = { kind: "text", text: "远端文本", updatedAt: Date.now() };
+  await manager.syncOnce();
+  assert.equal(manager.lastError, "剪贴板被占用");
+  assert.equal(harness.remote.setCalls.length, 0, "a failed local write must not be pushed back");
+  // The failed payload is not marked as applied, so the next tick retries it.
+  harness.remote.payload = { kind: "text", text: "远端文本", updatedAt: Date.now() };
+  await manager.syncOnce();
+  assert.equal(manager.lastError, "剪贴板被占用");
+});
+
+// ---------------------------------------------------------------------------
+// 11. ClipboardSyncManager: Electron adapter (injected, no Electron needed)
+// ---------------------------------------------------------------------------
+
+test("createElectronClipboardAdapter: reads files > image > text in priority order", async () => {
+  const { createElectronClipboardAdapter } = require("../dist-electron/services/clipboardSyncManager.js");
+  const fileA = path.join(makeTempDir("adapter-src"), "存在.txt");
+  fs.writeFileSync(fileA, "x");
+  const missing = path.join(os.tmpdir(), `silkwarp-missing-${Date.now()}.bin`);
+
+  let imageIsEmpty = false;
+  let textValue = "退而求其次的文本";
+  const written = { texts: [], images: [] };
+  const deps = {
+    clipboard: {
+      readText: () => textValue,
+      writeText: (text) => written.texts.push(text),
+      readImage: () => ({
+        isEmpty: () => imageIsEmpty,
+        toPNG: () => Buffer.from(TINY_PNG_BASE64, "base64"),
+      }),
+      writeImage: (img) => written.images.push(img),
+    },
+    nativeImage: { createFromBuffer: (buffer) => ({ buffer }) },
+    fileDropList: {
+      read: async () => [fileA, missing],
+      write: async (paths) => paths.length > 0,
+    },
+  };
+  const adapter = createElectronClipboardAdapter(deps);
+
+  // Files win when present; missing paths are filtered out.
+  const filesPayload = await adapter.read();
+  assert.equal(filesPayload.kind, "files");
+  assert.deepEqual(filesPayload.files, [fileA]);
+
+  // No files -> image.
+  deps.fileDropList.read = async () => [];
+  imageIsEmpty = false;
+  const imagePayload = await adapter.read();
+  assert.equal(imagePayload.kind, "image");
+  assert.equal(imagePayload.imageBase64, TINY_PNG_BASE64);
+
+  // No image -> text.
+  imageIsEmpty = true;
+  const textPayload = await adapter.read();
+  assert.equal(textPayload.kind, "text");
+  assert.equal(textPayload.text, textValue);
+
+  // No text -> empty.
+  textValue = "";
+  const emptyPayload = await adapter.read();
+  assert.equal(emptyPayload.kind, "empty");
+
+  // Writes route by kind.
+  const textWrite = await adapter.write({ kind: "text", text: "写入", updatedAt: Date.now() });
+  assert.equal(textWrite.ok, true);
+  assert.deepEqual(written.texts, ["写入"]);
+
+  const imageWrite = await adapter.write({
+    kind: "image",
+    imageBase64: TINY_PNG_BASE64,
+    updatedAt: Date.now(),
+  });
+  assert.equal(imageWrite.ok, true);
+  assert.equal(written.images.length, 1);
+
+  const fileWrite = await adapter.write({ kind: "files", files: [fileA], updatedAt: Date.now() });
+  assert.equal(fileWrite.ok, true);
+
+  const missingWrite = await adapter.write({ kind: "files", files: [missing], updatedAt: Date.now() });
+  assert.equal(missingWrite.ok, false);
+  assert.match(missingWrite.message, /没有可写入/);
+});
+
+test("createElectronClipboardAdapter: oversized image payloads are rejected", async () => {
+  const { createElectronClipboardAdapter } = require("../dist-electron/services/clipboardSyncManager.js");
+  const adapter = createElectronClipboardAdapter({
+    clipboard: {
+      readText: () => "",
+      writeText: () => {},
+      readImage: () => ({ isEmpty: () => true, toPNG: () => Buffer.alloc(0) }),
+      writeImage: () => {},
+    },
+    nativeImage: { createFromBuffer: (buffer) => ({ buffer }) },
+    fileDropList: { read: async () => [], write: async () => true },
+  });
+
+  const oversized = Buffer.alloc(MAX_CLIPBOARD_IMAGE_BYTES + 1, 0x41).toString("base64");
+  const result = await adapter.write({ kind: "image", imageBase64: oversized, updatedAt: Date.now() });
+  assert.equal(result.ok, false);
+  assert.match(result.message, /10 MiB/);
 });

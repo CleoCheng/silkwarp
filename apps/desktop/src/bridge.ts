@@ -2,9 +2,14 @@ import type { SilkWarpBridge } from "../electron/preload";
 import type {
   ActiveSessionState,
   AppRuntimeState,
+  DeviceAgentSessionResult,
   DeviceInfo,
   DisplayMonitorInfo,
+  RemoteFileEntry,
+  RemoteFileListing,
+  RemoteRootDir,
   StreamPreset,
+  TransferTaskItem,
   UserInfo,
 } from "../electron/types";
 
@@ -117,7 +122,77 @@ function buildPreviewSession(device: DeviceInfo): ActiveSessionState {
     privacyActive: false,
     privacySupported: true,
     autoLockOnDisconnect: previewState.settings.autoLockOnDisconnect,
+    clipboardSyncEnabled: true,
+    clipboardLastKind: "empty",
+    clipboardLastSyncAt: null,
+    clipboardError: "",
+    transfers: [],
   };
+}
+
+// --- Preview-mode file system + clipboard simulation -----------------------
+
+const PREVIEW_RECV_ROOT = "C:\\Users\\Roger\\Desktop\\SilkWarpRecv";
+const PREVIEW_ROOTS: RemoteRootDir[] = [
+  { label: "接收文件夹", path: PREVIEW_RECV_ROOT },
+  { label: "桌面", path: "C:\\Users\\Roger\\Desktop" },
+  { label: "下载", path: "C:\\Users\\Roger\\Downloads" },
+  { label: "文档", path: "C:\\Users\\Roger\\Documents" },
+];
+
+function previewEntry(name: string, parent: string, isDirectory: boolean, size: number): RemoteFileEntry {
+  return {
+    name,
+    path: `${parent}\\${name}`,
+    isDirectory,
+    size: isDirectory ? 0 : size,
+    modifiedAt: Date.now() - 3600_000,
+  };
+}
+
+function buildPreviewListing(dirPath?: string): RemoteFileListing {
+  const currentPath = dirPath?.trim() || PREVIEW_RECV_ROOT;
+  const entries: RemoteFileEntry[] = [];
+  if (currentPath === PREVIEW_RECV_ROOT) {
+    entries.push(
+      previewEntry("归档", currentPath, true, 0),
+      previewEntry("季度汇报 (终版).pdf", currentPath, false, 2_412_640),
+      previewEntry("installer.iso", currentPath, false, 1_048_576_000),
+      previewEntry("设计稿.png", currentPath, false, 884_736),
+    );
+  } else if (currentPath.endsWith("\\归档")) {
+    entries.push(previewEntry("2025-年度总结.xlsx", currentPath, false, 512_000));
+  }
+  const parent = currentPath.includes("\\") ? currentPath.slice(0, currentPath.lastIndexOf("\\")) : null;
+  return {
+    currentPath,
+    parentPath: parent && parent.length > 2 ? parent : null,
+    roots: PREVIEW_ROOTS,
+    entries,
+  };
+}
+
+let previewTransfers: TransferTaskItem[] = [];
+
+function previewUploadTasks(localPaths: string[]): TransferTaskItem[] {
+  const created = localPaths.map((localPath) => {
+    const filename = localPath.split(/[\\/]/).pop() || localPath;
+    return {
+      id: `preview-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      direction: "upload" as const,
+      filename,
+      transferred: 1024 * 1024,
+      total: 1024 * 1024,
+      status: "done" as const,
+      localPath,
+      remotePath: `${PREVIEW_RECV_ROOT}\\${filename}`,
+    };
+  });
+  previewTransfers = [...created, ...previewTransfers].slice(0, 12);
+  if (previewSessionState) {
+    previewSessionState = { ...previewSessionState, transfers: previewTransfers };
+  }
+  return created;
 }
 
 const previewSavedPasswords = new Map<string, string>();
@@ -393,6 +468,82 @@ const previewFallback: SilkWarpBridge = {
     };
     return previewSessionState;
   },
+  listSessionFiles: async (dirPath?: string) => buildPreviewListing(dirPath),
+  uploadSessionFiles: async (localPaths: string[]) => previewUploadTasks(localPaths),
+  pickAndUploadSessionFiles: async () =>
+    previewUploadTasks([`${PREVIEW_RECV_ROOT}\\预览上传-${Date.now()}.txt`]),
+  downloadSessionFile: async (remotePath: string, suggestedName?: string) => {
+    const task: TransferTaskItem = {
+      id: `preview-dl-${Date.now()}`,
+      direction: "download",
+      filename: suggestedName || remotePath.split(/[\\/]/).pop() || "download.bin",
+      transferred: 2_412_640,
+      total: 2_412_640,
+      status: "done",
+      remotePath,
+      localPath: `C:\\Users\\Roger\\Downloads\\${suggestedName || remotePath.split(/[\\/]/).pop() || "download.bin"}`,
+    };
+    previewTransfers = [task, ...previewTransfers].slice(0, 12);
+    if (previewSessionState) {
+      previewSessionState = { ...previewSessionState, transfers: previewTransfers };
+    }
+    return task;
+  },
+  setSessionClipboardSync: async (enabled: boolean) => {
+    if (!previewSessionState) return null;
+    previewSessionState = {
+      ...previewSessionState,
+      clipboardSyncEnabled: enabled,
+      clipboardError: "",
+    };
+    return previewSessionState;
+  },
+  syncSessionClipboardNow: async () => {
+    if (!previewSessionState) return null;
+    previewSessionState = {
+      ...previewSessionState,
+      clipboardLastKind: "text",
+      clipboardLastSyncAt: Date.now(),
+      clipboardError: "",
+    };
+    return previewSessionState;
+  },
+  prepareDeviceAgent: async (device: DeviceInfo, opts): Promise<DeviceAgentSessionResult> => {
+    const denied = previewPasswordGate(device, opts);
+    if (denied) {
+      return {
+        ok: false,
+        needsPassword: true,
+        message: denied.message,
+        agentPort: device.agent_port || 19580,
+        agentToken: "",
+      };
+    }
+    return {
+      ok: true,
+      message: "预览模式：已连接文件通道",
+      agentPort: device.agent_port || 19580,
+      agentToken: "preview-agent-token",
+    };
+  },
+  listDeviceFiles: async (args) => buildPreviewListing(args.dirPath),
+  uploadDeviceFiles: async (args) => previewUploadTasks(args.localPaths),
+  pickAndUploadDeviceFiles: async () =>
+    previewUploadTasks([`${PREVIEW_RECV_ROOT}\\预览快传-${Date.now()}.bin`]),
+  downloadDeviceFile: async (args) => {
+    const filename = args.suggestedName || args.remotePath.split(/[\\/]/).pop() || "download.bin";
+    return {
+      id: `preview-device-dl-${Date.now()}`,
+      direction: "download",
+      filename,
+      transferred: 884_736,
+      total: 884_736,
+      status: "done",
+      remotePath: args.remotePath,
+      localPath: `C:\\Users\\Roger\\Downloads\\${filename}`,
+    };
+  },
+  getPathForFile: (file: File) => (file as { path?: string }).path || "",
   setAccessPassword: async (payload) => {
     const nextSettings = { ...previewState.settings };
     if (payload.requireAccessPassword !== undefined) {
