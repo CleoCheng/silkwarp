@@ -7,6 +7,7 @@ import {
   Download,
   ExternalLink,
   Loader2,
+  MousePointer2,
   RefreshCw,
   Shield,
   Wrench,
@@ -153,6 +154,92 @@ export function HostModeView({
           </div>
         </div>
       )}
+
+      {/* Office-mode RustDesk channel */}
+      <div className="rounded-2xl border border-emerald-500/25 bg-panel p-5 space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <MousePointer2 className="w-4 h-4 text-emerald-300" />
+              <h3 className="text-sm font-bold text-slate-50">办公极速光标通道（自建 RustDesk）</h3>
+              <span
+                className={`text-[11px] px-2 py-0.5 rounded-full font-medium border ${
+                  host.rustdeskInstalled
+                    ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/35"
+                    : "bg-slate-800 text-slate-400 border-edge"
+                }`}
+              >
+                {host.rustdeskInstalled ? "已安装" : "未安装"}
+              </span>
+            </div>
+            <p className="text-xs text-slate-400 leading-relaxed max-w-2xl">
+              高刷看视频、设计渲染请使用上面的 Apollo 低延迟串流；文字办公、精细点击、操作锁屏 / UAC 弹窗时，
+              其他设备可一键切入 RustDesk，获得 <strong className="text-emerald-200">0ms 本地硬件光标</strong>。
+              本机只需配齐自建中继与公钥，其他设备即可随时切入。
+            </p>
+          </div>
+
+          <div className="rounded-xl border border-edge bg-obsidian/70 px-4 py-2.5 text-xs min-w-[170px]">
+            <div className="text-slate-500">当前 RustDesk ID</div>
+            <div className="mt-0.5 font-mono text-base font-bold text-emerald-200">
+              {host.rustdeskId || "未读取到"}
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-[11px]">
+          <div className="rounded-xl border border-edge bg-obsidian/60 px-3 py-2 flex items-center justify-between">
+            <span className="text-slate-400">RustDesk 客户端</span>
+            <span className={host.rustdeskInstalled ? "text-emerald-300 font-semibold" : "text-amber-300 font-semibold"}>
+              {host.rustdeskInstalled ? "已安装" : "待安装"}
+            </span>
+          </div>
+          <div className="rounded-xl border border-edge bg-obsidian/60 px-3 py-2 flex items-center justify-between">
+            <span className="text-slate-400">本机 ID 上报</span>
+            <span className={host.rustdeskId ? "text-emerald-300 font-semibold" : "text-amber-300 font-semibold"}>
+              {host.rustdeskId ? "已就绪" : "待同步"}
+            </span>
+          </div>
+          <div className="rounded-xl border border-edge bg-obsidian/60 px-3 py-2 flex items-center justify-between">
+            <span className="text-slate-400">自建中继 / 公钥</span>
+            <span className={state.bootstrap?.rustdesk?.public_key ? "text-emerald-300 font-semibold" : "text-slate-400 font-semibold"}>
+              {state.bootstrap?.rustdesk?.public_key ? "已下发" : "登录后自动下发"}
+            </span>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          {!host.rustdeskInstalled ? (
+            <button
+              type="button"
+              onClick={() => void onInstallRustDesk().then(() => notify("已下载并启动 RustDesk 安装，完成后将自动接入自建中继")).catch((e) => notify(e.message))}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-gradient-to-r from-emerald-400 to-teal-500 px-4 py-2 text-xs font-bold text-slate-950 hover:opacity-95"
+            >
+              <Download className="w-3.5 h-3.5" /> 一键安装并接入自建中继
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void onConfigureRustDesk().then(() => notify("已同步自建 RustDesk 中继配置")).catch((e) => notify(e.message))}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-xs font-bold text-emerald-200 hover:bg-emerald-500/25"
+            >
+              <Wrench className="w-3.5 h-3.5" /> 同步自建服务器配置
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => void onOpenExternal("https://rustdesk.com/docs/en/self-host/").catch((e) => notify(e.message))}
+            className="inline-flex items-center gap-1 rounded-xl border border-edge bg-panelHover px-3 py-2 text-xs text-slate-300 hover:text-white"
+          >
+            <ExternalLink className="w-3.5 h-3.5" /> 自建中继说明
+          </button>
+          {host.rustdeskInstalled && (
+            <span className="text-[11px] text-slate-500">
+              配置写入后会重启 RustDesk 使 ID / 中继立即生效。
+            </span>
+          )}
+        </div>
+      </div>
 
       {/* Collapsed Advanced Controls */}
       <div className="rounded-2xl border border-edge bg-panel overflow-hidden">

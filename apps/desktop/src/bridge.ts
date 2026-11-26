@@ -1,5 +1,5 @@
 import type { SilkWarpBridge } from "../electron/preload";
-import type { AppRuntimeState, DeviceInfo, StreamPreset, UserInfo } from "../electron/types";
+import type { ActiveSessionState, AppRuntimeState, DeviceInfo, StreamPreset, UserInfo } from "../electron/types";
 
 declare global {
   interface Window {
@@ -55,6 +55,7 @@ const PREVIEW_DEVICES: DeviceInfo[] = [
 ];
 
 let previewAuthed = false;
+let previewSessionState: ActiveSessionState | null = null;
 let previewState: AppRuntimeState = {
   authenticated: false,
   user: null,
@@ -67,7 +68,21 @@ let previewState: AppRuntimeState = {
     autoStart: false,
     apolloUser: "",
     apolloPass: "",
-    preset: { resolution: "2560x1440", fps: 120, bitrateMbps: 35, codec: "hevc" },
+    preset: {
+      resolution: "2560x1440",
+      fps: 120,
+      bitrateMbps: 35,
+      codec: "hevc",
+      displayMode: "windowed",
+      streamApp: "Virtual Display",
+      muteHostAudio: true,
+      lowLatency: true,
+      adaptiveRelayCap: true,
+      absoluteMouse: true,
+      showPerfOverlay: false,
+      captureSystemKeys: "fullscreen",
+      packetSize: "auto",
+    },
   },
   easytier: {
     running: true,
@@ -162,7 +177,22 @@ const previewFallback: SilkWarpBridge = {
   installApollo: async () => "",
   installRustDesk: async () => "",
   openExternal: async () => {},
-  connectDevice: async (device) => ({ ok: true, stage: "connected", message: `正在远程连接 ${device.name}...` }),
+  connectDevice: async (device) => {
+    previewSessionState = {
+      sessionId: "preview-session",
+      device,
+      preset: previewState.settings.preset,
+      effectivePreset: previewState.settings.preset,
+      routeType: device.route_type || "p2p",
+      latencyMs: device.latency_ms,
+      resolvedApp: "Virtual Display",
+      availableApps: ["Desktop", "Virtual Display"],
+      windowRect: null,
+      reconnecting: false,
+      startedAt: Date.now(),
+    };
+    return { ok: true, stage: "connected", message: `正在远程连接 ${device.name}...` };
+  },
   retryProvision: async () => previewState,
   streamDevice: async () => {},
   openMoonlightGui: async () => {},
@@ -182,6 +212,48 @@ const previewFallback: SilkWarpBridge = {
   }),
   adminUpdateUser: async () => previewState.user!,
   adminDeleteUser: async () => true,
+  getSessionState: async (): Promise<ActiveSessionState | null> => previewSessionState,
+  updateSessionOptions: async (patch: Partial<StreamPreset>) => {
+    previewState = {
+      ...previewState,
+      settings: {
+        ...previewState.settings,
+        preset: { ...previewState.settings.preset, ...patch },
+      },
+    };
+    if (previewSessionState) {
+      previewSessionState = {
+        ...previewSessionState,
+        preset: previewState.settings.preset,
+        effectivePreset: previewState.settings.preset,
+      };
+    }
+    return previewSessionState;
+  },
+  fitSessionWindow: async () => previewSessionState,
+  toggleSessionFullscreen: async () => {
+    if (!previewSessionState) return null;
+    const nextMode = previewSessionState.preset.displayMode === "fullscreen" ? "windowed" : "fullscreen";
+    previewSessionState = {
+      ...previewSessionState,
+      preset: { ...previewSessionState.preset, displayMode: nextMode },
+      effectivePreset: { ...previewSessionState.effectivePreset, displayMode: nextMode },
+    };
+    previewState = {
+      ...previewState,
+      settings: { ...previewState.settings, preset: previewSessionState.preset },
+    };
+    return previewSessionState;
+  },
+  sendSessionHotkey: async () => {},
+  focusSessionRemote: async () => {},
+  switchSessionOfficeMode: async () => {},
+  disconnectSession: async () => {
+    previewSessionState = null;
+  },
+  setSessionBarExpanded: async () => {},
+  nudgeSessionBarOffset: async () => {},
+  onSessionChanged: () => () => {},
   onStateChanged: () => () => {},
 };
 

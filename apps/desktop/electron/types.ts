@@ -52,11 +52,51 @@ export interface BootstrapConfig {
   device: DeviceInfo;
 }
 
+export type DisplayMode = "windowed" | "borderless" | "fullscreen";
+export type StreamAppTarget = "Virtual Display" | "Desktop";
+export type SystemKeyCaptureMode = "always" | "fullscreen" | "never";
+export type SessionHotkeyAction = "fullscreen" | "perf" | "mouse";
+
 export interface StreamPreset {
-  resolution: "1920x1080" | "2560x1440" | "3840x2160";
-  fps: 60 | 120 | 144;
+  resolution: string;
+  fps: 30 | 60 | 120 | 144;
   bitrateMbps: number;
   codec: "hevc" | "av1" | "h264";
+  displayMode: DisplayMode;
+  streamApp: StreamAppTarget;
+  muteHostAudio: boolean;
+  lowLatency: boolean;
+  adaptiveRelayCap: boolean;
+  absoluteMouse: boolean;
+  showPerfOverlay: boolean;
+  captureSystemKeys: SystemKeyCaptureMode;
+  packetSize: "auto" | number;
+}
+
+export interface WindowRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  clientWidth: number;
+  clientHeight: number;
+  visible: boolean;
+  minimized: boolean;
+  foreground: boolean;
+}
+
+export interface ActiveSessionState {
+  sessionId: string;
+  device: DeviceInfo;
+  preset: StreamPreset;
+  effectivePreset: StreamPreset;
+  routeType: string;
+  latencyMs: number | null;
+  resolvedApp: StreamAppTarget;
+  availableApps: string[];
+  windowRect: WindowRect | null;
+  reconnecting: boolean;
+  startedAt: number;
 }
 
 export interface PeerStatus {

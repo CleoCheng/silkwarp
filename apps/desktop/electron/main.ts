@@ -21,10 +21,11 @@ import {
   submitApolloPin,
 } from "./services/hostManager";
 import { StateStore } from "./services/store";
+import { StreamSessionManager } from "./services/streamSessionManager";
+import { normalizeStreamPreset } from "./services/streamOptions";
 import {
   isMoonlightHostPaired,
   launchMoonlightGui,
-  launchMoonlightStream,
   launchRustDeskConnect,
   probeRemoteApolloPermission,
   probeTcpPort,
@@ -32,11 +33,13 @@ import {
   wakeDeviceViaGateway,
 } from "./services/streamLauncher";
 import type {
+  ActiveSessionState,
   AppRuntimeState,
   BootstrapConfig,
   DeviceInfo,
   HostHardwareInfo,
   ProvisionStage,
+  SessionHotkeyAction,
   StreamPreset,
 } from "./types";
 
@@ -54,6 +57,11 @@ const client = new ControlClient(
   () => store.get().token,
 );
 const easyTier = new EasyTierManager();
+const sessionManager = new StreamSessionManager(store, (sessionState: ActiveSessionState | null) => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("session:stateChanged", sessionState);
+  }
+});
 
 let bootstrapCache: BootstrapConfig | null = null;
 let devicesCache: DeviceInfo[] = [];
@@ -345,6 +353,7 @@ async function syncAll(): Promise<void> {
     }
 
     const peers = easyTier.getStatus().peers;
+    sessionManager.updateTelemetry(peers);
     const activeRelay = peers.find((p) => p.cost === "p2p" || p.cost.startsWith("relay"));
     const routeType = activeRelay ? activeRelay.cost : easyTier.getStatus().running ? "local" : "offline";
     const latencyMs = activeRelay ? activeRelay.latencyMs : null;
@@ -511,6 +520,7 @@ app.on("before-quit", () => {
   isQuitting = true;
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (pairPollTimer) clearInterval(pairPollTimer);
+  void sessionManager.disconnect();
   easyTier.stop();
 });
 
@@ -557,8 +567,38 @@ ipcMain.handle("auth:logout", async () => {
 });
 
 ipcMain.handle("settings:updatePreset", async (_evt, preset: StreamPreset) => {
-  store.update({ preset });
+  const next = await sessionManager.updateOptions(preset);
+  if (!next) {
+    store.update({ preset: normalizeStreamPreset(preset) });
+  }
   return buildRuntimeState();
+});
+
+// --- Session IPC ---
+ipcMain.handle("session:getState", async () => sessionManager.getState());
+ipcMain.handle("session:updateOptions", async (_evt, patch: Partial<StreamPreset>) =>
+  sessionManager.updateOptions(patch),
+);
+ipcMain.handle("session:fitWindow", async () => sessionManager.fitToWindow());
+ipcMain.handle("session:toggleFullscreen", async () => sessionManager.toggleFullscreen());
+ipcMain.handle("session:sendHotkey", async (_evt, action: SessionHotkeyAction) => {
+  sessionManager.sendHotkey(action);
+});
+ipcMain.handle("session:focusRemote", async () => {
+  sessionManager.focusRemoteWindow();
+});
+ipcMain.handle("session:switchOfficeMode", async () => {
+  if (!bootstrapCache) throw new Error("请先登录账号");
+  await sessionManager.switchToOfficeMode(bootstrapCache);
+});
+ipcMain.handle("session:disconnect", async () => {
+  await sessionManager.disconnect();
+});
+ipcMain.handle("session:setBarExpanded", async (_evt, expanded: boolean) => {
+  sessionManager.setBarExpanded(Boolean(expanded));
+});
+ipcMain.handle("session:setBarOffset", async (_evt, deltaX: number) => {
+  sessionManager.nudgeBarOffset(Number(deltaX) || 0);
 });
 
 ipcMain.handle("host:updateSettings", async (_evt, patch: Record<string, unknown>) => {
@@ -616,6 +656,7 @@ ipcMain.handle("app:relaunchAdmin", async () => {
   isQuitting = true;
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   if (pairPollTimer) clearInterval(pairPollTimer);
+  void sessionManager.disconnect();
   easyTier.stop();
   tray?.destroy();
   setTimeout(() => app.exit(0), 150);
@@ -679,7 +720,7 @@ ipcMain.handle("device:connect", async (_evt, device: DeviceInfo) => {
       store.update({ pairedHosts: { ...s.pairedHosts, [device.id]: device.mesh_ip } });
     }
     await assertRemoteInputPermission(device);
-    launchMoonlightStream(device, s.preset);
+    await sessionManager.startSession(device, device.route_type || "p2p", device.latency_ms ?? null);
     return { ok: true, stage: "streaming", message: `正在连接「${device.name}」桌面...` };
   }
 
@@ -715,7 +756,7 @@ ipcMain.handle("device:connect", async (_evt, device: DeviceInfo) => {
         store.update({ pairedHosts: { ...cur.pairedHosts, [device.id]: device.mesh_ip } });
         await new Promise((r) => setTimeout(r, 350));
         await assertRemoteInputPermission(device);
-        launchMoonlightStream(device, cur.preset);
+        await sessionManager.startSession(device, device.route_type || "p2p", device.latency_ms ?? null);
         return { ok: true, stage: "connected", message: `首次静默握手成功，正在进入「${device.name}」桌面！` };
       }
       lastReason = remoteFailure || pairOutcome.output || lastReason;
@@ -746,7 +787,7 @@ ipcMain.handle("device:stream", async (_evt, device: DeviceInfo) => {
     );
   }
   await assertRemoteInputPermission(device);
-  launchMoonlightStream(device, store.get().preset);
+  await sessionManager.startSession(device, device.route_type || "p2p", device.latency_ms ?? null);
 });
 
 ipcMain.handle("device:moonlightGui", async () => {

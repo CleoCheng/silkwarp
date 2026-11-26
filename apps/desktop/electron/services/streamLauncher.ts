@@ -1,12 +1,14 @@
 import { execFile, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import https from "node:https";
 import net from "node:net";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { BootstrapConfig, DeviceInfo, StreamPreset } from "../types";
+import type { BootstrapConfig, DeviceInfo, StreamAppTarget, StreamPreset } from "../types";
 import { parseApolloServerInfoPermission, parseMoonlightIniCredentials } from "./apolloPermissions";
 import { configureRustDeskClient, findRustDeskExe } from "./hostManager";
+import { buildMoonlightStreamArgs } from "./streamOptions";
 
 const execFileAsync = promisify(execFile);
 
@@ -41,6 +43,22 @@ export function resolveMoonlightExe(): string | null {
 }
 
 /**
+ * Reads the local Moonlight client certificate/key pair from the portable
+ * Moonlight.ini. Returns `null` when the exe or the ini is missing.
+ */
+function readLocalMoonlightCredentials(): ReturnType<typeof parseMoonlightIniCredentials> {
+  const exe = resolveMoonlightExe();
+  if (!exe) return null;
+  const iniPath = path.join(path.dirname(exe), "Moonlight Game Streaming Project", "Moonlight.ini");
+  try {
+    if (!fs.existsSync(iniPath)) return null;
+    return parseMoonlightIniCredentials(fs.readFileSync(iniPath, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Queries the remote Apollo/Sunshine `/serverinfo` endpoint using the local
  * Moonlight client certificate to learn whether this client is paired and
  * whether it has been granted mouse + keyboard input permissions.
@@ -54,19 +72,7 @@ export async function probeRemoteApolloPermission(
   httpsPort = 47984,
   timeoutMs = 2500,
 ): Promise<{ paired: boolean; permission: number | null; hasInput: boolean } | null> {
-  const exe = resolveMoonlightExe();
-  if (!exe) return null;
-
-  const iniPath = path.join(path.dirname(exe), "Moonlight Game Streaming Project", "Moonlight.ini");
-  let iniContent: string;
-  try {
-    if (!fs.existsSync(iniPath)) return null;
-    iniContent = fs.readFileSync(iniPath, "utf-8");
-  } catch {
-    return null;
-  }
-
-  const creds = parseMoonlightIniCredentials(iniContent);
+  const creds = readLocalMoonlightCredentials();
   if (!creds) return null;
 
   return new Promise((resolve) => {
@@ -197,30 +203,103 @@ export function spawnSilentMoonlightPair(
   };
 }
 
-export function launchMoonlightStream(device: DeviceInfo, preset: StreamPreset): void {
+/**
+ * Enumerates the apps advertised by the remote Apollo host. Returns `[]` on any
+ * failure (missing exe/ini, timeout, non-200, malformed XML) so callers can
+ * fall back to `"Desktop"` without blocking a connection.
+ */
+export async function fetchAvailableApolloApps(
+  meshIp: string,
+  httpsPort = 47984,
+  timeoutMs = 2000,
+): Promise<string[]> {
+  const creds = readLocalMoonlightCredentials();
+  if (!creds) return [];
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (apps: string[]) => {
+      if (settled) return;
+      settled = true;
+      resolve(apps);
+    };
+
+    const req = https.request(
+      {
+        hostname: meshIp,
+        port: httpsPort,
+        path: `/applist?uniqueid=${encodeURIComponent(creds.uniqueId)}`,
+        method: "GET",
+        cert: creds.cert,
+        key: creds.key,
+        rejectUnauthorized: false,
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          if (res.statusCode !== 200) {
+            finish([]);
+            return;
+          }
+          const body = Buffer.concat(chunks).toString("utf-8");
+          const apps: string[] = [];
+          const re = /<AppTitle>\s*([^<]+?)\s*<\/AppTitle>/gi;
+          let match: RegExpExecArray | null;
+          while ((match = re.exec(body)) !== null) {
+            const title = match[1].trim();
+            if (title) apps.push(title);
+          }
+          finish(apps);
+        });
+        res.on("error", () => finish([]));
+      },
+    );
+    req.on("error", () => finish([]));
+    req.on("timeout", () => {
+      req.destroy();
+      finish([]);
+    });
+    req.end();
+  });
+}
+
+/**
+ * Spawns Moonlight for a managed session. Unlike the legacy fire-and-forget
+ * launcher this keeps the child attached (no `detached` / `unref`) so the
+ * session manager can hot-reload it and reap it on disconnect.
+ */
+export function spawnMoonlightStreamProcess(
+  meshIp: string,
+  preset: StreamPreset,
+  routeType = "p2p",
+  resolvedApp: StreamAppTarget = "Desktop",
+): ChildProcess {
   const exe = resolveMoonlightExe();
   if (!exe) {
     throw new Error("未找到内置 Moonlight.exe，请先执行资源打包准备。");
   }
-  const codecMap: Record<StreamPreset["codec"], string> = {
-    hevc: "HEVC",
-    av1: "AV1",
-    h264: "H.264",
-  };
-  const args = [
-    "--resolution",
-    preset.resolution,
-    "--fps",
-    String(preset.fps),
-    "--bitrate",
-    String(preset.bitrateMbps * 1000),
-    "--video-codec",
-    codecMap[preset.codec] || "HEVC",
-    "--absolute-mouse",
-    "stream",
-    device.mesh_ip,
-    "Desktop",
-  ];
+  const args = buildMoonlightStreamArgs(meshIp, preset, routeType, resolvedApp);
+  return spawn(exe, args, {
+    cwd: path.dirname(exe),
+    detached: false,
+    windowsHide: false,
+    stdio: "ignore",
+  });
+}
+
+export function launchMoonlightStream(
+  device: DeviceInfo,
+  preset: StreamPreset,
+  routeType = "p2p",
+  resolvedApp: StreamAppTarget = "Desktop",
+): void {
+  const exe = resolveMoonlightExe();
+  if (!exe) {
+    throw new Error("未找到内置 Moonlight.exe，请先执行资源打包准备。");
+  }
+  const args = buildMoonlightStreamArgs(device.mesh_ip, preset, routeType, resolvedApp);
   const child = spawn(exe, args, {
     cwd: path.dirname(exe),
     detached: true,

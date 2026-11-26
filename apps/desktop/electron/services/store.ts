@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { AppSettings, StreamPreset, UserInfo } from "../types";
+import { DEFAULT_STREAM_PRESET, normalizeStreamPreset } from "./streamOptions";
 
 export interface ExternalAppConfig {
   apiUrl?: string;
@@ -23,13 +24,6 @@ export interface PersistedState {
   pairedHosts: Record<string, string>;
   preset: StreamPreset;
 }
-
-const DEFAULT_PRESET: StreamPreset = {
-  resolution: "2560x1440",
-  fps: 120,
-  bitrateMbps: 35,
-  codec: "hevc",
-};
 
 function normalizeApiUrl(raw: unknown): string {
   return typeof raw === "string" ? raw.trim().replace(/\/+$/, "") : "";
@@ -100,7 +94,7 @@ export class StateStore {
       apolloUser: "",
       apolloPass: "",
       pairedHosts: {},
-      preset: { ...DEFAULT_PRESET },
+      preset: { ...DEFAULT_STREAM_PRESET },
     };
     try {
       if (!fs.existsSync(this.filePath)) {
@@ -112,7 +106,7 @@ export class StateStore {
         ...fallback,
         ...parsed,
         pairedHosts: parsed.pairedHosts ?? {},
-        preset: { ...DEFAULT_PRESET, ...(parsed.preset ?? {}) },
+        preset: normalizeStreamPreset(parsed.preset),
       };
       if (!merged.apiUrl && this.externalConfig.apiUrl) {
         merged.apiUrl = this.externalConfig.apiUrl;
@@ -151,7 +145,9 @@ export class StateStore {
     this.state = {
       ...this.state,
       ...patch,
-      preset: patch.preset ? { ...this.state.preset, ...patch.preset } : this.state.preset,
+      preset: normalizeStreamPreset(
+        patch.preset ? { ...this.state.preset, ...patch.preset } : this.state.preset,
+      ),
     };
     this.saveRaw(this.state);
     return this.state;

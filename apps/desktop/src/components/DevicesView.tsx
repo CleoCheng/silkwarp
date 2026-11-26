@@ -4,13 +4,14 @@ import {
   Edit3,
   Loader2,
   MonitorPlay,
+  MousePointer2,
   Power,
   RefreshCw,
-  Terminal,
   Trash2,
   Wifi,
   WifiOff,
   X,
+  Zap,
 } from "lucide-react";
 import type { ConnectDeviceResult, DeviceInfo, StreamPreset } from "../../electron/types";
 
@@ -31,10 +32,10 @@ interface DevicesViewProps {
   notify: (msg: string) => void;
 }
 
-const QUICK_PRESETS: Array<{ label: string; preset: StreamPreset }> = [
-  { label: "流畅省流 · 1080P 60帧", preset: { resolution: "1920x1080", fps: 60, bitrateMbps: 15, codec: "hevc" } },
-  { label: "超清高刷 · 2K 120帧", preset: { resolution: "2560x1440", fps: 120, bitrateMbps: 35, codec: "hevc" } },
-  { label: "极致原画 · 4K 60帧", preset: { resolution: "3840x2160", fps: 60, bitrateMbps: 60, codec: "hevc" } },
+const QUICK_PRESETS: Array<{ label: string; preset: Pick<StreamPreset, "resolution" | "fps" | "bitrateMbps"> }> = [
+  { label: "流畅省流 · 1080P 60帧", preset: { resolution: "1920x1080", fps: 60, bitrateMbps: 15 } },
+  { label: "超清高刷 · 2K 120帧", preset: { resolution: "2560x1440", fps: 120, bitrateMbps: 35 } },
+  { label: "极致原画 · 4K 60帧", preset: { resolution: "3840x2160", fps: 60, bitrateMbps: 60 } },
 ];
 
 export function DevicesView({
@@ -94,49 +95,121 @@ export function DevicesView({
   return (
     <div className="space-y-5">
       {/* Stream Preset Bar */}
-      <div className="rounded-2xl border border-edge bg-panel p-4 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-2">
-          {QUICK_PRESETS.map((q) => {
-            const active =
-              preset.resolution === q.preset.resolution &&
-              preset.fps === q.preset.fps &&
-              preset.bitrateMbps === q.preset.bitrateMbps;
-            return (
-              <button
-                key={q.label}
-                type="button"
-                onClick={() => void onUpdatePreset({ ...q.preset, codec: preset.codec })}
-                className={`rounded-xl px-3 py-1.5 text-xs font-semibold border transition-colors ${
-                  active
-                    ? "bg-sky-500/15 text-sky-300 border-sky-500/40"
-                    : "border-edge bg-panelHover text-slate-300 hover:text-white"
-                }`}
-              >
-                {q.label}
-              </button>
-            );
-          })}
+      <div className="rounded-2xl border border-edge bg-panel p-4 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-2">
+            {QUICK_PRESETS.map((q) => {
+              const active =
+                preset.resolution === q.preset.resolution &&
+                preset.fps === q.preset.fps &&
+                preset.bitrateMbps === q.preset.bitrateMbps;
+              return (
+                <button
+                  key={q.label}
+                  type="button"
+                  onClick={() => void onUpdatePreset({ ...preset, ...q.preset })}
+                  className={`rounded-xl px-3 py-1.5 text-xs font-semibold border transition-colors ${
+                    active
+                      ? "bg-sky-500/15 text-sky-300 border-sky-500/40"
+                      : "border-edge bg-panelHover text-slate-300 hover:text-white"
+                  }`}
+                >
+                  {q.label}
+                </button>
+              );
+            })}
 
-          <select
-            aria-label="编码器"
-            value={preset.codec}
-            onChange={(e) => void onUpdatePreset({ ...preset, codec: e.target.value as StreamPreset["codec"] })}
-            className="rounded-xl border border-edge bg-panelHover px-2.5 py-1.5 text-xs text-slate-200"
+            <select
+              aria-label="编码器"
+              value={preset.codec}
+              onChange={(e) => void onUpdatePreset({ ...preset, codec: e.target.value as StreamPreset["codec"] })}
+              className="rounded-xl border border-edge bg-panelHover px-2.5 py-1.5 text-xs text-slate-200"
+            >
+              <option value="hevc">H.265 (推荐)</option>
+              <option value="av1">AV1 (新显卡)</option>
+              <option value="h264">H.264 (兼容)</option>
+            </select>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => void onRefresh()}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-edge bg-panelHover px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-sky-500/50 transition-colors"
           >
-            <option value="hevc">H.265 (推荐)</option>
-            <option value="av1">AV1 (新显卡)</option>
-            <option value="h264">H.264 (兼容)</option>
-          </select>
+            <RefreshCw className="w-3.5 h-3.5" />
+            刷新设备
+          </button>
         </div>
 
-        <button
-          type="button"
-          onClick={() => void onRefresh()}
-          className="inline-flex items-center gap-1.5 rounded-xl border border-edge bg-panelHover px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-sky-500/50 transition-colors"
-        >
-          <RefreshCw className="w-3.5 h-3.5" />
-          刷新设备
-        </button>
+        {/* Stage 1 quick switches */}
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-2 pt-3 border-t border-edge/60 text-[11px]">
+          <div className="flex items-center gap-1.5">
+            <span className="text-slate-500">显示模式</span>
+            <div className="flex rounded-lg border border-edge bg-obsidian/70 p-0.5">
+              {([
+                { value: "windowed", label: "窗口" },
+                { value: "borderless", label: "无边框" },
+                { value: "fullscreen", label: "全屏" },
+              ] as const).map((m) => (
+                <button
+                  key={m.value}
+                  type="button"
+                  onClick={() => void onUpdatePreset({ ...preset, displayMode: m.value })}
+                  className={`rounded-md px-2 py-0.5 font-semibold transition-colors ${
+                    preset.displayMode === m.value
+                      ? "bg-sky-500/20 text-sky-300"
+                      : "text-slate-400 hover:text-slate-100"
+                  }`}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1.5">
+            <span className="text-slate-500">画面源</span>
+            <div className="flex rounded-lg border border-edge bg-obsidian/70 p-0.5">
+              {([
+                { value: "Virtual Display", label: "虚拟屏" },
+                { value: "Desktop", label: "桌面" },
+              ] as const).map((m) => (
+                <button
+                  key={m.value}
+                  type="button"
+                  onClick={() => void onUpdatePreset({ ...preset, streamApp: m.value })}
+                  className={`rounded-md px-2 py-0.5 font-semibold transition-colors ${
+                    preset.streamApp === m.value
+                      ? "bg-sky-500/20 text-sky-300"
+                      : "text-slate-400 hover:text-slate-100"
+                  }`}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <label className="inline-flex items-center gap-1.5 text-slate-300 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={preset.muteHostAudio}
+              onChange={(e) => void onUpdatePreset({ ...preset, muteHostAudio: e.target.checked })}
+              className="rounded border-edge bg-panelHover text-sky-400"
+            />
+            被控端静音
+          </label>
+
+          <label className="inline-flex items-center gap-1.5 text-slate-300 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={preset.lowLatency}
+              onChange={(e) => void onUpdatePreset({ ...preset, lowLatency: e.target.checked })}
+              className="rounded border-edge bg-panelHover text-sky-400"
+            />
+            低延迟抗分片
+          </label>
+        </div>
       </div>
 
       {/* Device Grid */}
@@ -190,6 +263,14 @@ export function DevicesView({
                       {statusLabel}
                     </span>
                   </div>
+
+                  {d.route_type?.startsWith("relay") &&
+                    preset.adaptiveRelayCap &&
+                    (preset.fps > 60 || preset.bitrateMbps > 15) && (
+                      <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/35 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold text-amber-200">
+                        <Zap className="w-3 h-3" /> 中继保护 60Hz
+                      </span>
+                    )}
 
                   <div className="rounded-xl bg-obsidian/70 border border-edge/70 p-3 space-y-1.5 text-xs">
                     <div className="flex items-center justify-between text-slate-300">
@@ -245,10 +326,11 @@ export function DevicesView({
                         <button
                           type="button"
                           onClick={() => void onRustDesk(d).catch((e) => notify(e.message))}
-                          className="inline-flex items-center gap-1 rounded-lg border border-edge bg-panelHover px-2.5 py-1 text-[11px] text-slate-200 hover:border-sky-500/40"
+                          className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-200 hover:bg-emerald-500/20"
+                          title="停止高刷串流并以本地 0ms 硬件光标接管，适合文字办公与锁屏/UAC 运维"
                         >
-                          <Terminal className="w-3 h-3 text-sky-400" />
-                          运维 / 文件
+                          <MousePointer2 className="w-3 h-3" />
+                          办公模式 (0ms光标)
                         </button>
                       )}
                     </div>
