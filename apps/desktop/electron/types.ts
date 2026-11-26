@@ -1,3 +1,7 @@
+import type { DisplayMonitorInfo, SystemActionType } from "./services/hostAgentServer";
+
+export type { DisplayMonitorInfo, SystemActionType } from "./services/hostAgentServer";
+
 export interface UserInfo {
   id: string;
   username: string;
@@ -28,6 +32,8 @@ export interface DeviceInfo {
   online: boolean;
   last_seen: string;
   created_at: string;
+  has_access_password?: boolean;
+  agent_port?: number;
 }
 
 export interface BootstrapConfig {
@@ -97,6 +103,13 @@ export interface ActiveSessionState {
   windowRect: WindowRect | null;
   reconnecting: boolean;
   startedAt: number;
+  agentConnected: boolean;
+  displays: DisplayMonitorInfo[];
+  selectedDisplayId: string;
+  hostMuted: boolean;
+  privacyActive: boolean;
+  privacySupported: boolean;
+  autoLockOnDisconnect: boolean;
 }
 
 export interface PeerStatus {
@@ -135,6 +148,8 @@ export interface ConnectDeviceResult {
   ok: boolean;
   stage?: string;
   message: string;
+  needsPassword?: boolean;
+  retryAfterSec?: number;
 }
 
 export interface HostHardwareInfo {
@@ -154,6 +169,8 @@ export interface HostHardwareInfo {
   provisionStage: ProvisionStage;
   provisionMessage: string;
   apolloAuthReady: boolean;
+  agentRunning: boolean;
+  agentPort: number;
 }
 
 export interface AppSettings {
@@ -165,6 +182,13 @@ export interface AppSettings {
   apolloUser: string;
   apolloPass: string;
   preset: StreamPreset;
+  requireAccessPassword: boolean;
+  hasAccessPassword: boolean;
+  allowSameAccountBypass: boolean;
+  autoLockOnDisconnect: boolean;
+  agentPort: number;
+  tempAccessPassword: string;
+  tempAccessPasswordExpiresAt: number;
 }
 
 export interface AppRuntimeState {

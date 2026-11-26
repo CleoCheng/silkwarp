@@ -4,11 +4,15 @@ import type {
   ActiveSessionState,
   BootstrapConfig,
   DeviceInfo,
+  DisplayMonitorInfo,
   PeerStatus,
   SessionHotkeyAction,
   StreamPreset,
+  SystemActionType,
 } from "../types";
 import { FloatingBarWindow } from "./floatingBarWindow";
+import { DEFAULT_AGENT_PORT } from "./hostAgentAuth";
+import { HostAgentClient } from "./hostAgentClient";
 import type { StateStore } from "./store";
 import {
   computeEffectivePreset,
@@ -47,11 +51,17 @@ function parseResolution(resolution: string): { width: number; height: number } 
 export class StreamSessionManager {
   private readonly store: StateStore;
   private readonly onStateChange: (state: ActiveSessionState | null) => void;
+  private readonly agentClient: HostAgentClient;
 
   private active: ActiveSessionState | null = null;
   private moonlight: ChildProcess | null = null;
   private tracker: WindowTracker | null = null;
   private floatingBar: FloatingBarWindow | null = null;
+
+  private agentHost = "";
+  private agentPort = DEFAULT_AGENT_PORT;
+  private agentToken = "";
+  private agentConnected = false;
 
   private closing = false;
   private generation = 0;
@@ -59,9 +69,14 @@ export class StreamSessionManager {
   private reloadTimer: NodeJS.Timeout | null = null;
   private reloadChain: Promise<void> = Promise.resolve();
 
-  constructor(store: StateStore, onStateChange: (state: ActiveSessionState | null) => void) {
+  constructor(
+    store: StateStore,
+    onStateChange: (state: ActiveSessionState | null) => void,
+    agentClient = new HostAgentClient(),
+  ) {
     this.store = store;
     this.onStateChange = onStateChange;
+    this.agentClient = agentClient;
   }
 
   getState(): ActiveSessionState | null {
@@ -176,16 +191,37 @@ export class StreamSessionManager {
     device: DeviceInfo,
     routeType: string,
     latencyMs: number | null,
+    agentContext?: { agentConnected: boolean; agentPort: number; agentToken: string },
   ): Promise<ActiveSessionState> {
-    return this.runLifecycle(() => this.startSessionInternal(device, routeType, latencyMs));
+    return this.runLifecycle(() =>
+      this.startSessionInternal(device, routeType, latencyMs, agentContext),
+    );
   }
 
   private async startSessionInternal(
     device: DeviceInfo,
     routeType: string,
     latencyMs: number | null,
+    agentContext?: { agentConnected: boolean; agentPort: number; agentToken: string },
   ): Promise<ActiveSessionState> {
     const generation = ++this.generation;
+
+    // A new session replaces the previous one without going through
+    // disconnect(); tell the old host to restore mute/privacy and honour its
+    // auto-lock setting before we drop the old credentials.
+    const previous = this.active;
+    if (previous && this.agentConnected && this.agentToken) {
+      this.agentClient
+        .notifySessionEnd(this.agentHost, this.agentPort, this.agentToken, {
+          autoLock: previous.autoLockOnDisconnect,
+        })
+        .catch(() => {});
+    }
+
+    this.agentHost = device.mesh_ip;
+    this.agentPort = agentContext?.agentPort || device.agent_port || DEFAULT_AGENT_PORT;
+    this.agentToken = agentContext?.agentToken || "";
+    this.agentConnected = Boolean(agentContext?.agentConnected && agentContext?.agentToken);
 
     // Detach the previous session first so its process-exit handlers cannot
     // tear down the new session that is about to be created.
@@ -214,6 +250,13 @@ export class StreamSessionManager {
       windowRect: null,
       reconnecting: false,
       startedAt: Date.now(),
+      agentConnected: this.agentConnected,
+      displays: [],
+      selectedDisplayId: "",
+      hostMuted: false,
+      privacyActive: false,
+      privacySupported: true,
+      autoLockOnDisconnect: false,
     };
     this.active = active;
 
@@ -225,14 +268,77 @@ export class StreamSessionManager {
       this.spawnFor(active);
     } catch (err) {
       this.active = null;
+      this.agentConnected = false;
       bar.destroy();
       this.floatingBar = null;
       this.broadcast();
       throw err;
     }
 
+    if (this.agentConnected) {
+      await this.hydrateAgentState(active, generation);
+    }
+
+    if (generation !== this.generation || this.active !== active) {
+      return active;
+    }
     this.broadcast();
     return active;
+  }
+
+  /**
+   * Best-effort parallel probe of the host agent after the stream launches.
+   * Individual route failures degrade to defaults instead of failing the session.
+   */
+  private async hydrateAgentState(active: ActiveSessionState, generation: number): Promise<void> {
+    const host = this.agentHost;
+    const port = this.agentPort;
+    const token = this.agentToken;
+    if (!token) return;
+
+    const [info, displays, mute, privacy] = await Promise.allSettled([
+      this.agentClient.probeInfo(host, port, 1800),
+      this.agentClient.listDisplays(host, port, token),
+      this.agentClient.getMuteState(host, port, token),
+      this.agentClient.getPrivacyState(host, port, token),
+    ]);
+    if (generation !== this.generation || this.active !== active) return;
+
+    if (displays.status === "fulfilled") {
+      active.displays = displays.value;
+    }
+    if (info.status === "fulfilled") {
+      active.autoLockOnDisconnect = Boolean(info.value.autoLockOnDisconnect);
+    }
+    if (mute.status === "fulfilled") {
+      active.hostMuted = Boolean(mute.value.muted);
+    }
+    if (privacy.status === "fulfilled") {
+      active.privacyActive = Boolean(privacy.value.active);
+      active.privacySupported = privacy.value.supported !== false;
+    }
+
+    if (!active.selectedDisplayId && active.displays.length > 0) {
+      active.selectedDisplayId = this.inferSelectedDisplay(active.displays, active.preset.streamApp);
+    }
+
+    if (active.effectivePreset.muteHostAudio) {
+      try {
+        await this.agentClient.setMuteState(host, port, token, true);
+        active.hostMuted = true;
+      } catch {
+        // Mute is best-effort; the stream itself is unaffected.
+      }
+    }
+  }
+
+  private inferSelectedDisplay(displays: DisplayMonitorInfo[], streamApp: string): string {
+    if (streamApp === "Virtual Display") {
+      const virtual = displays.find((d) => d.isVirtual) ?? displays.find((d) => d.active);
+      return (virtual ?? displays[0]).id;
+    }
+    const primary = displays.find((d) => d.isPrimary && !d.isVirtual) ?? displays.find((d) => !d.isVirtual);
+    return (primary ?? displays[0]).id;
   }
 
   async updateOptions(patch: Partial<StreamPreset>): Promise<ActiveSessionState | null> {
@@ -312,6 +418,139 @@ export class StreamSessionManager {
 
     active.reconnecting = false;
     this.broadcast();
+  }
+
+  getAgentContext(): { connected: boolean; host: string; port: number; token: string } | null {
+    if (!this.active) return null;
+    return {
+      connected: this.agentConnected,
+      host: this.agentHost,
+      port: this.agentPort,
+      token: this.agentToken,
+    };
+  }
+
+  async refreshDisplays(): Promise<ActiveSessionState | null> {
+    const active = this.active;
+    if (!active || !this.agentConnected || !this.agentToken) return active;
+
+    const displays = await this.agentClient.listDisplays(this.agentHost, this.agentPort, this.agentToken);
+    if (this.active !== active) return this.active;
+
+    active.displays = displays;
+    if (!active.selectedDisplayId && displays.length > 0) {
+      active.selectedDisplayId = this.inferSelectedDisplay(displays, active.preset.streamApp);
+    }
+    this.broadcast();
+    return active;
+  }
+
+  async selectDisplay(displayId: string): Promise<ActiveSessionState | null> {
+    const active = this.active;
+    if (!active || !this.agentConnected || !this.agentToken) return active;
+
+    const result = await this.agentClient.selectDisplay(
+      this.agentHost,
+      this.agentPort,
+      this.agentToken,
+      displayId,
+    );
+    if (this.active !== active) return this.active;
+    if (!result.ok) {
+      active.displays = result.displays?.length ? result.displays : active.displays;
+      this.broadcast();
+      throw new Error(result.message || "切换显示器失败");
+    }
+
+    active.displays = result.displays?.length ? result.displays : active.displays;
+    active.selectedDisplayId = result.selectedDisplayId || displayId;
+
+    const selected = active.displays.find((d) => d.id === active.selectedDisplayId);
+    const nextStreamApp: StreamPreset["streamApp"] = selected?.isVirtual
+      ? "Virtual Display"
+      : !selected?.isVirtual && active.preset.streamApp === "Virtual Display"
+        ? "Desktop"
+        : active.preset.streamApp;
+
+    const streamAppChanged = nextStreamApp !== active.preset.streamApp;
+    if (streamAppChanged) {
+      const preset = normalizeStreamPreset({ ...active.preset, streamApp: nextStreamApp });
+      this.store.update({ preset });
+      active.preset = preset;
+      active.effectivePreset = computeEffectivePreset(preset, active.routeType);
+    }
+
+    this.broadcast();
+
+    if (result.restartRecommended || streamAppChanged) {
+      this.scheduleReload();
+    }
+    return active;
+  }
+
+  async setHostMute(muted: boolean): Promise<ActiveSessionState | null> {
+    const active = this.active;
+    if (!active) return null;
+
+    if (this.agentConnected && this.agentToken) {
+      const res = await this.agentClient.setMuteState(
+        this.agentHost,
+        this.agentPort,
+        this.agentToken,
+        muted,
+      );
+      if (this.active !== active) return this.active;
+      active.hostMuted = Boolean(res.muted);
+
+      // Reflect the live state in the persisted preset without restarting
+      // Moonlight (the audio path is a host-side master mute, not an encoder
+      // option).
+      const preset = normalizeStreamPreset({ ...this.store.get().preset, muteHostAudio: active.hostMuted });
+      this.store.update({ preset });
+      active.preset = preset;
+      active.effectivePreset = computeEffectivePreset(preset, active.routeType);
+      this.broadcast();
+      return active;
+    }
+
+    return this.updateOptions({ muteHostAudio: muted });
+  }
+
+  async setPrivacy(enabled: boolean): Promise<ActiveSessionState | null> {
+    const active = this.active;
+    if (!active || !this.agentConnected || !this.agentToken) return active;
+
+    const res = await this.agentClient.setPrivacyState(
+      this.agentHost,
+      this.agentPort,
+      this.agentToken,
+      enabled,
+    );
+    if (this.active !== active) return this.active;
+
+    active.privacyActive = Boolean(res.active);
+    active.privacySupported = res.supported !== false;
+    this.broadcast();
+    return active;
+  }
+
+  async runSystemAction(action: SystemActionType): Promise<{ ok: boolean; message: string }> {
+    const active = this.active;
+    if (!active) {
+      return { ok: false, message: "当前没有活跃的远程会话。" };
+    }
+    if (!this.agentConnected || !this.agentToken) {
+      return { ok: false, message: "目标主机的 Host Companion Agent 未连接，无法执行远程系统操作。" };
+    }
+    return this.agentClient.runSystemAction(this.agentHost, this.agentPort, this.agentToken, action);
+  }
+
+  async setAutoLockOnDisconnect(enabled: boolean): Promise<ActiveSessionState | null> {
+    const active = this.active;
+    if (!active) return null;
+    active.autoLockOnDisconnect = enabled;
+    this.broadcast();
+    return active;
   }
 
   async fitToWindow(): Promise<ActiveSessionState | null> {
@@ -434,7 +673,20 @@ export class StreamSessionManager {
         clearTimeout(this.reloadTimer);
         this.reloadTimer = null;
       }
+
+      const closingSession = this.active;
+      if (closingSession && this.agentConnected && this.agentToken) {
+        this.agentClient
+          .notifySessionEnd(this.agentHost, this.agentPort, this.agentToken, {
+            autoLock: closingSession.autoLockOnDisconnect,
+          })
+          .catch(() => {});
+      }
+
       this.active = null;
+      this.agentConnected = false;
+      this.agentToken = "";
+      this.agentHost = "";
       await this.stopCurrentProcess();
       this.floatingBar?.destroy();
       this.floatingBar = null;

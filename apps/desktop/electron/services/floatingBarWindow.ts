@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ActiveSessionState, WindowRect } from "../types";
 
 export const COLLAPSED_SIZE = { width: 290, height: 38 };
-export const EXPANDED_SIZE = { width: 580, height: 470 };
+export const EXPANDED_SIZE = { width: 600, height: 540 };
 
 const EDGE_MARGIN = 4;
 const TOP_OFFSET = 6;

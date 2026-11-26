@@ -4,7 +4,6 @@ import {
   ChevronDown,
   ChevronUp,
   Crosshair,
-  Eye,
   Gauge,
   Keyboard,
   Layers,
@@ -14,9 +13,9 @@ import {
   Monitor,
   MonitorOff,
   MousePointer2,
+  Power,
   Radio,
   RefreshCw,
-  Scissors,
   Unplug,
   Wifi,
   Zap,
@@ -27,6 +26,7 @@ import type {
   DisplayMode,
   StreamAppTarget,
   StreamPreset,
+  SystemActionType,
   SystemKeyCaptureMode,
 } from "../../electron/types";
 
@@ -79,17 +79,23 @@ function Toggle({
   onChange,
   label,
   hint,
+  title,
+  disabled,
 }: {
   checked: boolean;
   onChange: (next: boolean) => void;
   label: string;
   hint?: string;
+  title?: string;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
+      title={title}
+      disabled={disabled}
       onClick={() => onChange(!checked)}
-      className="flex w-full items-center justify-between rounded-lg border border-white/10 bg-black/20 px-2.5 py-1.5 text-left"
+      className="flex w-full items-center justify-between rounded-lg border border-white/10 bg-black/20 px-2.5 py-1.5 text-left disabled:cursor-not-allowed disabled:opacity-50"
     >
       <span>
         <span className="block text-[11px] font-semibold text-slate-200">{label}</span>
@@ -119,13 +125,38 @@ function SectionTitle({ icon, children }: { icon: React.ReactNode; children: Rea
   );
 }
 
+const SYSTEM_ACTION_LABELS: Record<SystemActionType, string> = {
+  lock: "锁屏",
+  show_desktop: "显示桌面",
+  taskmgr: "任务管理器",
+  sas: "Ctrl+Alt+Del",
+  reboot: "重启",
+  shutdown: "关机",
+};
+
+const SYSTEM_ACTION_ORDER: SystemActionType[] = [
+  "lock",
+  "show_desktop",
+  "taskmgr",
+  "sas",
+  "reboot",
+  "shutdown",
+];
+
+const CONFIRM_TIMEOUT_MS = 4000;
+
 export function SessionBar() {
   const bridge = useMemo(() => getBridge(), []);
   const [state, setState] = useState<ActiveSessionState | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [pulse, setPulse] = useState(false);
   const [draftBitrate, setDraftBitrate] = useState<number | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [pendingConfirm, setPendingConfirm] = useState<SystemActionType | null>(null);
+  const [actionBanner, setActionBanner] = useState<{ ok: boolean; text: string } | null>(null);
   const dragRef = useRef<{ lastX: number; moved: boolean } | null>(null);
+  const confirmTimerRef = useRef<number | null>(null);
+  const bannerTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     void bridge.getSessionState().then(setState);
@@ -142,16 +173,114 @@ export function SessionBar() {
     setDraftBitrate(null);
   }, [state?.preset.bitrateMbps]);
 
+  useEffect(() => {
+    return () => {
+      if (confirmTimerRef.current !== null) window.clearTimeout(confirmTimerRef.current);
+      if (bannerTimerRef.current !== null) window.clearTimeout(bannerTimerRef.current);
+    };
+  }, []);
+
   function patchOptions(patch: Partial<StreamPreset>) {
     void bridge.updateSessionOptions(patch).then((next) => {
       if (next) setState(next);
     });
   }
 
+  function applySession(next: ActiveSessionState | null) {
+    if (next) setState(next);
+  }
+
   function toggleExpanded() {
     const next = !expanded;
     setExpanded(next);
     void bridge.setSessionBarExpanded(next);
+  }
+
+  function showBanner(ok: boolean, text: string) {
+    setActionBanner({ ok, text });
+    if (bannerTimerRef.current !== null) window.clearTimeout(bannerTimerRef.current);
+    bannerTimerRef.current = window.setTimeout(() => setActionBanner(null), 4000);
+  }
+
+  async function handleHostMute(next: boolean) {
+    if (busy) return;
+    setBusy(true);
+    try {
+      applySession(await bridge.setSessionHostMute(next));
+    } catch (err) {
+      showBanner(false, err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handlePrivacy(next: boolean) {
+    if (busy) return;
+    setBusy(true);
+    try {
+      applySession(await bridge.setSessionPrivacy(next));
+    } catch (err) {
+      showBanner(false, err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleAutoLock(next: boolean) {
+    try {
+      applySession(await bridge.setSessionAutoLock(next));
+    } catch (err) {
+      showBanner(false, err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleRefreshDisplays() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      applySession(await bridge.refreshSessionDisplays());
+    } catch (err) {
+      showBanner(false, err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSelectDisplay(displayId: string) {
+    if (busy || displayId === state?.selectedDisplayId) return;
+    setBusy(true);
+    try {
+      applySession(await bridge.selectSessionDisplay(displayId));
+    } catch (err) {
+      showBanner(false, err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSystemAction(action: SystemActionType) {
+    if (busy) return;
+    const guarded = action === "reboot" || action === "shutdown";
+    if (guarded && pendingConfirm !== action) {
+      setPendingConfirm(action);
+      if (confirmTimerRef.current !== null) window.clearTimeout(confirmTimerRef.current);
+      confirmTimerRef.current = window.setTimeout(() => setPendingConfirm(null), CONFIRM_TIMEOUT_MS);
+      return;
+    }
+    if (confirmTimerRef.current !== null) {
+      window.clearTimeout(confirmTimerRef.current);
+      confirmTimerRef.current = null;
+    }
+    setPendingConfirm(null);
+    setBusy(true);
+    try {
+      const res = await bridge.runSessionSystemAction(action);
+      showBanner(res.ok, res.message);
+    } catch (err) {
+      showBanner(false, err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
   }
 
   function startDrag(e: React.PointerEvent) {
@@ -479,7 +608,7 @@ export function SessionBar() {
             </button>
           </div>
 
-          {/* Section 3: quick actions + stage 2/3 preview */}
+          {/* Section 3: quick actions + Stage 2 live controls */}
           <div className="space-y-1.5">
             <SectionTitle icon={<Gauge className="h-3 w-3 text-slate-400" />}>快捷操作</SectionTitle>
             <div className="flex flex-wrap gap-1">
@@ -512,28 +641,138 @@ export function SessionBar() {
                 <Unplug className="h-3 w-3" /> 断开
               </button>
             </div>
+          </div>
 
-            <div className="rounded-lg border border-dashed border-white/10 bg-black/10 p-1.5">
-              <div className="mb-1 text-[9px] font-semibold uppercase tracking-wide text-slate-500">
-                阶段 2 / 3 即将接入
-              </div>
-              <div className="grid grid-cols-2 gap-1">
-                {[
-                  { icon: <Layers className="h-3 w-3" />, label: "多屏切换" },
-                  { icon: <Lock className="h-3 w-3" />, label: "访问密码锁" },
-                  { icon: <Scissors className="h-3 w-3" />, label: "拖拽传文件" },
-                  { icon: <Eye className="h-3 w-3" />, label: "防窥隐私屏" },
-                ].map((item) => (
-                  <div
-                    key={item.label}
-                    className="flex cursor-not-allowed items-center gap-1 rounded border border-white/5 bg-white/[0.02] px-1.5 py-1 text-[10px] text-slate-500"
-                  >
-                    {item.icon}
-                    {item.label}
-                  </div>
-                ))}
-              </div>
+          {/* Section 4: multi-monitor switching */}
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between">
+              <SectionTitle icon={<Layers className="h-3 w-3 text-sky-400" />}>屏幕切换</SectionTitle>
+              <button
+                type="button"
+                disabled={busy || !state.agentConnected}
+                onClick={() => void handleRefreshDisplays()}
+                className="inline-flex items-center gap-1 rounded border border-white/10 bg-black/20 px-1.5 py-0.5 text-[9px] text-slate-300 hover:text-white disabled:opacity-40"
+              >
+                <RefreshCw className={`h-2.5 w-2.5 ${busy ? "animate-spin" : ""}`} /> 刷新
+              </button>
             </div>
+
+            {!state.agentConnected ? (
+              <div className="rounded-lg border border-dashed border-white/10 bg-black/10 px-2 py-1.5 text-[10px] text-slate-500">
+                Host Companion Agent 未连接，无法切换被控端显示器
+              </div>
+            ) : state.displays.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-white/10 bg-black/10 px-2 py-1.5 text-[10px] text-slate-500">
+                未读取到被控端显示器，请点击刷新
+              </div>
+            ) : (
+              <div className="flex flex-wrap gap-1">
+                {state.displays.map((display) => {
+                  const selected = display.id === state.selectedDisplayId;
+                  return (
+                    <button
+                      key={display.id}
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void handleSelectDisplay(display.id)}
+                      className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[10px] transition-colors disabled:opacity-50 ${
+                        selected
+                          ? "border-sky-400/60 bg-sky-400/15 text-sky-100"
+                          : "border-white/10 bg-black/20 text-slate-300 hover:text-white"
+                      }`}
+                    >
+                      <Monitor className="h-3 w-3" />
+                      <span className="font-semibold">
+                        {display.isPrimary ? "主屏" : display.isVirtual ? "虚拟屏" : `屏 ${display.index + 1}`}
+                      </span>
+                      <span className="text-slate-500">
+                        {display.width}x{display.height}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Section 5: hardware privacy & audio */}
+          <div className="space-y-1.5">
+            <SectionTitle icon={<Lock className="h-3 w-3 text-emerald-300" />}>硬件隐私与声音</SectionTitle>
+            <div className="grid grid-cols-2 gap-1.5">
+              <Toggle
+                checked={state.hostMuted}
+                onChange={(next) => void handleHostMute(next)}
+                label="被控静音"
+                hint={state.agentConnected ? "被控端扬声器主静音" : "本机静音（Agent 未连接）"}
+              />
+              <Toggle
+                checked={state.privacyActive}
+                onChange={(next) => void handlePrivacy(next)}
+                disabled={!state.agentConnected || !state.privacySupported}
+                title="被控端物理屏全黑，采集侧仍可见真实桌面；在被控端按 Ctrl+Alt+Shift+P 可立即恢复显示"
+                label="防窥隐私屏"
+                hint={
+                  !state.agentConnected
+                    ? "需要被控端 Host Companion Agent"
+                    : state.privacySupported
+                      ? "被控端物理屏黑屏，本机 Ctrl+Alt+Shift+P 可救援"
+                      : "仅支持 Windows 被控端"
+                }
+              />
+              <Toggle
+                checked={state.autoLockOnDisconnect}
+                onChange={(next) => void handleAutoLock(next)}
+                label="断开后自动锁屏"
+                hint="会话结束时锁定被控端"
+              />
+            </div>
+          </div>
+
+          {/* Section 6: remote system actions */}
+          <div className="space-y-1.5">
+            <SectionTitle icon={<Power className="h-3 w-3 text-amber-300" />}>远程系统操作</SectionTitle>
+            <div className="flex flex-wrap gap-1">
+              {SYSTEM_ACTION_ORDER.map((action) => {
+                const guarded = action === "reboot" || action === "shutdown";
+                const armed = pendingConfirm === action;
+                const disabled = busy || !state.agentConnected;
+                return (
+                  <button
+                    key={action}
+                    type="button"
+                    disabled={disabled}
+                    onClick={() => void handleSystemAction(action)}
+                    className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[10px] font-semibold transition-colors disabled:opacity-40 ${
+                      armed
+                        ? "border-red-400/70 bg-red-500/25 text-red-100"
+                        : guarded
+                          ? "border-red-400/30 bg-red-500/10 text-red-200 hover:bg-red-500/20"
+                          : "border-white/10 bg-black/20 text-slate-300 hover:text-white"
+                    }`}
+                  >
+                    {guarded ? <Power className="h-3 w-3" /> : action === "lock" ? <Lock className="h-3 w-3" /> : <Monitor className="h-3 w-3" />}
+                    {armed ? `确认${SYSTEM_ACTION_LABELS[action]}?` : SYSTEM_ACTION_LABELS[action]}
+                  </button>
+                );
+              })}
+            </div>
+
+            {actionBanner && (
+              <div
+                className={`rounded-lg border px-2 py-1 text-[10px] ${
+                  actionBanner.ok
+                    ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-100"
+                    : "border-red-400/30 bg-red-500/10 text-red-100"
+                }`}
+              >
+                {actionBanner.text}
+              </div>
+            )}
+          </div>
+
+          {/* Stage 3 banner */}
+          <div className="rounded-lg border border-dashed border-white/10 bg-black/10 px-2 py-1 text-[9px] text-slate-500">
+            阶段 3 即将接入：拖拽传文件 · 双向剪贴板同步
           </div>
         </div>
 

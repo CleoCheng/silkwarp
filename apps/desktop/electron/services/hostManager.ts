@@ -9,6 +9,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import type { BootstrapConfig, HostHardwareInfo, ProvisionStage } from "../types";
 import { APOLLO_PERM_ALL, needsApolloPermissionUpgrade } from "./apolloPermissions";
+import { DEFAULT_AGENT_PORT } from "./hostAgentAuth";
 
 const execFileAsync = promisify(execFile);
 
@@ -244,6 +245,8 @@ export async function collectHostInfo(): Promise<HostHardwareInfo> {
     provisionStage: "idle",
     provisionMessage: "",
     apolloAuthReady: false,
+    agentRunning: false,
+    agentPort: DEFAULT_AGENT_PORT,
   };
 }
 

@@ -153,8 +153,9 @@ export default function App() {
             selfDeviceId={state.settings.deviceId}
             preset={state.settings.preset}
             onUpdatePreset={async (p) => setState(await bridge.updatePreset(p))}
-            onConnect={(d) => bridge.connectDevice(d)}
-            onRustDesk={(d) => bridge.connectRustDesk(d)}
+            onConnect={(d, opts) => bridge.connectDevice(d, opts)}
+            onStream={(d, opts) => bridge.streamDevice(d, opts)}
+            onRustDesk={(d, opts) => bridge.connectRustDesk(d, opts)}
             onWake={async (d) => {
               await bridge.wakeDevice(d);
             }}
@@ -169,6 +170,8 @@ export default function App() {
           <HostModeView
             state={state}
             onUpdateHostSettings={async (patch) => setState(await bridge.updateHostSettings(patch))}
+            onSetAccessPassword={async (payload) => setState(await bridge.setAccessPassword(payload))}
+            onRotateTempPassword={async () => setState(await bridge.rotateTempPassword())}
             onRetryProvision={async () => setState(await bridge.retryProvision())}
             onConfigureFirewall={async () => setState(await bridge.configureFirewall())}
             onConfigureRustDesk={async () => {

@@ -1,8 +1,9 @@
-import { app } from "electron";
+import { app, safeStorage } from "electron";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { AppSettings, StreamPreset, UserInfo } from "../types";
+import { DEFAULT_AGENT_PORT } from "./hostAgentAuth";
 import { DEFAULT_STREAM_PRESET, normalizeStreamPreset } from "./streamOptions";
 
 export interface ExternalAppConfig {
@@ -23,6 +24,11 @@ export interface PersistedState {
   apolloPass: string;
   pairedHosts: Record<string, string>;
   preset: StreamPreset;
+  requireAccessPassword: boolean;
+  accessPasswordHash: string;
+  allowSameAccountBypass: boolean;
+  autoLockOnDisconnect: boolean;
+  savedDevicePasswords: Record<string, string>;
 }
 
 function normalizeApiUrl(raw: unknown): string {
@@ -95,6 +101,11 @@ export class StateStore {
       apolloPass: "",
       pairedHosts: {},
       preset: { ...DEFAULT_STREAM_PRESET },
+      requireAccessPassword: false,
+      accessPasswordHash: "",
+      allowSameAccountBypass: true,
+      autoLockOnDisconnect: false,
+      savedDevicePasswords: {},
     };
     try {
       if (!fs.existsSync(this.filePath)) {
@@ -107,6 +118,19 @@ export class StateStore {
         ...parsed,
         pairedHosts: parsed.pairedHosts ?? {},
         preset: normalizeStreamPreset(parsed.preset),
+        requireAccessPassword:
+          typeof parsed.requireAccessPassword === "boolean" ? parsed.requireAccessPassword : false,
+        accessPasswordHash: typeof parsed.accessPasswordHash === "string" ? parsed.accessPasswordHash : "",
+        allowSameAccountBypass:
+          typeof parsed.allowSameAccountBypass === "boolean" ? parsed.allowSameAccountBypass : true,
+        autoLockOnDisconnect:
+          typeof parsed.autoLockOnDisconnect === "boolean" ? parsed.autoLockOnDisconnect : false,
+        savedDevicePasswords:
+          parsed.savedDevicePasswords &&
+          typeof parsed.savedDevicePasswords === "object" &&
+          !Array.isArray(parsed.savedDevicePasswords)
+            ? parsed.savedDevicePasswords
+            : {},
       };
       if (!merged.apiUrl && this.externalConfig.apiUrl) {
         merged.apiUrl = this.externalConfig.apiUrl;
@@ -138,7 +162,66 @@ export class StateStore {
       apolloUser: this.state.apolloUser,
       apolloPass: this.state.apolloPass,
       preset: this.state.preset,
+      requireAccessPassword: this.state.requireAccessPassword,
+      hasAccessPassword: Boolean(this.state.accessPasswordHash),
+      allowSameAccountBypass: this.state.allowSameAccountBypass,
+      autoLockOnDisconnect: this.state.autoLockOnDisconnect,
+      agentPort: DEFAULT_AGENT_PORT,
+      tempAccessPassword: "",
+      tempAccessPasswordExpiresAt: 0,
     };
+  }
+
+  /** Encrypts a secret with the OS keystore when available, else base64. */
+  encodeSecret(plain: string): string {
+    try {
+      if (safeStorage.isEncryptionAvailable()) {
+        return `enc:${safeStorage.encryptString(plain).toString("base64")}`;
+      }
+    } catch {
+      // keystore unavailable (e.g. before app ready): fall back to plain base64
+    }
+    return `plain:${Buffer.from(plain, "utf8").toString("base64")}`;
+  }
+
+  /** Decrypts a value produced by {@link encodeSecret}; failures yield `""`. */
+  decodeSecret(stored: string): string {
+    if (typeof stored !== "string" || !stored) return "";
+    try {
+      if (stored.startsWith("enc:")) {
+        const payload = Buffer.from(stored.slice(4), "base64");
+        return safeStorage.decryptString(payload);
+      }
+      if (stored.startsWith("plain:")) {
+        return Buffer.from(stored.slice(6), "base64").toString("utf8");
+      }
+    } catch {
+      return "";
+    }
+    return "";
+  }
+
+  getSavedDevicePassword(deviceId: string): string {
+    const encoded = this.state.savedDevicePasswords[deviceId];
+    return encoded ? this.decodeSecret(encoded) : "";
+  }
+
+  setSavedDevicePassword(deviceId: string, password: string): void {
+    if (!deviceId) return;
+    const next = { ...this.state.savedDevicePasswords };
+    if (!password) {
+      delete next[deviceId];
+    } else {
+      next[deviceId] = this.encodeSecret(password);
+    }
+    this.update({ savedDevicePasswords: next });
+  }
+
+  clearSavedDevicePassword(deviceId: string): void {
+    if (!deviceId || !(deviceId in this.state.savedDevicePasswords)) return;
+    const next = { ...this.state.savedDevicePasswords };
+    delete next[deviceId];
+    this.update({ savedDevicePasswords: next });
   }
 
   update(patch: Partial<PersistedState>): PersistedState {

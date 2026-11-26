@@ -6,8 +6,22 @@ import type {
   DeviceInfo,
   SessionHotkeyAction,
   StreamPreset,
+  SystemActionType,
   UserInfo,
 } from "./types";
+
+export interface AccessPasswordPayload {
+  requireAccessPassword?: boolean;
+  permanentPassword?: string;
+  clearPermanentPassword?: boolean;
+  allowSameAccountBypass?: boolean;
+  autoLockOnDisconnect?: boolean;
+}
+
+export interface ConnectOptions {
+  password?: string;
+  rememberPassword?: boolean;
+}
 
 const api = {
   getState: (): Promise<AppRuntimeState> => ipcRenderer.invoke("app:getState"),
@@ -30,11 +44,14 @@ const api = {
   installApollo: (): Promise<string> => ipcRenderer.invoke("host:installApollo"),
   installRustDesk: (): Promise<string> => ipcRenderer.invoke("host:installRustDesk"),
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke("app:openExternal", url),
-  connectDevice: (device: DeviceInfo): Promise<ConnectDeviceResult> => ipcRenderer.invoke("device:connect", device),
+  connectDevice: (device: DeviceInfo, opts?: ConnectOptions): Promise<ConnectDeviceResult> =>
+    ipcRenderer.invoke("device:connect", device, opts),
   retryProvision: (): Promise<AppRuntimeState> => ipcRenderer.invoke("host:retryProvision"),
-  streamDevice: (device: DeviceInfo): Promise<void> => ipcRenderer.invoke("device:stream", device),
+  streamDevice: (device: DeviceInfo, opts?: ConnectOptions): Promise<ConnectDeviceResult> =>
+    ipcRenderer.invoke("device:stream", device, opts),
   openMoonlightGui: (): Promise<void> => ipcRenderer.invoke("device:moonlightGui"),
-  connectRustDesk: (device: DeviceInfo): Promise<void> => ipcRenderer.invoke("device:rustdesk", device),
+  connectRustDesk: (device: DeviceInfo, opts?: ConnectOptions): Promise<ConnectDeviceResult> =>
+    ipcRenderer.invoke("device:rustdesk", device, opts),
   wakeDevice: (device: DeviceInfo): Promise<{ status: string; methods?: string[] }> =>
     ipcRenderer.invoke("device:wake", device),
   requestPair: (args: { hostDeviceId: string; pin: string }): Promise<{ status: string; message?: string }> =>
@@ -71,6 +88,21 @@ const api = {
     ipcRenderer.invoke("session:setBarExpanded", expanded),
   nudgeSessionBarOffset: (deltaX: number): Promise<void> =>
     ipcRenderer.invoke("session:setBarOffset", deltaX),
+  refreshSessionDisplays: (): Promise<ActiveSessionState | null> =>
+    ipcRenderer.invoke("session:refreshDisplays"),
+  selectSessionDisplay: (displayId: string): Promise<ActiveSessionState | null> =>
+    ipcRenderer.invoke("session:selectDisplay", displayId),
+  setSessionHostMute: (muted: boolean): Promise<ActiveSessionState | null> =>
+    ipcRenderer.invoke("session:setHostMute", muted),
+  setSessionPrivacy: (active: boolean): Promise<ActiveSessionState | null> =>
+    ipcRenderer.invoke("session:setPrivacy", active),
+  runSessionSystemAction: (action: SystemActionType): Promise<{ ok: boolean; message: string }> =>
+    ipcRenderer.invoke("session:runSystemAction", action),
+  setSessionAutoLock: (enabled: boolean): Promise<ActiveSessionState | null> =>
+    ipcRenderer.invoke("session:setAutoLock", enabled),
+  setAccessPassword: (payload: AccessPasswordPayload): Promise<AppRuntimeState> =>
+    ipcRenderer.invoke("host:setAccessPassword", payload),
+  rotateTempPassword: (): Promise<AppRuntimeState> => ipcRenderer.invoke("host:rotateTempPassword"),
   onSessionChanged: (cb: (state: ActiveSessionState | null) => void): (() => void) => {
     const listener = (_evt: Electron.IpcRendererEvent, state: ActiveSessionState | null) => cb(state);
     ipcRenderer.on("session:stateChanged", listener);

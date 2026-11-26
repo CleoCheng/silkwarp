@@ -16,10 +16,27 @@ import {
   downloadAndRunRustDeskInstaller,
   ensureApolloCredentials,
   ensureApolloServiceRunning,
+  getApolloOutputName,
   grantAllApolloClientPermissions,
+  setApolloOutputName,
   silentInstallApollo,
   submitApolloPin,
 } from "./services/hostManager";
+import {
+  AgentAuthManager,
+  DEFAULT_AGENT_PORT,
+  generateTempAccessPassword,
+  hashAccessPassword,
+} from "./services/hostAgentAuth";
+import { AgentClientError, HostAgentClient } from "./services/hostAgentClient";
+import { HostAgentServer } from "./services/hostAgentServer";
+import {
+  getHostMasterMute,
+  listHostDisplays,
+  runHostSystemAction,
+  setHostMasterMute,
+} from "./services/hostSystemControl";
+import { PrivacyScreenManager } from "./services/privacyScreenManager";
 import { StateStore } from "./services/store";
 import { StreamSessionManager } from "./services/streamSessionManager";
 import { normalizeStreamPreset } from "./services/streamOptions";
@@ -36,11 +53,13 @@ import type {
   ActiveSessionState,
   AppRuntimeState,
   BootstrapConfig,
+  ConnectDeviceResult,
   DeviceInfo,
   HostHardwareInfo,
   ProvisionStage,
   SessionHotkeyAction,
   StreamPreset,
+  SystemActionType,
 } from "./types";
 
 const execFileAsync = promisify(execFile);
@@ -90,8 +109,157 @@ let hostInfoCache: HostHardwareInfo = {
   provisionStage: "idle",
   provisionMessage: "",
   apolloAuthReady: false,
+  agentRunning: false,
+  agentPort: DEFAULT_AGENT_PORT,
 };
 const pairLogs: string[] = [];
+
+const TEMP_PASSWORD_TTL_MS = 30 * 60 * 1000;
+let tempAccessPassword = "";
+let tempAccessPasswordExpiresAt = 0;
+let hostSessionOrigMuted: boolean | null = null;
+let hostSelectedDisplayId = "";
+let apolloOutputSeeded = false;
+let agentServerRunning = false;
+
+const privacyScreen = new PrivacyScreenManager();
+const agentClient = new HostAgentClient();
+
+function ensureValidTempPassword(): void {
+  const s = store.get();
+  if (!s.requireAccessPassword) return;
+  if (!tempAccessPassword || Date.now() >= tempAccessPasswordExpiresAt) {
+    tempAccessPassword = generateTempAccessPassword();
+    tempAccessPasswordExpiresAt = Date.now() + TEMP_PASSWORD_TTL_MS;
+  }
+}
+
+const authManager = new AgentAuthManager(() => {
+  const s = store.get();
+  if (s.requireAccessPassword) ensureValidTempPassword();
+  return {
+    requireAccessPassword: s.requireAccessPassword,
+    permanentPasswordHash: s.accessPasswordHash,
+    tempPassword: tempAccessPassword,
+    tempPasswordExpiresAt: tempAccessPasswordExpiresAt,
+    allowSameAccountBypass: s.allowSameAccountBypass,
+    hostOwnerUserId: s.user?.id || "",
+  };
+});
+
+const hostAgentServer = new HostAgentServer({
+  authManager,
+  getMeshCidr: getDefaultMeshCidr,
+  allowLoopback: true,
+  handlers: {
+    getHostInfo: async () => {
+      const s = store.get();
+      const muted = await getHostMasterMute().catch(() => false);
+      if (!apolloOutputSeeded && s.apolloUser && s.apolloPass) {
+        apolloOutputSeeded = true;
+        const output = await getApolloOutputName(s.apolloUser, s.apolloPass).catch(() => "");
+        // Only seed when Apollo reports a Win32 device path, which is what
+        // listHostDisplays() uses as a stable display id.
+        if (output.startsWith("\\\\.\\DISPLAY")) hostSelectedDisplayId = output;
+      }
+      return {
+        hostDeviceId: s.deviceId,
+        hostname: os.hostname(),
+        requirePassword: s.requireAccessPassword,
+        privacyActive: privacyScreen.isActive(),
+        muted,
+        autoLockOnDisconnect: s.autoLockOnDisconnect,
+        apolloPort: hostInfoCache.apolloPort,
+        apolloReady: hostInfoCache.apolloRunning && apolloAuthReady,
+        capabilities: ["displays", "audio_mute", "privacy_screen", "system_actions", "temp_password"],
+      };
+    },
+    listDisplays: async () => listHostDisplays(),
+    selectDisplay: async (displayId) => {
+      hostSelectedDisplayId = displayId;
+      const s = store.get();
+      let message: string | undefined;
+      if (s.apolloUser && s.apolloPass) {
+        const switchResult = await setApolloOutputName(displayId, s.apolloUser, s.apolloPass).catch(
+          (err: unknown) => ({
+            ok: false,
+            message: err instanceof Error ? err.message : "Apollo 输出切换失败",
+          }),
+        );
+        if (!switchResult.ok) {
+          message = switchResult.message || "Apollo 输出切换失败";
+        }
+      }
+      return {
+        ok: !message,
+        selectedDisplayId: displayId,
+        restartRecommended: !message,
+        displays: await listHostDisplays(),
+        message,
+      };
+    },
+    getMuteState: async () => ({ muted: await getHostMasterMute() }),
+    setMuteState: async (muted) => {
+      if (muted && hostSessionOrigMuted === null) {
+        hostSessionOrigMuted = await getHostMasterMute().catch(() => false);
+      }
+      const next = await setHostMasterMute(muted);
+      return { muted: next };
+    },
+    getPrivacyState: async () => ({
+      active: privacyScreen.isActive(),
+      supported: privacyScreen.isSupported(),
+    }),
+    setPrivacyState: async (active) => {
+      const result = active ? privacyScreen.enable(() => emitState()) : privacyScreen.disable();
+      emitState();
+      return result;
+    },
+    runSystemAction: async (action) => runHostSystemAction(action),
+    onSessionEnded: async (opts) => {
+      let muteRestored = false;
+      if (hostSessionOrigMuted !== null) {
+        const restoreTarget = hostSessionOrigMuted;
+        hostSessionOrigMuted = null;
+        muteRestored = await setHostMasterMute(restoreTarget)
+          .then((muted) => muted === restoreTarget)
+          .catch(() => false);
+      }
+
+      let privacyRestored = false;
+      if (privacyScreen.isActive()) {
+        privacyScreen.disable();
+        privacyRestored = true;
+        emitState();
+      }
+
+      const autoLock = Boolean(opts?.autoLock) || store.get().autoLockOnDisconnect;
+      let locked = false;
+      if (autoLock) {
+        const result = await runHostSystemAction("lock").catch(() => ({ ok: false, message: "" }));
+        locked = result.ok;
+      }
+      return { locked, muteRestored, privacyRestored };
+    },
+  },
+});
+
+async function syncHostAgentServer(): Promise<void> {
+  const shouldRun = store.get().isHost;
+  if (shouldRun && !agentServerRunning) {
+    try {
+      await hostAgentServer.start("0.0.0.0", DEFAULT_AGENT_PORT);
+      agentServerRunning = true;
+    } catch {
+      agentServerRunning = false;
+    }
+    return;
+  }
+  if (!shouldRun && agentServerRunning) {
+    await hostAgentServer.stop().catch(() => {});
+    agentServerRunning = false;
+  }
+}
 
 function pushPairLog(line: string): void {
   pairLogs.unshift(`${new Date().toLocaleTimeString()} ${line}`);
@@ -104,17 +272,28 @@ function getDefaultMeshCidr(): string {
 
 function buildRuntimeState(): AppRuntimeState {
   const s = store.get();
+  const settings = store.getPublicSettings();
+  if (s.requireAccessPassword) {
+    ensureValidTempPassword();
+    settings.tempAccessPassword = tempAccessPassword;
+    settings.tempAccessPasswordExpiresAt = tempAccessPasswordExpiresAt;
+  } else {
+    settings.tempAccessPassword = "";
+    settings.tempAccessPasswordExpiresAt = 0;
+  }
   return {
     authenticated: Boolean(s.token && s.user),
     user: s.user,
     bootstrap: bootstrapCache,
-    settings: store.getPublicSettings(),
+    settings,
     easytier: easyTier.getStatus(),
     host: {
       ...hostInfoCache,
       provisionStage,
       provisionMessage,
       apolloAuthReady,
+      agentRunning: agentServerRunning,
+      agentPort: hostAgentServer.getPort() || DEFAULT_AGENT_PORT,
     },
     devices: devicesCache,
     lastPairLogs: [...pairLogs],
@@ -291,6 +470,7 @@ async function processPendingPairs(pending: PairRequestItem[]): Promise<void> {
 
 async function syncAll(): Promise<void> {
   hostInfoCache = await collectHostInfo();
+  await syncHostAgentServer();
   const s = store.get();
   if (!s.token) {
     emitState();
@@ -373,6 +553,8 @@ async function syncAll(): Promise<void> {
       route_type: routeType,
       latency_ms: latencyMs,
       is_host: latestSettings.isHost,
+      has_access_password: latestSettings.requireAccessPassword,
+      agent_port: hostAgentServer.getPort() || DEFAULT_AGENT_PORT,
     });
 
     if (latestSettings.isHost && latestSettings.autoApprovePair && hb.pending_pairs.length > 0) {
@@ -522,6 +704,10 @@ app.on("before-quit", () => {
   if (pairPollTimer) clearInterval(pairPollTimer);
   void sessionManager.disconnect();
   easyTier.stop();
+  privacyScreen.dispose();
+  void hostAgentServer.stop().catch(() => {});
+  authManager.revokeAllTokens();
+  agentServerRunning = false;
 });
 
 // --- IPC Handlers ---
@@ -601,6 +787,82 @@ ipcMain.handle("session:setBarOffset", async (_evt, deltaX: number) => {
   sessionManager.nudgeBarOffset(Number(deltaX) || 0);
 });
 
+// --- Stage 2 host agent IPC ---
+ipcMain.handle("session:refreshDisplays", async () => sessionManager.refreshDisplays());
+ipcMain.handle("session:selectDisplay", async (_evt, displayId: string) =>
+  sessionManager.selectDisplay(String(displayId || "")),
+);
+ipcMain.handle("session:setHostMute", async (_evt, muted: boolean) =>
+  sessionManager.setHostMute(Boolean(muted)),
+);
+ipcMain.handle("session:setPrivacy", async (_evt, active: boolean) =>
+  sessionManager.setPrivacy(Boolean(active)),
+);
+ipcMain.handle("session:runSystemAction", async (_evt, action: SystemActionType) =>
+  sessionManager.runSystemAction(action),
+);
+ipcMain.handle("session:setAutoLock", async (_evt, enabled: boolean) =>
+  sessionManager.setAutoLockOnDisconnect(Boolean(enabled)),
+);
+
+ipcMain.handle(
+  "host:setAccessPassword",
+  async (
+    _evt,
+    payload: {
+      requireAccessPassword?: boolean;
+      permanentPassword?: string;
+      clearPermanentPassword?: boolean;
+      allowSameAccountBypass?: boolean;
+      autoLockOnDisconnect?: boolean;
+    } = {},
+  ) => {
+    const patch: Record<string, unknown> = {};
+    const newPassword = typeof payload.permanentPassword === "string" ? payload.permanentPassword.trim() : "";
+    if (newPassword && newPassword.length < 4) {
+      throw new Error("固定访问密码至少需要 4 个字符");
+    }
+    if (newPassword) {
+      patch.accessPasswordHash = hashAccessPassword(newPassword);
+      authManager.revokeAllTokens();
+    }
+    if (payload.clearPermanentPassword) {
+      patch.accessPasswordHash = "";
+      authManager.revokeAllTokens();
+    }
+    if (typeof payload.requireAccessPassword === "boolean") {
+      patch.requireAccessPassword = payload.requireAccessPassword;
+      if (!payload.requireAccessPassword) {
+        tempAccessPassword = "";
+        tempAccessPasswordExpiresAt = 0;
+        authManager.revokeAllTokens();
+      }
+    }
+    if (typeof payload.allowSameAccountBypass === "boolean") {
+      patch.allowSameAccountBypass = payload.allowSameAccountBypass;
+    }
+    if (typeof payload.autoLockOnDisconnect === "boolean") {
+      patch.autoLockOnDisconnect = payload.autoLockOnDisconnect;
+    }
+    if (Object.keys(patch).length > 0) {
+      store.update(patch);
+    }
+    if (store.get().requireAccessPassword) {
+      ensureValidTempPassword();
+    }
+    await syncHostAgentServer();
+    await syncAll();
+    return buildRuntimeState();
+  },
+);
+
+ipcMain.handle("host:rotateTempPassword", async () => {
+  tempAccessPassword = generateTempAccessPassword();
+  tempAccessPasswordExpiresAt = Date.now() + TEMP_PASSWORD_TTL_MS;
+  emitState();
+  return buildRuntimeState();
+});
+
 ipcMain.handle("host:updateSettings", async (_evt, patch: Record<string, unknown>) => {
   store.update(patch);
   if ("apolloUser" in patch || "apolloPass" in patch || patch.isHost === true) {
@@ -620,6 +882,7 @@ ipcMain.handle("host:updateSettings", async (_evt, patch: Record<string, unknown
   if (store.get().isHost && hostInfoCache.isElevated && ("apolloUser" in patch || "apolloPass" in patch || patch.isHost === true)) {
     void autoProvisionHostIfNeeded(true);
   }
+  await syncHostAgentServer();
   await syncAll();
   return buildRuntimeState();
 });
@@ -696,108 +959,239 @@ async function assertRemoteInputPermission(device: DeviceInfo): Promise<void> {
   }
 }
 
-ipcMain.handle("device:connect", async (_evt, device: DeviceInfo) => {
-  if (!easyTier.getStatus().running) {
-    throw new Error("本机虚拟网卡尚未就绪，请先点击顶部【一键授权启用】。");
-  }
-  const primaryPort = device.apollo_port || 47984;
-  const [okPrimary, okHttp] = await Promise.all([
-    probeTcpPort(device.mesh_ip, primaryPort, 2500),
-    probeTcpPort(device.mesh_ip, 47989, 2500),
-  ]);
-  if (!okPrimary && !okHttp) {
-    if (!device.apollo_ready) {
-      throw new Error(
-        `目标主机「${device.name}」正在后台自动初始化高清串流引擎（约需 15 秒），请稍候再试，或确认对方已开启【允许本机被远程】。`,
-      );
+type AgentSessionResult =
+  | { ok: true; agentConnected: boolean; port: number; token: string }
+  | { ok: false; needsPassword?: boolean; retryAfterSec?: number; message: string };
+
+/**
+ * Establishes a Host Companion Agent bearer session for a remote device.
+ *
+ * A host without the agent (or an old client that never reports
+ * `has_access_password`) degrades gracefully to a stream-only session; a host
+ * that advertises a password but cannot be authenticated returns a structured
+ * `needsPassword` result instead of throwing so the UI can prompt.
+ */
+async function ensureRemoteAgentSession(
+  device: DeviceInfo,
+  opts?: { password?: string; rememberPassword?: boolean },
+): Promise<AgentSessionResult> {
+  const port = device.agent_port || DEFAULT_AGENT_PORT;
+  try {
+    await agentClient.probeInfo(device.mesh_ip, port, 1800);
+  } catch {
+    if (!device.has_access_password) {
+      return { ok: true, agentConnected: false, port, token: "" };
     }
-    throw new Error(`虚拟内网已在线，但无法连接 ${device.mesh_ip}:47984/47989，请稍候 10 秒等待对方防火墙自动同步。`);
+    return {
+      ok: false,
+      message: "无法连接目标主机的安全验证服务，请确认对方 SilkWarp 在线",
+    };
   }
 
-  if (await isMoonlightHostPaired(device.mesh_ip)) {
-    const s = store.get();
-    if (s.pairedHosts[device.id] !== device.mesh_ip) {
-      store.update({ pairedHosts: { ...s.pairedHosts, [device.id]: device.mesh_ip } });
+  const s = store.get();
+  const explicitPassword = typeof opts?.password === "string" ? opts.password : "";
+  const savedPassword = store.getSavedDevicePassword(device.id);
+  const password = explicitPassword || savedPassword;
+
+  try {
+    const auth = await agentClient.authenticate(device.mesh_ip, port, {
+      password: password || undefined,
+      clientUserId: s.user?.id || undefined,
+      deviceId: s.deviceId,
+    });
+    if (!auth?.token) {
+      return {
+        ok: false,
+        needsPassword: true,
+        message: "目标主机未返回有效令牌，请重新输入访问密码",
+      };
+    }
+    if (explicitPassword && opts?.rememberPassword) {
+      store.setSavedDevicePassword(device.id, explicitPassword);
+    }
+    return { ok: true, agentConnected: true, port, token: auth.token };
+  } catch (err) {
+    if (err instanceof AgentClientError) {
+      if (err.statusCode === 401) {
+        // Drop the cached password only when the failing credential came from
+        // the cache (or the user retyped that same stale value).
+        if (!explicitPassword || (savedPassword && savedPassword === explicitPassword)) {
+          store.clearSavedDevicePassword(device.id);
+        }
+        return { ok: false, needsPassword: true, message: err.message };
+      }
+      if (err.statusCode === 429) {
+        return {
+          ok: false,
+          needsPassword: true,
+          retryAfterSec: err.retryAfterSec,
+          message: err.message,
+        };
+      }
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, message: `安全验证失败：${message}` };
+  }
+}
+
+function deniedResult(result: Extract<AgentSessionResult, { ok: false }>): ConnectDeviceResult {
+  return {
+    ok: false,
+    stage: result.needsPassword ? "needs_password" : "agent_error",
+    message: result.message,
+    needsPassword: Boolean(result.needsPassword),
+    retryAfterSec: result.retryAfterSec,
+  };
+}
+
+ipcMain.handle(
+  "device:connect",
+  async (_evt, device: DeviceInfo, opts?: { password?: string; rememberPassword?: boolean }) => {
+    if (!easyTier.getStatus().running) {
+      throw new Error("本机虚拟网卡尚未就绪，请先点击顶部【一键授权启用】。");
+    }
+
+    const agentSession = await ensureRemoteAgentSession(device, opts);
+    if (!agentSession.ok) return deniedResult(agentSession);
+    const agentContext = {
+      agentConnected: agentSession.agentConnected,
+      agentPort: agentSession.port,
+      agentToken: agentSession.token,
+    };
+
+    const primaryPort = device.apollo_port || 47984;
+    const [okPrimary, okHttp] = await Promise.all([
+      probeTcpPort(device.mesh_ip, primaryPort, 2500),
+      probeTcpPort(device.mesh_ip, 47989, 2500),
+    ]);
+    if (!okPrimary && !okHttp) {
+      if (!device.apollo_ready) {
+        throw new Error(
+          `目标主机「${device.name}」正在后台自动初始化高清串流引擎（约需 15 秒），请稍候再试，或确认对方已开启【允许本机被远程】。`,
+        );
+      }
+      throw new Error(`虚拟内网已在线，但无法连接 ${device.mesh_ip}:47984/47989，请稍候 10 秒等待对方防火墙自动同步。`);
+    }
+
+    if (await isMoonlightHostPaired(device.mesh_ip)) {
+      const s = store.get();
+      if (s.pairedHosts[device.id] !== device.mesh_ip) {
+        store.update({ pairedHosts: { ...s.pairedHosts, [device.id]: device.mesh_ip } });
+      }
+      await assertRemoteInputPermission(device);
+      await sessionManager.startSession(
+        device,
+        device.route_type || "p2p",
+        device.latency_ms ?? null,
+        agentContext,
+      );
+      return { ok: true, stage: "streaming", message: `正在连接「${device.name}」桌面...` };
+    }
+
+    let lastReason = "静默握手未响应";
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const s = store.get();
+      const pin = String(1000 + Math.floor(Math.random() * 9000));
+      const pairProc = spawnSilentMoonlightPair(device.mesh_ip, pin);
+      try {
+        await new Promise((r) => setTimeout(r, 900));
+        const created = await client.createPairRequest(device.id, pin, s.deviceId, os.hostname());
+        const reqId = created.pair_request.id;
+
+        let remoteFailure = "";
+        const pollPromise = (async () => {
+          for (let i = 0; i < 16; i++) {
+            await new Promise((r) => setTimeout(r, 1000));
+            const poll = await client.getPairRequest(reqId).catch(() => null);
+            if (poll && (poll.pair_request.status === "failed" || poll.pair_request.status === "rejected")) {
+              remoteFailure = poll.pair_request.message || "被控端自动确认配对失败";
+              pairProc.cancel();
+              return;
+            }
+            if (poll && poll.pair_request.status === "approved") {
+              return;
+            }
+          }
+        })();
+
+        const [pairOutcome] = await Promise.all([pairProc.promise, pollPromise]);
+        if (pairOutcome.ok || (await isMoonlightHostPaired(device.mesh_ip))) {
+          const cur = store.get();
+          store.update({ pairedHosts: { ...cur.pairedHosts, [device.id]: device.mesh_ip } });
+          await new Promise((r) => setTimeout(r, 350));
+          await assertRemoteInputPermission(device);
+          await sessionManager.startSession(
+            device,
+            device.route_type || "p2p",
+            device.latency_ms ?? null,
+            agentContext,
+          );
+          return { ok: true, stage: "connected", message: `首次静默握手成功，正在进入「${device.name}」桌面！` };
+        }
+        lastReason = remoteFailure || pairOutcome.output || lastReason;
+      } finally {
+        pairProc.cancel();
+      }
+    }
+    throw new Error(`自动握手失败：${lastReason}。请确认对方「本机受控」页显示一切就绪后重试。`);
+  },
+);
+
+ipcMain.handle(
+  "device:stream",
+  async (_evt, device: DeviceInfo, opts?: { password?: string; rememberPassword?: boolean }) => {
+    if (!easyTier.getStatus().running) {
+      throw new Error("本机虚拟网卡尚未启动，请先点击顶部【以管理员权限重启】拉起虚拟网卡。");
+    }
+
+    const agentSession = await ensureRemoteAgentSession(device, opts);
+    if (!agentSession.ok) return deniedResult(agentSession);
+
+    const primaryPort = device.apollo_port || 47984;
+    const [okPrimary, okHttp] = await Promise.all([
+      probeTcpPort(device.mesh_ip, primaryPort, 2500),
+      probeTcpPort(device.mesh_ip, 47989, 2500),
+    ]);
+    if (!okPrimary && !okHttp) {
+      if (!device.apollo_ready) {
+        throw new Error(
+          `目标主机「${device.name} (${device.mesh_ip})」尚未安装或启动 Apollo 串流服务。请前往被控端【被控模式】点击“一键安装 Apollo”，装完启动后再点击【首次配对】。`,
+        );
+      }
+      throw new Error(
+        `无法连接到 ${device.mesh_ip}:47984/47989。请确认被控端已在【被控模式】点击“放行内网防火墙”，且双方【组网状态】均显示 p2p 或 relay 在线。`,
+      );
     }
     await assertRemoteInputPermission(device);
-    await sessionManager.startSession(device, device.route_type || "p2p", device.latency_ms ?? null);
-    return { ok: true, stage: "streaming", message: `正在连接「${device.name}」桌面...` };
-  }
-
-  let lastReason = "静默握手未响应";
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const s = store.get();
-    const pin = String(1000 + Math.floor(Math.random() * 9000));
-    const pairProc = spawnSilentMoonlightPair(device.mesh_ip, pin);
-    try {
-      await new Promise((r) => setTimeout(r, 900));
-      const created = await client.createPairRequest(device.id, pin, s.deviceId, os.hostname());
-      const reqId = created.pair_request.id;
-
-      let remoteFailure = "";
-      const pollPromise = (async () => {
-        for (let i = 0; i < 16; i++) {
-          await new Promise((r) => setTimeout(r, 1000));
-          const poll = await client.getPairRequest(reqId).catch(() => null);
-          if (poll && (poll.pair_request.status === "failed" || poll.pair_request.status === "rejected")) {
-            remoteFailure = poll.pair_request.message || "被控端自动确认配对失败";
-            pairProc.cancel();
-            return;
-          }
-          if (poll && poll.pair_request.status === "approved") {
-            return;
-          }
-        }
-      })();
-
-      const [pairOutcome] = await Promise.all([pairProc.promise, pollPromise]);
-      if (pairOutcome.ok || (await isMoonlightHostPaired(device.mesh_ip))) {
-        const cur = store.get();
-        store.update({ pairedHosts: { ...cur.pairedHosts, [device.id]: device.mesh_ip } });
-        await new Promise((r) => setTimeout(r, 350));
-        await assertRemoteInputPermission(device);
-        await sessionManager.startSession(device, device.route_type || "p2p", device.latency_ms ?? null);
-        return { ok: true, stage: "connected", message: `首次静默握手成功，正在进入「${device.name}」桌面！` };
-      }
-      lastReason = remoteFailure || pairOutcome.output || lastReason;
-    } finally {
-      pairProc.cancel();
-    }
-  }
-  throw new Error(`自动握手失败：${lastReason}。请确认对方「本机受控」页显示一切就绪后重试。`);
-});
-
-ipcMain.handle("device:stream", async (_evt, device: DeviceInfo) => {
-  if (!easyTier.getStatus().running) {
-    throw new Error("本机虚拟网卡尚未启动，请先点击顶部【以管理员权限重启】拉起虚拟网卡。");
-  }
-  const primaryPort = device.apollo_port || 47984;
-  const [okPrimary, okHttp] = await Promise.all([
-    probeTcpPort(device.mesh_ip, primaryPort, 2500),
-    probeTcpPort(device.mesh_ip, 47989, 2500),
-  ]);
-  if (!okPrimary && !okHttp) {
-    if (!device.apollo_ready) {
-      throw new Error(
-        `目标主机「${device.name} (${device.mesh_ip})」尚未安装或启动 Apollo 串流服务。请前往被控端【被控模式】点击“一键安装 Apollo”，装完启动后再点击【首次配对】。`,
-      );
-    }
-    throw new Error(
-      `无法连接到 ${device.mesh_ip}:47984/47989。请确认被控端已在【被控模式】点击“放行内网防火墙”，且双方【组网状态】均显示 p2p 或 relay 在线。`,
-    );
-  }
-  await assertRemoteInputPermission(device);
-  await sessionManager.startSession(device, device.route_type || "p2p", device.latency_ms ?? null);
-});
+    await sessionManager.startSession(device, device.route_type || "p2p", device.latency_ms ?? null, {
+      agentConnected: agentSession.agentConnected,
+      agentPort: agentSession.port,
+      agentToken: agentSession.token,
+    });
+    return {
+      ok: true,
+      stage: "streaming",
+      message: `正在串流「${device.name}」...`,
+    } satisfies ConnectDeviceResult;
+  },
+);
 
 ipcMain.handle("device:moonlightGui", async () => {
   launchMoonlightGui();
 });
 
-ipcMain.handle("device:rustdesk", async (_evt, device: DeviceInfo) => {
-  if (!bootstrapCache) throw new Error("请先登录账号");
-  launchRustDeskConnect(device, bootstrapCache);
-});
+ipcMain.handle(
+  "device:rustdesk",
+  async (_evt, device: DeviceInfo, opts?: { password?: string; rememberPassword?: boolean }) => {
+    if (!bootstrapCache) throw new Error("请先登录账号");
+
+    const agentSession = await ensureRemoteAgentSession(device, opts);
+    if (!agentSession.ok) return deniedResult(agentSession);
+
+    launchRustDeskConnect(device, bootstrapCache);
+    return { ok: true, stage: "rustdesk", message: `正在启动 RustDesk 办公模式连接「${device.name}」...` };
+  },
+);
 
 ipcMain.handle("device:wake", async (_evt, device: DeviceInfo) => {
   if (!bootstrapCache) throw new Error("请先登录账号");

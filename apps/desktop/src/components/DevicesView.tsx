@@ -1,8 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Cpu,
   Edit3,
+  KeyRound,
   Loader2,
+  Lock,
   MonitorPlay,
   MousePointer2,
   Power,
@@ -14,14 +16,31 @@ import {
   Zap,
 } from "lucide-react";
 import type { ConnectDeviceResult, DeviceInfo, StreamPreset } from "../../electron/types";
+import type { ConnectOptions } from "../../electron/preload";
+
+type ConnectMode = "connect" | "stream" | "rustdesk";
+
+interface PasswordPrompt {
+  device: DeviceInfo;
+  mode: ConnectMode;
+  message: string;
+  retryAfterSec?: number;
+}
+
+const MODE_LABELS: Record<ConnectMode, string> = {
+  connect: "高清串流",
+  stream: "高清串流",
+  rustdesk: "RustDesk 办公",
+};
 
 interface DevicesViewProps {
   devices: DeviceInfo[];
   selfDeviceId: string;
   preset: StreamPreset;
   onUpdatePreset: (preset: StreamPreset) => Promise<void>;
-  onConnect: (device: DeviceInfo) => Promise<ConnectDeviceResult>;
-  onRustDesk: (device: DeviceInfo) => Promise<void>;
+  onConnect: (device: DeviceInfo, opts?: ConnectOptions) => Promise<ConnectDeviceResult>;
+  onStream: (device: DeviceInfo, opts?: ConnectOptions) => Promise<ConnectDeviceResult>;
+  onRustDesk: (device: DeviceInfo, opts?: ConnectOptions) => Promise<ConnectDeviceResult>;
   onWake: (device: DeviceInfo) => Promise<void>;
   onUpdateDevice: (
     deviceId: string,
@@ -44,6 +63,7 @@ export function DevicesView({
   preset,
   onUpdatePreset,
   onConnect,
+  onStream,
   onRustDesk,
   onWake,
   onUpdateDevice,
@@ -56,6 +76,20 @@ export function DevicesView({
   const [editName, setEditName] = useState("");
   const [editMac, setEditMac] = useState("");
   const [editVis, setEditVis] = useState<"team" | "private">("team");
+  const [passwordPrompt, setPasswordPrompt] = useState<PasswordPrompt | null>(null);
+  const [passwordDraft, setPasswordDraft] = useState("");
+  const [rememberPassword, setRememberPassword] = useState(true);
+  const [passwordError, setPasswordError] = useState("");
+  const [retryCountdown, setRetryCountdown] = useState(0);
+  const [submittingPassword, setSubmittingPassword] = useState(false);
+
+  useEffect(() => {
+    if (retryCountdown <= 0) return;
+    const timer = setInterval(() => {
+      setRetryCountdown((cur) => Math.max(0, cur - 1));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [retryCountdown]);
 
   function openEdit(d: DeviceInfo) {
     setEditTarget(d);
@@ -64,14 +98,79 @@ export function DevicesView({
     setEditVis(d.visibility);
   }
 
-  async function handleConnect(d: DeviceInfo) {
+  function closePasswordPrompt() {
+    setPasswordPrompt(null);
+    setPasswordDraft("");
+    setPasswordError("");
+    setRetryCountdown(0);
+  }
+
+  /**
+   * Runs a connect action, funnelling `needsPassword` results into the modal
+   * and re-submitting the exact same action once a password is entered.
+   */
+  async function runConnectAction(mode: ConnectMode, d: DeviceInfo, opts?: ConnectOptions): Promise<void> {
+    const invoke =
+      mode === "rustdesk" ? onRustDesk : mode === "stream" ? onStream : onConnect;
     setConnectingId(d.id);
     try {
-      const res = await onConnect(d);
+      const res = await invoke(d, opts);
+      if (res?.needsPassword) {
+        setPasswordPrompt({
+          device: d,
+          mode,
+          message: res.message || "此主机需要访问密码",
+          retryAfterSec: res.retryAfterSec,
+        });
+        setPasswordDraft(opts?.password ?? "");
+        // A first-time prompt is expected, not an error; only surface the
+        // server message when a password was actually rejected.
+        setPasswordError(opts?.password ? res.message || "访问密码错误" : "");
+        setRetryCountdown(res.retryAfterSec ?? 0);
+        return;
+      }
       if (res?.message) notify(res.message);
+      if (res?.ok) closePasswordPrompt();
     } catch (err) {
       notify(err instanceof Error ? err.message : String(err));
     } finally {
+      setConnectingId("");
+    }
+  }
+
+  async function handleConnect(d: DeviceInfo) {
+    await runConnectAction("connect", d);
+  }
+
+  async function submitPassword(e: React.FormEvent) {
+    e.preventDefault();
+    if (!passwordPrompt || submittingPassword || retryCountdown > 0) return;
+    const password = passwordDraft.trim();
+    if (!password) {
+      setPasswordError("请输入访问密码或临时密码");
+      return;
+    }
+    setSubmittingPassword(true);
+    setPasswordError("");
+    try {
+      const { device, mode } = passwordPrompt;
+      const invoke = mode === "rustdesk" ? onRustDesk : mode === "stream" ? onStream : onConnect;
+      setConnectingId(device.id);
+      const res = await invoke(device, { password, rememberPassword });
+      if (res?.needsPassword) {
+        setPasswordError(res.message || "访问密码错误");
+        setRetryCountdown(res.retryAfterSec ?? 0);
+        return;
+      }
+      // Password was accepted (or not needed): any failure from here on is a
+      // connection problem, not a credential problem, so close the prompt.
+      closePasswordPrompt();
+      if (res?.message) notify(res.message);
+    } catch (err) {
+      closePasswordPrompt();
+      notify(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSubmittingPassword(false);
       setConnectingId("");
     }
   }
@@ -250,6 +349,15 @@ export function DevicesView({
                             本机
                           </span>
                         )}
+                        {d.has_access_password && (
+                          <span
+                            title="该主机已启用访问密码保护，连接时需输入密码或临时码"
+                            className="inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-200 border border-amber-500/35"
+                          >
+                            <Lock className="w-2.5 h-2.5" />
+                            需密码
+                          </span>
+                        )}
                       </div>
                       <div className="text-xs text-slate-400 mt-0.5">
                         {d.owner_username} · {d.mesh_ip}
@@ -325,8 +433,9 @@ export function DevicesView({
                       {d.rustdesk_id && !isSelf && (
                         <button
                           type="button"
-                          onClick={() => void onRustDesk(d).catch((e) => notify(e.message))}
-                          className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-200 hover:bg-emerald-500/20"
+                          disabled={isBusy}
+                          onClick={() => void runConnectAction("rustdesk", d)}
+                          className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-40"
                           title="停止高刷串流并以本地 0ms 硬件光标接管，适合文字办公与锁屏/UAC 运维"
                         >
                           <MousePointer2 className="w-3 h-3" />
@@ -358,6 +467,102 @@ export function DevicesView({
               </article>
             );
           })}
+        </div>
+      )}
+
+      {/* Access Password Modal */}
+      {passwordPrompt && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-md rounded-2xl border border-edge bg-panel p-6 space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <KeyRound className="w-4 h-4 text-amber-300" />
+                  <h3 className="font-bold text-slate-100">需要访问密码</h3>
+                </div>
+                <p className="text-xs text-slate-400">
+                  目标主机「{passwordPrompt.device.name}」已启用访问密码保护。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={closePasswordPrompt}
+                disabled={submittingPassword}
+                className="text-slate-400 hover:text-slate-100 disabled:opacity-40"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="flex items-center gap-2 text-[11px]">
+              <span className="rounded-full border border-edge bg-obsidian/70 px-2 py-0.5 text-slate-300">
+                {MODE_LABELS[passwordPrompt.mode]}
+              </span>
+              <span className="font-mono text-slate-500">{passwordPrompt.device.mesh_ip}</span>
+              {passwordPrompt.device.agent_port ? (
+                <span className="text-slate-500">Agent :{passwordPrompt.device.agent_port}</span>
+              ) : null}
+            </div>
+
+            <form onSubmit={submitPassword} className="space-y-3 text-xs">
+              <div>
+                <label className="mb-1 block text-slate-400">访问密码 / 6 位临时密码</label>
+                <input
+                  type="password"
+                  autoFocus
+                  autoComplete="off"
+                  value={passwordDraft}
+                  onChange={(e) => {
+                    setPasswordDraft(e.target.value);
+                    setPasswordError("");
+                  }}
+                  placeholder="请输入对方提供的密码"
+                  className="w-full rounded-xl border border-edge bg-panelHover px-3 py-2 text-sm font-mono tracking-widest text-slate-100"
+                />
+              </div>
+
+              <label className="inline-flex items-center gap-2 text-slate-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={rememberPassword}
+                  onChange={(e) => setRememberPassword(e.target.checked)}
+                  className="rounded border-edge bg-panelHover text-sky-400"
+                />
+                记住此设备密码
+              </label>
+
+              {passwordError && (
+                <div className="rounded-xl border border-red-500/35 bg-red-500/10 px-3 py-2 text-[11px] text-red-200">
+                  {passwordError}
+                </div>
+              )}
+
+              {retryCountdown > 0 && (
+                <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-200">
+                  密码错误次数过多，请在 {retryCountdown} 秒后重试。
+                </div>
+              )}
+
+              <div className="flex items-center gap-2 pt-1">
+                <button
+                  type="submit"
+                  disabled={submittingPassword || retryCountdown > 0}
+                  className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-xl bg-gradient-to-r from-sky-400 to-blue-500 px-4 py-2.5 text-sm font-bold text-slate-950 disabled:opacity-50"
+                >
+                  {submittingPassword ? <Loader2 className="w-4 h-4 animate-spin" /> : <KeyRound className="w-4 h-4" />}
+                  验证并连接
+                </button>
+                <button
+                  type="button"
+                  onClick={closePasswordPrompt}
+                  disabled={submittingPassword}
+                  className="rounded-xl border border-edge bg-panelHover px-4 py-2.5 text-sm text-slate-300 disabled:opacity-40"
+                >
+                  取消
+                </button>
+              </div>
+            </form>
+          </div>
         </div>
       )}
 
