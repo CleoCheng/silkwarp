@@ -26,6 +26,7 @@ import {
   launchMoonlightGui,
   launchMoonlightStream,
   launchRustDeskConnect,
+  probeRemoteApolloPermission,
   probeTcpPort,
   spawnSilentMoonlightPair,
   wakeDeviceViaGateway,
@@ -215,6 +216,29 @@ async function autoProvisionHostIfNeeded(forceManualRetry = false): Promise<void
   return provisionInFlight;
 }
 
+/**
+ * Apollo only persists a client certificate after the PIN handshake completes,
+ * so grant permissions a few times after pairing to cover the window in which
+ * Moonlight finishes writing its certificate to disk.
+ */
+function scheduleGrantApolloPermissions(): void {
+  for (const delayMs of [1500, 4000, 8000]) {
+    const timer = setTimeout(() => {
+      const latest = store.get();
+      if (!latest.token || !latest.isHost || !latest.apolloUser || !latest.apolloPass) return;
+      void grantAllApolloClientPermissions(latest.apolloUser, latest.apolloPass)
+        .then((res) => {
+          if (res.updated > 0) {
+            pushPairLog(`已自动补全 ${res.updated} 个客户端的键鼠与启动权限`);
+            emitState();
+          }
+        })
+        .catch(() => {});
+    }, delayMs);
+    timer.unref?.();
+  }
+}
+
 async function processPendingPairs(pending: PairRequestItem[]): Promise<void> {
   for (const req of pending) {
     if (activePairReqIds.has(req.id)) continue;
@@ -247,8 +271,7 @@ async function processPendingPairs(pending: PairRequestItem[]): Promise<void> {
       await client.resolvePairRequest(req.id, res.ok ? "approved" : "failed", res.message);
       pushPairLog(`静默握手 [${req.client_name}] PIN=${req.pin}: ${res.message}`);
       if (res.ok) {
-        const latest = store.get();
-        void grantAllApolloClientPermissions(latest.apolloUser, latest.apolloPass).catch(() => {});
+        scheduleGrantApolloPermissions();
       }
     } catch {
       // ignore transient resolution errors so loop keeps running
@@ -306,6 +329,19 @@ async function syncAll(): Promise<void> {
     } else {
       provisionStage = "idle";
       provisionMessage = "";
+    }
+
+    // Self-heal clients that were paired before the permission fix by
+    // re-granting full Apollo permissions on every host heartbeat.
+    if (
+      s.isHost &&
+      hostInfoCache.isElevated &&
+      hostInfoCache.apolloRunning &&
+      apolloAuthReady &&
+      s.apolloUser &&
+      s.apolloPass
+    ) {
+      void grantAllApolloClientPermissions(s.apolloUser, s.apolloPass).catch(() => {});
     }
 
     const peers = easyTier.getStatus().peers;
@@ -609,6 +645,16 @@ ipcMain.handle("app:openExternal", async (_evt, url: string) => {
   await shell.openExternal(url);
 });
 
+async function assertRemoteInputPermission(device: DeviceInfo): Promise<void> {
+  const permInfo = await probeRemoteApolloPermission(device.mesh_ip, device.apollo_port || 47984);
+  if (permInfo && permInfo.paired && !permInfo.hasInput && permInfo.permission !== null) {
+    throw new Error(
+      `目标主机「${device.name}」的 Apollo 未授予本机键鼠输入权限（Permission=0x${permInfo.permission.toString(16)}，仅可观看画面）。` +
+        `请在目标主机更新 SilkWarp，或在其本机 https://localhost:47990 -> PIN / Clients 页面中为该客户端勾选鼠标与键盘权限后重试。`,
+    );
+  }
+}
+
 ipcMain.handle("device:connect", async (_evt, device: DeviceInfo) => {
   if (!easyTier.getStatus().running) {
     throw new Error("本机虚拟网卡尚未就绪，请先点击顶部【一键授权启用】。");
@@ -632,6 +678,7 @@ ipcMain.handle("device:connect", async (_evt, device: DeviceInfo) => {
     if (s.pairedHosts[device.id] !== device.mesh_ip) {
       store.update({ pairedHosts: { ...s.pairedHosts, [device.id]: device.mesh_ip } });
     }
+    await assertRemoteInputPermission(device);
     launchMoonlightStream(device, s.preset);
     return { ok: true, stage: "streaming", message: `正在连接「${device.name}」桌面...` };
   }
@@ -667,6 +714,7 @@ ipcMain.handle("device:connect", async (_evt, device: DeviceInfo) => {
         const cur = store.get();
         store.update({ pairedHosts: { ...cur.pairedHosts, [device.id]: device.mesh_ip } });
         await new Promise((r) => setTimeout(r, 350));
+        await assertRemoteInputPermission(device);
         launchMoonlightStream(device, cur.preset);
         return { ok: true, stage: "connected", message: `首次静默握手成功，正在进入「${device.name}」桌面！` };
       }
@@ -697,6 +745,7 @@ ipcMain.handle("device:stream", async (_evt, device: DeviceInfo) => {
       `无法连接到 ${device.mesh_ip}:47984/47989。请确认被控端已在【被控模式】点击“放行内网防火墙”，且双方【组网状态】均显示 p2p 或 relay 在线。`,
     );
   }
+  await assertRemoteInputPermission(device);
   launchMoonlightStream(device, store.get().preset);
 });
 

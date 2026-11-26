@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { BootstrapConfig, HostHardwareInfo, ProvisionStage } from "../types";
+import { APOLLO_PERM_ALL, needsApolloPermissionUpgrade } from "./apolloPermissions";
 
 const execFileAsync = promisify(execFile);
 
@@ -809,19 +810,27 @@ export async function ensureApolloCredentials(
   };
 }
 
-export async function grantAllApolloClientPermissions(apolloUser: string, apolloPass: string, port = 47990): Promise<void> {
-  if (!apolloUser || !apolloPass) return;
+export async function grantAllApolloClientPermissions(
+  apolloUser: string,
+  apolloPass: string,
+  port = 47990,
+): Promise<{ total: number; updated: number }> {
+  if (!apolloUser || !apolloPass) return { total: 0, updated: 0 };
   const listRes = await apolloAuthedRequest(port, "GET", "/api/clients/list", apolloUser, apolloPass);
-  if (listRes.statusCode !== 200 || !listRes.json || !Array.isArray(listRes.json.named_certs)) return;
+  if (listRes.statusCode !== 200 || !listRes.json || !Array.isArray(listRes.json.named_certs)) {
+    return { total: 0, updated: 0 };
+  }
 
-  for (const item of listRes.json.named_certs as Array<Record<string, unknown>>) {
+  const namedCerts = listRes.json.named_certs as Array<Record<string, unknown>>;
+  const total = namedCerts.length;
+  let updated = 0;
+
+  for (const item of namedCerts) {
+    if (!needsApolloPermissionUpgrade(item.perm, item.allow_client_commands)) continue;
     const uuid = String(item.uuid || "");
     if (!uuid) continue;
-    const permVal = Number(item.perm ?? 0) >>> 0;
-    const allowCmd = Boolean(item.allow_client_commands);
-    if (permVal >= 0x00ffffff && allowCmd) continue;
 
-    await apolloAuthedRequest(
+    const updateRes = await apolloAuthedRequest(
       port,
       "POST",
       "/api/clients/update",
@@ -836,10 +845,15 @@ export async function grantAllApolloClientPermissions(apolloUser: string, apollo
         always_use_virtual_display: Boolean(item.always_use_virtual_display),
         do: Array.isArray(item.do) ? item.do : [],
         undo: Array.isArray(item.undo) ? item.undo : [],
-        perm: 0xffffffff,
+        perm: APOLLO_PERM_ALL,
       },
     );
+    if (updateRes.statusCode >= 200 && updateRes.statusCode < 300 && updateRes.json?.status === true) {
+      updated++;
+    }
   }
+
+  return { total, updated };
 }
 
 export async function submitApolloPin(

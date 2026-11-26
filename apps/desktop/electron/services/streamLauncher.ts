@@ -1,9 +1,11 @@
 import { execFile, spawn } from "node:child_process";
 import fs from "node:fs";
+import https from "node:https";
 import net from "node:net";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { BootstrapConfig, DeviceInfo, StreamPreset } from "../types";
+import { parseApolloServerInfoPermission, parseMoonlightIniCredentials } from "./apolloPermissions";
 import { configureRustDeskClient, findRustDeskExe } from "./hostManager";
 
 const execFileAsync = promisify(execFile);
@@ -36,6 +38,81 @@ export function resolveMoonlightExe(): string | null {
     if (fs.existsSync(p)) return p;
   }
   return null;
+}
+
+/**
+ * Queries the remote Apollo/Sunshine `/serverinfo` endpoint using the local
+ * Moonlight client certificate to learn whether this client is paired and
+ * whether it has been granted mouse + keyboard input permissions.
+ *
+ * Fail-open: any timeout, network error, missing credentials or non-200
+ * response returns `null` so that a healthy paired stream is never blocked by
+ * a flaky probe.
+ */
+export async function probeRemoteApolloPermission(
+  meshIp: string,
+  httpsPort = 47984,
+  timeoutMs = 2500,
+): Promise<{ paired: boolean; permission: number | null; hasInput: boolean } | null> {
+  const exe = resolveMoonlightExe();
+  if (!exe) return null;
+
+  const iniPath = path.join(path.dirname(exe), "Moonlight Game Streaming Project", "Moonlight.ini");
+  let iniContent: string;
+  try {
+    if (!fs.existsSync(iniPath)) return null;
+    iniContent = fs.readFileSync(iniPath, "utf-8");
+  } catch {
+    return null;
+  }
+
+  const creds = parseMoonlightIniCredentials(iniContent);
+  if (!creds) return null;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: { paired: boolean; permission: number | null; hasInput: boolean } | null) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
+    const req = https.request(
+      {
+        hostname: meshIp,
+        port: httpsPort,
+        path: `/serverinfo?uniqueid=${encodeURIComponent(creds.uniqueId)}`,
+        method: "GET",
+        cert: creds.cert,
+        key: creds.key,
+        rejectUnauthorized: false,
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          if (res.statusCode !== 200) {
+            finish(null);
+            return;
+          }
+          const body = Buffer.concat(chunks).toString("utf-8");
+          try {
+            finish(parseApolloServerInfoPermission(body));
+          } catch {
+            finish(null);
+          }
+        });
+        res.on("error", () => finish(null));
+      },
+    );
+    req.on("error", () => finish(null));
+    req.on("timeout", () => {
+      req.destroy();
+      finish(null);
+    });
+    req.end();
+  });
 }
 
 export async function isMoonlightHostPaired(meshIp: string): Promise<boolean> {
