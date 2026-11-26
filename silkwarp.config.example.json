@@ -1,0 +1,15 @@
+{
+  "apiUrl": "https://silkwarp.example.com/silkwarp",
+  "signalingHost": "203.0.113.10",
+  "relayHost": "relay.example.com",
+  "easytierCoordPort": 11010,
+  "easytierRelayPort": 11011,
+  "rustdeskHbbsPort": 21116,
+  "rustdeskHbbrPort": 21117,
+  "rustdeskApiUrl": "https://silkwarp.example.com:21114",
+  "meshCidr": "10.144.0.0/24",
+  "relayMeshIp": "10.144.0.1",
+  "wolPort": 9580,
+  "defaultBroadcastIp": "255.255.255.255",
+  "networkName": "silkwarp-team"
+}

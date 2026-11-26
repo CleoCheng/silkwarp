@@ -1,0 +1,35 @@
+# SilkWarp EasyTier High-Bandwidth Relay & Mesh Hub Config (Relay Server)
+# Role: Dedicated high-uplink private relay + mesh gateway + outbound peer to fixed-IP coordinator.
+
+hostname = "silkwarp-relay"
+ipv4 = "10.144.0.1/24"
+dhcp = false
+
+listeners = [
+    "tcp://0.0.0.0:11011",
+    "udp://0.0.0.0:11011",
+    "tcp://[::]:11011",
+    "udp://[::]:11011",
+]
+
+# Enforce localhost-only RPC via CLI: --rpc-portal 127.0.0.1:15888 --rpc-portal-whitelist 127.0.0.1,127.0.0.0/8,::1/128
+rpc_portal = "127.0.0.1:15888"
+
+# Maintain outbound connection to fixed-IP coordinator so dynamic relay IP changes converge fast
+[[peer]]
+uri = "udp://<SIGNALING_HOST>:<EASYTIER_COORD_PORT>"
+
+[[peer]]
+uri = "tcp://<SIGNALING_HOST>:<EASYTIER_COORD_PORT>"
+
+[network_identity]
+network_name = "silkwarp-team"
+network_secret = "<REPLACE_WITH_SILKWARP_NETWORK_SECRET>"
+
+[flags]
+relay_network_whitelist = "silkwarp-team"
+relay_all_peer_rpc = false
+multi_thread = true
+latency_first = true
+enable_ipv6 = true
+enable_encryption = true

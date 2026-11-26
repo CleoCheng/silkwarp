@@ -13,10 +13,16 @@ Thumbs.db
 *.key
 *.crt
 secrets/
+silkwarp.config.json
+apps/desktop/silkwarp.config.json
+*.local.json
 *服务器信息*.txt
 *access*.txt
 *.xlsx
 服务器.xlsx
+*.docx
+docs/SilkWarp_*.docx
+docs/server-evaluation.md
 
 # Logs & temp
 *.log
@@ -29,3 +35,8 @@ target/
 node_modules/
 __pycache__/
 *.pyc
+apps/desktop/resources/
+apps/desktop/release/
+apps/desktop/dist/
+apps/desktop/dist-electron/
+apps/desktop/node_modules/

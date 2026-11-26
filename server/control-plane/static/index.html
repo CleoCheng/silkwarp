@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SilkWarp 控制中心与全端接入助手</title>
+  <style>
+    :root {
+      --bg: #0b0d13;
+      --surface: #131722;
+      --surface-2: #1a2030;
+      --border: #273046;
+      --text: #eef2f8;
+      --muted: #93a1ba;
+      --accent: #38bdf8;
+      --accent-2: #3b82f6;
+      --ok: #10b981;
+      --warn: #f59e0b;
+      --err: #ef4444;
+      --radius: 14px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Inter", "PingFang SC", "Microsoft YaHei UI", system-ui, -apple-system, sans-serif;
+      background: radial-gradient(circle at 12% 8%, rgba(56, 189, 248, 0.12), transparent 36%), var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    button, input, select { font: inherit; }
+    button:focus-visible, input:focus-visible, select:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { transition: none !important; animation: none !important; }
+    }
+    .shell { max-width: 1120px; margin: 0 auto; padding: 24px 18px 56px; }
+    .topbar {
+      display: flex; flex-wrap: wrap; gap: 14px; justify-content: space-between; align-items: center;
+      padding: 16px 20px; background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); margin-bottom: 20px;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; }
+    .logo {
+      width: 38px; height: 38px; border-radius: 10px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      display: grid; place-items: center; font-weight: 800; color: #08111e; font-size: 1rem;
+    }
+    .brand h1 { font-size: 1.15rem; margin: 0; letter-spacing: 0.2px; }
+    .brand small { color: var(--muted); font-size: 0.82rem; display: block; }
+    .nav { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .tab {
+      background: transparent; color: var(--muted); border: 1px solid var(--border);
+      padding: 8px 14px; border-radius: 10px; cursor: pointer; font-weight: 600; font-size: 0.9rem;
+    }
+    .tab.active { background: rgba(56, 189, 248, 0.14); color: var(--accent); border-color: rgba(56, 189, 248, 0.45); }
+    .btn {
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #061322; border: 0; border-radius: 10px; padding: 9px 15px;
+      font-weight: 700; cursor: pointer; font-size: 0.9rem;
+    }
+    .btn-ghost {
+      background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+      border-radius: 10px; padding: 8px 13px; font-weight: 600; cursor: pointer; font-size: 0.85rem;
+    }
+    .btn-danger {
+      background: rgba(239, 68, 68, 0.14); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4);
+      border-radius: 10px; padding: 7px 12px; font-weight: 600; cursor: pointer; font-size: 0.82rem;
+    }
+    .card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px;
+    }
+    .login-wrap { max-width: 420px; margin: 7vh auto; }
+    .field { margin-bottom: 14px; }
+    .field label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 6px; }
+    .field input, .field select {
+      width: 100%; padding: 10px 12px; border-radius: 10px;
+      border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
+    }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+    .dev-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 16px; display: flex; flex-direction: column; gap: 10px;
+    }
+    .dev-head { display: flex; justify-content: space-between; align-items: start; gap: 10px; }
+    .badge {
+      font-size: 0.76rem; padding: 3px 9px; border-radius: 999px; font-weight: 600;
+      display: inline-flex; align-items: center; gap: 5px;
+    }
+    .badge-on { background: rgba(16, 185, 129, 0.16); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.35); }
+    .badge-off { background: rgba(148, 163, 184, 0.14); color: var(--muted); border: 1px solid var(--border); }
+    .badge-host { background: rgba(56, 189, 248, 0.14); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.35); }
+    .kv { font-size: 0.84rem; color: var(--muted); display: grid; gap: 4px; }
+    .kv strong { color: var(--text); font-weight: 600; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+    .toast {
+      position: fixed; right: 20px; bottom: 20px; background: var(--surface-2);
+      border: 1px solid var(--accent); color: var(--text); padding: 10px 16px;
+      border-radius: 10px; font-size: 0.88rem; z-index: 50; display: none;
+    }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 600; }
+    pre.code {
+      background: #090b10; border: 1px solid var(--border); border-radius: 10px;
+      padding: 12px; overflow-x: auto; font-size: 0.8rem; color: #bae6fd; margin: 10px 0 0;
+    }
+    .err-msg { color: #fca5a5; font-size: 0.86rem; min-height: 20px; margin-bottom: 10px; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div id="login-view" class="card login-wrap">
+      <div class="brand" style="margin-bottom:18px;">
+        <div class="logo">SW</div>
+        <div>
+          <h1>SilkWarp 控制中心</h1>
+          <small>团队账号登录 · 全端接入管理后台</small>
+        </div>
+      </div>
+      <div id="login-err" class="err-msg"></div>
+      <form id="login-form">
+        <div class="field">
+          <label for="login-user">团队账号</label>
+          <input id="login-user" type="text" autocomplete="username" placeholder="admin" required />
+        </div>
+        <div class="field">
+          <label for="login-pass">密码</label>
+          <input id="login-pass" type="password" autocomplete="current-password" required />
+        </div>
+        <button class="btn" style="width:100%;" type="submit">登录控制中心</button>
+      </form>
+    </div>
+
+    <div id="app-view" class="hidden">
+      <header class="topbar">
+        <div class="brand">
+          <div class="logo">SW</div>
+          <div>
+            <h1>SilkWarp 团队远控后台</h1>
+            <small id="whoami"></small>
+          </div>
+        </div>
+        <nav class="nav">
+          <button class="tab active" data-tab="devices">团队设备</button>
+          <button class="tab" data-tab="mobile">Mac / 手机接入</button>
+          <button class="tab hidden" id="tab-btn-admin" data-tab="admin">成员账号</button>
+          <button class="btn-ghost" id="btn-logout">退出登录</button>
+        </nav>
+      </header>
+
+      <section id="pane-devices">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;gap:10px;flex-wrap:wrap;">
+          <div style="color:var(--muted);font-size:0.9rem;">查看团队被控主机在线状态、虚拟网 IP 与一键复制接入参数</div>
+          <button class="btn-ghost" id="btn-refresh-devices">刷新设备状态</button>
+        </div>
+        <div id="devices-grid" class="grid"></div>
+      </section>
+
+      <section id="pane-mobile" class="hidden">
+        <div class="card">
+          <h2 style="margin:0 0 8px;font-size:1.05rem;">macOS / Android / iOS 极速接入参数</h2>
+          <p style="margin:0 0 14px;color:var(--muted);font-size:0.9rem;">
+            Windows 电脑推荐直接安装桌面客户端 <strong>SilkWarp Windows 桌面安装包</strong>（登录后免配置自动连接）；
+            手机与 Mac 端可安装 EasyTier + Moonlight / Artemis（或 RustDesk）使用下方团队参数接入：
+          </p>
+          <div style="display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));">
+            <div class="card" style="background:var(--surface-2);">
+              <strong style="display:block;margin-bottom:6px;">1. RustDesk 账号直连（全端通用）</strong>
+              <div class="kv" id="rd-info">加载中...</div>
+              <div class="actions" style="margin-top:12px;">
+                <button class="btn-ghost" id="btn-copy-rd">复制 RustDesk 配置 JSON</button>
+              </div>
+            </div>
+            <div class="card" style="background:var(--surface-2);">
+              <strong style="display:block;margin-bottom:6px;">2. EasyTier + Moonlight 高刷串流</strong>
+              <div class="kv" id="et-info">加载中...</div>
+              <div class="actions" style="margin-top:12px;">
+                <button class="btn-ghost" id="btn-copy-et">复制 EasyTier TOML</button>
+              </div>
+            </div>
+          </div>
+          <pre class="code" id="et-toml-preview"></pre>
+        </div>
+      </section>
+
+      <section id="pane-admin" class="hidden">
+        <div class="card" style="margin-bottom:16px;">
+          <h2 style="margin:0 0 12px;font-size:1.05rem;">新增团队成员账号</h2>
+          <form id="create-user-form" style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));align-items:end;">
+            <div class="field" style="margin:0;">
+              <label for="new-username">用户名</label>
+              <input id="new-username" required placeholder="例如 zhangsan" />
+            </div>
+            <div class="field" style="margin:0;">
+              <label for="new-display">显示名称</label>
+              <input id="new-display" placeholder="例如 张三" />
+            </div>
+            <div class="field" style="margin:0;">
+              <label for="new-pass">初始密码（≥6位）</label>
+              <input id="new-pass" type="password" required minlength="6" />
+            </div>
+            <div class="field" style="margin:0;">
+              <label for="new-role">角色</label>
+              <select id="new-role">
+                <option value="member">普通成员</option>
+                <option value="admin">管理员</option>
+              </select>
+            </div>
+            <button class="btn" type="submit">创建账号</button>
+          </form>
+        </div>
+        <div class="card">
+          <h2 style="margin:0 0 12px;font-size:1.05rem;">成员列表</h2>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>用户名</th><th>昵称</th><th>角色</th><th>状态</th><th>操作</th></tr>
+              </thead>
+              <tbody id="users-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+  <div id="toast" class="toast"></div>
+
+  <script>
+    const TOKEN_KEY = "silkwarp_web_token";
+    let state = { token: localStorage.getItem(TOKEN_KEY) || "", user: null, bootstrap: null };
+
+    function toast(msg) {
+      const el = document.getElementById("toast");
+      el.textContent = msg;
+      el.style.display = "block";
+      clearTimeout(toast._t);
+      toast._t = setTimeout(() => { el.style.display = "none"; }, 2600);
+    }
+
+    function esc(v) {
+      return String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+    }
+
+    async function api(path, opts = {}) {
+      const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
+      if (state.token) headers["Authorization"] = "Bearer " + state.token;
+      const res = await fetch("./" + path.replace(/^\/+/, ""), Object.assign({}, opts, { headers }));
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+      return data;
+    }
+
+    async function copyText(txt, label) {
+      try {
+        await navigator.clipboard.writeText(txt);
+        toast("已复制" + label);
+      } catch {
+        toast("请手动复制下方文本");
+      }
+    }
+
+    function buildEasyTierToml(b) {
+      return [
+        'hostname = "mobile-or-mac-client"',
+        "dhcp = true",
+        "",
+        'listeners = ["tcp://0.0.0.0:0", "udp://0.0.0.0:0"]',
+        "",
+        ...b.easytier.peers.map(u => `[[peer]]\nuri = "${u}"\n`),
+        "[network_identity]",
+        `network_name = "${b.easytier.network_name}"`,
+        `network_secret = "${b.easytier.network_secret}"`,
+        "",
+        "[flags]",
+        "latency_first = true",
+        "multi_thread = true",
+        "enable_ipv6 = true",
+        "enable_encryption = true"
+      ].join("\n");
+    }
+
+    async function loadApp() {
+      const me = await api("api/auth/me");
+      state.user = me.user;
+      document.getElementById("login-view").classList.add("hidden");
+      document.getElementById("app-view").classList.remove("hidden");
+      document.getElementById("whoami").textContent = `${me.user.display_name} (${me.user.username}) · ${me.user.role === "admin" ? "管理员" : "团队成员"}`;
+      if (me.user.role === "admin") {
+        document.getElementById("tab-btn-admin").classList.remove("hidden");
+      } else {
+        document.getElementById("tab-btn-admin").classList.add("hidden");
+      }
+      await Promise.all([loadDevices(), loadBootstrap(), me.user.role === "admin" ? loadUsers() : Promise.resolve()]);
+    }
+
+    async function loadDevices() {
+      const { devices } = await api("api/devices");
+      const grid = document.getElementById("devices-grid");
+      if (!devices.length) {
+        grid.innerHTML = '<div class="card" style="color:var(--muted);">暂无设备接入，请在电脑端安装 SilkWarp 客户端并登录账号。</div>';
+        return;
+      }
+      grid.innerHTML = devices.map(d => `
+        <article class="dev-card">
+          <div class="dev-head">
+            <div>
+              <div style="font-weight:700;font-size:1.02rem;">${esc(d.name)}</div>
+              <div style="color:var(--muted);font-size:0.8rem;">归属: ${esc(d.owner_username)} · ${esc(d.os)}</div>
+            </div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:end;">
+              ${d.is_host ? '<span class="badge badge-host">被控主机</span>' : ""}
+              <span class="badge ${d.online ? "badge-on" : "badge-off"}">${d.online ? "在线" : "离线"}</span>
+            </div>
+          </div>
+          <div class="kv">
+            <div>Mesh IP: <strong>${esc(d.mesh_ip)}</strong></div>
+            <div>显卡/CPU: <strong>${esc(d.gpu || "未上报")}</strong></div>
+            <div>链路: <strong>${esc(d.route_type)}</strong>${d.latency_ms != null ? ` (${d.latency_ms.toFixed(1)} ms)` : ""}</div>
+            ${d.rustdesk_id ? `<div>RustDesk ID: <strong>${esc(d.rustdesk_id)}</strong></div>` : ""}
+            ${d.mac_address ? `<div>MAC: <strong>${esc(d.mac_address)}</strong></div>` : ""}
+          </div>
+          <div class="actions">
+            <button class="btn-ghost" onclick="copyText('${esc(d.mesh_ip)}',' Mesh IP')">复制 Mesh IP</button>
+            ${d.rustdesk_id ? `<button class="btn-ghost" onclick="copyText('${esc(d.rustdesk_id)}',' RustDesk ID')">复制 RustDesk ID</button>` : ""}
+          </div>
+        </article>
+      `).join("");
+    }
+
+    async function loadBootstrap() {
+      let webId = localStorage.getItem("silkwarp_web_dev_id");
+      if (!webId) {
+        webId = "web-" + (crypto.randomUUID ? crypto.randomUUID().slice(0, 12) : Date.now());
+        localStorage.setItem("silkwarp_web_dev_id", webId);
+      }
+      const b = await api(`api/bootstrap/config?device_id=${encodeURIComponent(webId)}&name=WebCompanion&os=web`);
+      state.bootstrap = b;
+      document.getElementById("rd-info").innerHTML = `
+        <div>ID 服务器: <strong>${esc(b.rustdesk.id_server)}</strong></div>
+        <div>中继服务器: <strong>${esc(b.rustdesk.relay_server)}</strong></div>
+        <div>API 服务器: <strong>${esc(b.rustdesk.api_server)}</strong></div>
+        <div>Key: <strong style="word-break:break-all;">${esc(b.rustdesk.public_key)}</strong></div>
+      `;
+      document.getElementById("et-info").innerHTML = `
+        <div>网络名称: <strong>${esc(b.easytier.network_name)}</strong></div>
+        <div>虚拟网段: <strong>${esc(b.mesh_cidr)}</strong></div>
+        <div>默认节点: <strong>${esc(b.easytier.peers[0])}</strong></div>
+      `;
+      document.getElementById("et-toml-preview").textContent = buildEasyTierToml(b);
+    }
+
+    async function loadUsers() {
+      const { users } = await api("api/admin/users");
+      const tbody = document.getElementById("users-tbody");
+      tbody.innerHTML = users.map(u => `
+        <tr>
+          <td><strong>${esc(u.username)}</strong></td>
+          <td>${esc(u.display_name)}</td>
+          <td>${u.role === "admin" ? "管理员" : "成员"}</td>
+          <td>${u.enabled ? '<span style="color:var(--ok);">启用</span>' : '<span style="color:var(--err);">禁用</span>'}</td>
+          <td style="display:flex;gap:6px;flex-wrap:wrap;">
+            <button class="btn-ghost" onclick="toggleUser('${u.id}', ${!u.enabled})">${u.enabled ? "禁用" : "启用"}</button>
+            ${u.id !== state.user.id ? `<button class="btn-danger" onclick="removeUser('${u.id}')">删除</button>` : ""}
+          </td>
+        </tr>
+      `).join("");
+    }
+
+    async function toggleUser(id, enabled) {
+      await api(`api/admin/users/${id}`, { method: "PATCH", body: JSON.stringify({ enabled }) });
+      toast(enabled ? "已启用账号" : "已禁用账号");
+      await loadUsers();
+    }
+
+    async function removeUser(id) {
+      if (!confirm("确认删除该账号及其绑定的设备记录？")) return;
+      await api(`api/admin/users/${id}`, { method: "DELETE" });
+      toast("已删除账号");
+      await loadUsers();
+    }
+
+    document.getElementById("login-form").addEventListener("submit", async e => {
+      e.preventDefault();
+      const errEl = document.getElementById("login-err");
+      errEl.textContent = "";
+      try {
+        const res = await api("api/auth/login", {
+          method: "POST",
+          body: JSON.stringify({
+            username: document.getElementById("login-user").value.trim(),
+            password: document.getElementById("login-pass").value
+          })
+        });
+        state.token = res.token;
+        localStorage.setItem(TOKEN_KEY, res.token);
+        await loadApp();
+      } catch (err) {
+        errEl.textContent = err.message;
+      }
+    });
+
+    document.getElementById("btn-logout").addEventListener("click", async () => {
+      try { await api("api/auth/logout", { method: "POST" }); } catch {}
+      state.token = "";
+      localStorage.removeItem(TOKEN_KEY);
+      document.getElementById("app-view").classList.add("hidden");
+      document.getElementById("login-view").classList.remove("hidden");
+    });
+
+    document.getElementById("btn-refresh-devices").addEventListener("click", () => loadDevices().then(() => toast("设备状态已刷新")));
+    document.getElementById("btn-copy-et").addEventListener("click", () => {
+      if (state.bootstrap) copyText(buildEasyTierToml(state.bootstrap), " EasyTier TOML");
+    });
+    document.getElementById("btn-copy-rd").addEventListener("click", () => {
+      if (!state.bootstrap) return;
+      const rd = state.bootstrap.rustdesk;
+      copyText(JSON.stringify({ host: rd.id_server, relay: rd.relay_server, api: rd.api_server, key: rd.public_key }, null, 2), " RustDesk 配置");
+    });
+
+    document.getElementById("create-user-form").addEventListener("submit", async e => {
+      e.preventDefault();
+      try {
+        await api("api/admin/users", {
+          method: "POST",
+          body: JSON.stringify({
+            username: document.getElementById("new-username").value.trim(),
+            display_name: document.getElementById("new-display").value.trim(),
+            password: document.getElementById("new-pass").value,
+            role: document.getElementById("new-role").value
+          })
+        });
+        e.target.reset();
+        toast("成员账号创建成功");
+        await loadUsers();
+      } catch (err) {
+        toast("创建失败: " + err.message);
+      }
+    });
+
+    document.querySelectorAll(".tab").forEach(btn => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".tab").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        const tab = btn.dataset.tab;
+        ["devices", "mobile", "admin"].forEach(p => {
+          document.getElementById("pane-" + p).classList.toggle("hidden", p !== tab);
+        });
+      });
+    });
+
+    if (state.token) {
+      loadApp().catch(() => {
+        state.token = "";
+        localStorage.removeItem(TOKEN_KEY);
+      });
+    }
+  </script>
+</body>
+</html>

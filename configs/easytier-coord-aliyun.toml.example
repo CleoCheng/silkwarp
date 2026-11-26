@@ -1,0 +1,26 @@
+# SilkWarp EasyTier Coordination Server Config (Fixed-IP VPS)
+# Role: RPC-only discovery & P2P hole-punching helper. NEVER relays bulk data traffic.
+
+hostname = "silkwarp-coord"
+dhcp = false
+
+listeners = [
+    "tcp://0.0.0.0:11010",
+    "udp://0.0.0.0:11010",
+]
+
+# Keep RPC portal bound strictly to localhost (also enforce via CLI:
+# --rpc-portal 127.0.0.1:15888 --rpc-portal-whitelist 127.0.0.1,127.0.0.0/8,::1/128)
+rpc_portal = "127.0.0.1:15888"
+
+[network_identity]
+# Intentionally isolated from the private team network secret
+network_name = "silkwarp-coord-only"
+network_secret = "<REPLACE_WITH_SILKWARP_COORD_SECRET>"
+
+[flags]
+no_tun = true
+relay_network_whitelist = ""
+relay_all_peer_rpc = true
+multi_thread = true
+enable_encryption = true

@@ -1,0 +1,36 @@
+appId: io.silkwarp.desktop
+productName: SilkWarp
+copyright: Copyright © 2026 SilkWarp Team
+directories:
+  output: release
+  buildResources: build
+files:
+  - dist/**
+  - dist-electron/**
+  - package.json
+extraResources:
+  - from: resources/easytier
+    to: easytier
+  - from: resources/moonlight
+    to: moonlight
+  - from: resources/installers
+    to: installers
+  - from: build/icon.png
+    to: icon.png
+asar: true
+win:
+  icon: build/icon.ico
+  signAndEditExecutable: false
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: SilkWarp
+  artifactName: SilkWarp-Setup-${version}.exe
