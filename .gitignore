@@ -15,6 +15,8 @@ Thumbs.db
 secrets/
 *服务器信息*.txt
 *access*.txt
+*.xlsx
+服务器.xlsx
 
 # Logs & temp
 *.log
