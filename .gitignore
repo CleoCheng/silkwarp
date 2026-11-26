@@ -1,0 +1,29 @@
+# System & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Secrets & server credentials (keep home-broadband IPs/keys out of Git)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets/
+*服务器信息*.txt
+*access*.txt
+
+# Logs & temp
+*.log
+tmp/
+
+# Build outputs & dependencies
+dist/
+build/
+target/
+node_modules/
+__pycache__/
+*.pyc
