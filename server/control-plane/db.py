@@ -95,6 +95,8 @@ class Database:
                 rustdesk_id TEXT NOT NULL DEFAULT '',
                 apollo_ready INTEGER NOT NULL DEFAULT 0,
                 apollo_port INTEGER NOT NULL DEFAULT 47984,
+                has_access_password INTEGER NOT NULL DEFAULT 0,
+                agent_port INTEGER NOT NULL DEFAULT 19580,
                 route_type TEXT NOT NULL DEFAULT 'unknown',
                 latency_ms REAL DEFAULT NULL,
                 is_host INTEGER NOT NULL DEFAULT 0,
@@ -116,6 +118,20 @@ class Database:
             );
             """
         )
+        self._conn.commit()
+        self._migrate_device_columns()
+
+    def _migrate_device_columns(self) -> None:
+        """Add Stage 2 Host Agent columns to pre-existing devices tables."""
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(devices)").fetchall()}
+        if "has_access_password" not in columns:
+            self._conn.execute(
+                "ALTER TABLE devices ADD COLUMN has_access_password INTEGER NOT NULL DEFAULT 0"
+            )
+        if "agent_port" not in columns:
+            self._conn.execute(
+                "ALTER TABLE devices ADD COLUMN agent_port INTEGER NOT NULL DEFAULT 19580"
+            )
         self._conn.commit()
 
     def ensure_admin(self, username: str, password: str, display_name: str = "管理员") -> None:
@@ -329,6 +345,8 @@ class Database:
             "rustdesk_id": row["rustdesk_id"],
             "apollo_ready": bool(row["apollo_ready"]),
             "apollo_port": row["apollo_port"],
+            "has_access_password": bool(row["has_access_password"]) if "has_access_password" in row.keys() else False,
+            "agent_port": int(row["agent_port"]) if ("agent_port" in row.keys() and row["agent_port"]) else 19580,
             "route_type": row["route_type"],
             "latency_ms": row["latency_ms"],
             "is_host": bool(row["is_host"]),
@@ -402,6 +420,16 @@ class Database:
             new_rd = str(payload.get("rustdesk_id") if payload.get("rustdesk_id") is not None else row["rustdesk_id"]).strip()[:48]
             new_apollo_ready = int(bool(payload["apollo_ready"])) if "apollo_ready" in payload else row["apollo_ready"]
             new_apollo_port = int(payload["apollo_port"]) if "apollo_port" in payload and payload["apollo_port"] else row["apollo_port"]
+            new_has_access_password = (
+                int(bool(payload["has_access_password"]))
+                if "has_access_password" in payload
+                else int(row["has_access_password"])
+            )
+            raw_agent_port = payload.get("agent_port")
+            if isinstance(raw_agent_port, int) and not isinstance(raw_agent_port, bool) and 1024 <= raw_agent_port <= 65535:
+                new_agent_port = raw_agent_port
+            else:
+                new_agent_port = int(row["agent_port"] or 19580)
             new_route = str(payload.get("route_type") or row["route_type"]).strip()[:24]
             new_lat = float(payload["latency_ms"]) if payload.get("latency_ms") is not None else row["latency_ms"]
             new_is_host = int(bool(payload["is_host"])) if "is_host" in payload else row["is_host"]
@@ -413,14 +441,16 @@ class Database:
                 """
                 UPDATE devices
                 SET name=?, os=?, mac_address=?, broadcast_ip=?, cpu=?, gpu=?,
-                    rustdesk_id=?, apollo_ready=?, apollo_port=?, route_type=?,
-                    latency_ms=?, is_host=?, visibility=?, last_seen=?
+                    rustdesk_id=?, apollo_ready=?, apollo_port=?,
+                    has_access_password=?, agent_port=?,
+                    route_type=?, latency_ms=?, is_host=?, visibility=?, last_seen=?
                 WHERE id=?
                 """,
                 (
                     new_name, new_os, new_mac, new_bcast, new_cpu, new_gpu,
-                    new_rd, new_apollo_ready, new_apollo_port, new_route,
-                    new_lat, new_is_host, vis, now_str, dev_id,
+                    new_rd, new_apollo_ready, new_apollo_port,
+                    new_has_access_password, new_agent_port,
+                    new_route, new_lat, new_is_host, vis, now_str, dev_id,
                 ),
             )
 

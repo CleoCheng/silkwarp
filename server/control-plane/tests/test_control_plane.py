@@ -17,6 +17,7 @@ CP_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CP_DIR))
 
 from app import ControlPlaneConfig, create_server  # noqa: E402
+from db import Database  # noqa: E402
 
 
 class ControlPlaneTestCase(unittest.TestCase):
@@ -88,6 +89,9 @@ class ControlPlaneTestCase(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(boot1["mesh_ip"], "10.144.0.10")
         self.assertEqual(boot1["easytier"]["network_name"], "silkwarp-team")
+        # Stage 2 device metadata defaults to "no access password" + agent port 19580.
+        self.assertIs(boot1["device"]["has_access_password"], False)
+        self.assertEqual(boot1["device"]["agent_port"], 19580)
 
         code, boot1_again = self._req("/api/bootstrap/config?device_id=host-1&name=GPU-PC&os=windows", token=admin_tok)
         self.assertEqual(boot1_again["mesh_ip"], "10.144.0.10")
@@ -124,6 +128,63 @@ class ControlPlaneTestCase(unittest.TestCase):
         )
         self.assertEqual(code, 200)
         self.assertEqual(hb["device"]["gpu"], "RTX 4070 Ti Super")
+        self.assertIs(hb["device"]["has_access_password"], False)
+        self.assertEqual(hb["device"]["agent_port"], 19580)
+
+        # Host reports Stage 2 Host Agent metadata; values round-trip to clients.
+        code, hb_secure = self._req(
+            "/api/devices/heartbeat",
+            "POST",
+            {
+                "device_id": "host-1",
+                "is_host": True,
+                "has_access_password": True,
+                "agent_port": 19581,
+            },
+            token=admin_tok,
+        )
+        self.assertEqual(code, 200)
+        self.assertIs(hb_secure["device"]["has_access_password"], True)
+        self.assertEqual(hb_secure["device"]["agent_port"], 19581)
+
+        # Heartbeats that omit the keys preserve the previously reported values.
+        code, hb_preserved = self._req(
+            "/api/devices/heartbeat",
+            "POST",
+            {"device_id": "host-1", "is_host": True},
+            token=admin_tok,
+        )
+        self.assertEqual(code, 200)
+        self.assertIs(hb_preserved["device"]["has_access_password"], True)
+        self.assertEqual(hb_preserved["device"]["agent_port"], 19581)
+
+        # Out-of-range agent ports are ignored instead of persisted.
+        code, hb_bad_port = self._req(
+            "/api/devices/heartbeat",
+            "POST",
+            {"device_id": "host-1", "agent_port": 80},
+            token=admin_tok,
+        )
+        self.assertEqual(code, 200)
+        self.assertEqual(hb_bad_port["device"]["agent_port"], 19581)
+
+        # Devices listing exposes the same metadata for the client UI.
+        code, dev_list = self._req("/api/devices", token=admin_tok)
+        self.assertEqual(code, 200)
+        listed = next(d for d in dev_list["devices"] if d["id"] == "host-1")
+        self.assertIs(listed["has_access_password"], True)
+        self.assertEqual(listed["agent_port"], 19581)
+
+        # Reset the flag to False for the remaining pair-broker assertions.
+        code, hb_reset = self._req(
+            "/api/devices/heartbeat",
+            "POST",
+            {"device_id": "host-1", "has_access_password": False, "agent_port": 19580},
+            token=admin_tok,
+        )
+        self.assertEqual(code, 200)
+        self.assertIs(hb_reset["device"]["has_access_password"], False)
+        self.assertEqual(hb_reset["device"]["agent_port"], 19580)
 
         # Alice creates pair request against host-1
         code, pr_resp = self._req(
@@ -198,6 +259,69 @@ class ControlPlaneTestCase(unittest.TestCase):
         self.assertEqual(loaded.rustdesk_hbbr_port, 22117)
         self.assertEqual(loaded.wol_port, 19002)
         self.assertEqual(loaded.network_name, "json-net")
+
+    def test_legacy_devices_table_is_migrated_idempotently(self) -> None:
+        """Pre-Stage-2 databases gain has_access_password/agent_port on open."""
+        import sqlite3
+
+        legacy_path = Path(self._tmp.name) / "legacy.db"
+        legacy = sqlite3.connect(str(legacy_path))
+        legacy.executescript(
+            """
+            CREATE TABLE users (
+                id TEXT PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                display_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE devices (
+                id TEXT PRIMARY KEY,
+                owner_user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                os TEXT NOT NULL DEFAULT 'windows',
+                mesh_ip TEXT UNIQUE NOT NULL,
+                mac_address TEXT NOT NULL DEFAULT '',
+                broadcast_ip TEXT NOT NULL DEFAULT '255.255.255.255',
+                cpu TEXT NOT NULL DEFAULT '',
+                gpu TEXT NOT NULL DEFAULT '',
+                rustdesk_id TEXT NOT NULL DEFAULT '',
+                apollo_ready INTEGER NOT NULL DEFAULT 0,
+                apollo_port INTEGER NOT NULL DEFAULT 47984,
+                route_type TEXT NOT NULL DEFAULT 'unknown',
+                latency_ms REAL DEFAULT NULL,
+                is_host INTEGER NOT NULL DEFAULT 0,
+                visibility TEXT NOT NULL DEFAULT 'team',
+                last_seen TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO users (id, username, display_name, password_hash, role, enabled, created_at)
+            VALUES ('user-1', 'legacy', 'Legacy', 'x', 'admin', 1, '2026-01-01T00:00:00+00:00');
+            INSERT INTO devices (id, owner_user_id, name, mesh_ip, last_seen, created_at)
+            VALUES ('legacy-1', 'user-1', 'Legacy-PC', '10.144.0.50', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+            """
+        )
+        legacy.commit()
+        legacy.close()
+
+        # Opening twice proves the ALTER TABLE migration is idempotent.
+        for _ in range(2):
+            db = Database(legacy_path)
+            try:
+                device = db.get_device("legacy-1")
+                assert device is not None
+                self.assertIs(device["has_access_password"], False)
+                self.assertEqual(device["agent_port"], 19580)
+            finally:
+                db.close()
+
+        check = sqlite3.connect(str(legacy_path))
+        columns = {row[1] for row in check.execute("PRAGMA table_info(devices)").fetchall()}
+        check.close()
+        self.assertIn("has_access_password", columns)
+        self.assertIn("agent_port", columns)
 
 
 if __name__ == "__main__":
