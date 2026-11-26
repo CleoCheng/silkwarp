@@ -265,7 +265,7 @@ Apollo / Sunshine 的 `POST /api/config` 是**整份配置重写**，不是局�
 
 `SendSAS` 特殊处理：
 
-- 先读取 `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\SoftwareSASGeneration`；缺失或 `<= 0` 时直接输出 `<<<SILKWARP_SAS:DENIED>>>`（默认策略即禁用软件生成 SAS）。
+- 先读取 `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\SoftwareSASGeneration`；缺失或 `< 2` 时直接输出 `<<<SILKWARP_SAS:DENIED>>>`（`0` 禁用、`1` 仅服务可用，而 SilkWarp 以普通桌面进程运行，只有 `2`/`3` 才能真正生效，`1` 会静默无效）。
 - 允许时再 `Add-Type` 调用 `sas.dll`；捕获 `EntryPointNotFoundException`、`DllNotFoundException`、策略拒绝等所有异常并输出 `DENIED`。
 - 被拒绝时 `runHostSystemAction` 返回：
   `SendSAS 被系统策略拦截（需系统服务权限或启用 SoftwareSASGeneration），建议改用【锁定】或【任务管理器】`

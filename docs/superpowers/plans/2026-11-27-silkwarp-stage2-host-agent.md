@@ -3,7 +3,7 @@
 - **依据规格**：[`docs/superpowers/specs/2026-11-27-silkwarp-stage2-host-agent-design.md`](../specs/2026-11-27-silkwarp-stage2-host-agent-design.md)
 - **日期**：2026-11-27
 - **范围**：`server/control-plane/`（设备元数据）与 `apps/desktop/`（Agent 服务、主机控制、隐私幕布、主进程接线）
-- **拆分**：Part A（已完成并测试）→ Part B1（本批：主机控制与隐私幕布底层）→ Part B2（主进程接线与渲染层 UI）
+- **拆分**：Part A（已完成并测试）→ Part B1（已完成：主机控制与隐私幕布底层）→ Part B2（主进程接线与渲染层 UI）
 
 ## 目标
 
@@ -22,10 +22,10 @@
 | A4 | Agent HTTP 服务：Mesh 守卫、公开 info/auth、Bearer 保护路由、64 KiB 请求体限制、可扩展路由钩子 | `electron/services/hostAgentServer.ts` | ✅ 已完成 |
 | A5 | 主控端类型化客户端：info/auth/displays/audio/privacy/system/session | `electron/services/hostAgentClient.ts` | ✅ 已完成 |
 | A6 | Agent 单元 + 集成测试（真实 HTTP 回环） | `scripts/test_host_agent.cjs` | ✅ 已完成 |
-| B1.1 | 主机系统控制：显示器枚举/解析、虚拟屏识别、主静音 COM、六类系统动作、`runEncodedPowerShell` | `electron/services/hostSystemControl.ts` | 本批 |
-| B1.2 | 隐私幕布：多屏黑窗 + `setContentProtection` + `Ctrl+Alt+Shift+P` 本机救援 + 显示器热插拔跟随 | `electron/services/privacyScreenManager.ts` | 本批 |
-| B1.3 | 防火墙新增 `SilkWarp-Agent-TCP` 19580，`checkFirewallConfigured` 双规则校验；Apollo `output_name` 读取/整份写回 | `electron/services/hostManager.ts` | 本批 |
-| B1.4 | 主机控制测试：解析/识别/动作脚本 + Windows 只读实机枚举与静音读取 | `scripts/test_host_system_control.cjs` | 本批 |
+| B1.1 | 主机系统控制：显示器枚举/解析、虚拟屏识别、主静音 COM、六类系统动作、`runEncodedPowerShell` | `electron/services/hostSystemControl.ts` | ✅ 已完成 |
+| B1.2 | 隐私幕布：多屏黑窗 + `setContentProtection` + `Ctrl+Alt+Shift+P` 本机救援 + 显示器热插拔跟随 | `electron/services/privacyScreenManager.ts` | ✅ 已完成 |
+| B1.3 | 防火墙新增 `SilkWarp-Agent-TCP` 19580，`checkFirewallConfigured` 双规则校验；Apollo `output_name` 读取/整份写回 | `electron/services/hostManager.ts` | ✅ 已完成 |
+| B1.4 | 主机控制测试：解析/识别/动作脚本 + Windows 只读实机枚举与静音读取 | `scripts/test_host_system_control.cjs` | ✅ 已完成 |
 | B2.1 | 主进程生命周期：按配置启停 `HostAgentServer`、`AgentAuthManager`、`PrivacyScreenManager`，实现全部 handlers | `electron/main.ts`、`electron/types.ts`、`electron/services/store.ts` | 待办 |
 | B2.2 | 主机端设置持久化：永久密码哈希、临时密码与过期时间、同账号免密开关、自动锁屏开关 | `electron/services/store.ts`、`electron/types.ts` | 待办 |
 | B2.3 | 心跳上报 `has_access_password` / `agent_port`，bootstrap 读取并回退 `19580` | `electron/services/controlClient.ts`、`electron/main.ts` | 待办 |
@@ -71,7 +71,7 @@
 - `scripts/test_host_agent.cjs` 覆盖 CIDR、哈希、限速、令牌过期、真实 HTTP 回环全链路、错误体校验、流式 `onExtraRoute`。
 - Windows 回环偶发 SYN 丢失通过测试内重试规避（生产代码不加重试）。
 
-## Part B1 实施细节（本批）
+## Part B1 实施细节（已完成）
 
 ### B1.1 `hostSystemControl.ts`
 

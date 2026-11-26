@@ -132,12 +132,15 @@ function detectPrimaryLanNic(): { macAddress: string; broadcastIp: string } {
 
 async function checkFirewallConfigured(): Promise<boolean> {
   if (process.platform !== "win32") return true;
+  const requiredRules = ["SilkWarp-Apollo-TCP", "SilkWarp-Agent-TCP"];
   try {
-    await execFileAsync(
-      "netsh",
-      ["advfirewall", "firewall", "show", "rule", "name=SilkWarp-Apollo-TCP"],
-      { timeout: 4000, windowsHide: true },
-    );
+    for (const rule of requiredRules) {
+      await execFileAsync(
+        "netsh",
+        ["advfirewall", "firewall", "show", "rule", "name=" + rule],
+        { timeout: 4000, windowsHide: true },
+      );
+    }
     return true;
   } catch {
     return false;
@@ -250,12 +253,13 @@ export async function configureWindowsFirewall(meshCidr: string, isElevated = fa
     throw new Error(`无效的网段格式: ${meshCidr}`);
   }
   const script = `
-foreach ($r in @('SilkWarp-Apollo-TCP','SilkWarp-Apollo-UDP','SilkWarp-Mesh-ICMP')) {
+foreach ($r in @('SilkWarp-Apollo-TCP','SilkWarp-Apollo-UDP','SilkWarp-Mesh-ICMP','SilkWarp-Agent-TCP')) {
   Get-NetFirewallRule -DisplayName $r -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
 }
 New-NetFirewallRule -DisplayName 'SilkWarp-Apollo-TCP' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 47984-48010 -RemoteAddress '${safeCidr}' -Profile Any | Out-Null
 New-NetFirewallRule -DisplayName 'SilkWarp-Apollo-UDP' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 47984-48010 -RemoteAddress '${safeCidr}' -Profile Any | Out-Null
 New-NetFirewallRule -DisplayName 'SilkWarp-Mesh-ICMP' -Direction Inbound -Action Allow -Protocol ICMPv4 -RemoteAddress '${safeCidr}' -Profile Any | Out-Null
+New-NetFirewallRule -DisplayName 'SilkWarp-Agent-TCP' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 19580 -RemoteAddress '${safeCidr}' -Profile Any | Out-Null
 `;
   if (isElevated) {
     await execFileAsync(
@@ -854,6 +858,83 @@ export async function grantAllApolloClientPermissions(
   }
 
   return { total, updated };
+}
+
+const APOLLO_READONLY_CONFIG_KEYS = [
+  "status",
+  "status_code",
+  "version",
+  "platform",
+  "has_session",
+  "login_pin",
+];
+
+/**
+ * Reads Apollo/Sunshine's configured capture output name (empty string when
+ * unset or unreachable).
+ */
+export async function getApolloOutputName(
+  apolloUser: string,
+  apolloPass: string,
+  port = 47990,
+): Promise<string> {
+  const res = await apolloAuthedRequest(port, "GET", "/api/config", apolloUser, apolloPass);
+  if (res.statusCode < 200 || res.statusCode >= 300 || !res.json) return "";
+  const value = res.json.output_name;
+  return typeof value === "string" ? value : String(value ?? "");
+}
+
+/**
+ * Switches Apollo/Sunshine's capture output to the named display.
+ *
+ * CRITICAL: `POST /api/config` rewrites the *entire* configuration from the
+ * submitted JSON rather than patching a single key. We therefore read the
+ * current config, strip read-only status metadata, set `output_name`, and post
+ * the full cloned object back.
+ */
+export async function setApolloOutputName(
+  outputName: string,
+  apolloUser: string,
+  apolloPass: string,
+  port = 47990,
+): Promise<{ ok: boolean; message?: string }> {
+  const target = String(outputName || "").trim();
+  if (!target) {
+    return { ok: false, message: "显示器名称为空，无法切换 Apollo 输出" };
+  }
+
+  const readRes = await apolloAuthedRequest(port, "GET", "/api/config", apolloUser, apolloPass);
+  if (readRes.statusCode < 200 || readRes.statusCode >= 300) {
+    return {
+      ok: false,
+      message:
+        readRes.statusCode === 0
+          ? `连接本机 Apollo (${port}) 失败: ${readRes.text}`
+          : `读取 Apollo 配置失败 (HTTP ${readRes.statusCode})`,
+    };
+  }
+  if (!readRes.json || typeof readRes.json !== "object" || Array.isArray(readRes.json)) {
+    return { ok: false, message: "Apollo 配置响应格式异常" };
+  }
+
+  const cloned: Record<string, unknown> = JSON.parse(JSON.stringify(readRes.json));
+  for (const key of APOLLO_READONLY_CONFIG_KEYS) {
+    delete cloned[key];
+  }
+  cloned.output_name = target;
+
+  const writeRes = await apolloAuthedRequest(port, "POST", "/api/config", apolloUser, apolloPass, cloned);
+  const ok = writeRes.statusCode >= 200 && writeRes.statusCode < 300;
+  if (ok) {
+    return { ok: true, message: `已切换 Apollo 输出到「${target}」` };
+  }
+  return {
+    ok: false,
+    message:
+      writeRes.statusCode === 0
+        ? `连接本机 Apollo (${port}) 失败: ${writeRes.text}`
+        : `Apollo 拒绝新配置 (HTTP ${writeRes.statusCode}): ${writeRes.text.slice(0, 200)}`,
+  };
 }
 
 export async function submitApolloPin(
