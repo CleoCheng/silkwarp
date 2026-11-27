@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
+  buildListDisplaysScript,
   buildSystemActionScript,
   getHostMasterMute,
   isVirtualMonitorDescriptor,
@@ -223,6 +224,14 @@ test("buildSystemActionScript: repair_ime restarts TextInputHost and ctfmon safe
   assert.match(spec.powershell, /TextInputHost/);
   assert.match(spec.powershell, /ctfmon\.exe/);
   assert.match(spec.powershell, /<<<SILKWARP_ACTION:OK>>>/);
+});
+
+test("buildListDisplaysScript: queries physical pixel dimensions via EnumDisplaySettingsW DEVMODEW", () => {
+  const script = buildListDisplaysScript();
+  assert.match(script, /EnumDisplaySettingsW/);
+  assert.match(script, /DEVMODEW/);
+  assert.match(script, /dmPelsWidth/);
+  assert.match(script, /dmPelsHeight/);
 });
 
 // ---------------------------------------------------------------------------

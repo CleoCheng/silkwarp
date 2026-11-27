@@ -63,6 +63,8 @@ test("renderEasyTierConfig: defaults to pure-UDP listeners, no client relaying, 
   assert.match(toml, /latency_first = false/);
   assert.match(toml, /multi_thread_count = 4/);
   assert.match(toml, /disable_tcp_hole_punching = true/);
+  assert.match(toml, /disable_sym_hole_punching = false/);
+  assert.match(toml, /compression = "none"/);
   assert.match(toml, /relay_network_whitelist = ""/);
   assert.match(toml, /mtu = 1360/);
   assert.doesNotMatch(toml, /tcp:\/\/relay\.example\.com:11011/);

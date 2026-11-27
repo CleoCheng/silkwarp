@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Activity, Copy, RefreshCw, Smartphone, UserPlus } from "lucide-react";
 import type { BootstrapConfig, EasyTierStatus, UserInfo } from "../../electron/types";
 
@@ -8,6 +8,7 @@ interface AdminViewProps {
   bootstrap: BootstrapConfig | null;
   easytier: EasyTierStatus;
   onStartEasyTier: () => Promise<void>;
+  onReconnectUdp: () => Promise<void>;
   onRelaunchAdmin: () => Promise<void>;
   onRefresh: () => Promise<void>;
   onListUsers: () => Promise<UserInfo[]>;
@@ -17,12 +18,37 @@ interface AdminViewProps {
   notify: (msg: string) => void;
 }
 
+async function copyText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // fall through to the legacy path
+  }
+  try {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(area);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 export function AdminView({
   currentUser,
   apiUrl,
   bootstrap,
   easytier,
   onStartEasyTier,
+  onReconnectUdp,
   onRelaunchAdmin,
   onRefresh,
   onListUsers,
@@ -36,6 +62,9 @@ export function AdminView({
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<"member" | "admin">("member");
+  const [reconnectingUdp, setReconnectingUdp] = useState(false);
+  const [confirmDeleteUserId, setConfirmDeleteUserId] = useState<string>("");
+  const confirmTimerRef = useRef<number | null>(null);
 
   async function reload() {
     if (currentUser.role !== "admin") return;
@@ -46,6 +75,30 @@ export function AdminView({
   useEffect(() => {
     void reload().catch(() => {});
   }, [currentUser.role]);
+
+  useEffect(() => {
+    return () => {
+      if (confirmTimerRef.current !== null) window.clearTimeout(confirmTimerRef.current);
+    };
+  }, []);
+
+  function armDeleteUser(userId: string) {
+    if (confirmTimerRef.current !== null) window.clearTimeout(confirmTimerRef.current);
+    if (confirmDeleteUserId === userId) {
+      setConfirmDeleteUserId("");
+      void onDeleteUser(userId)
+        .then(async () => {
+          notify("已删除成员账号");
+          await reload();
+        })
+        .catch((err) => notify(err instanceof Error ? err.message : String(err)));
+      return;
+    }
+    setConfirmDeleteUserId(userId);
+    confirmTimerRef.current = window.setTimeout(() => {
+      setConfirmDeleteUserId("");
+    }, 4000);
+  }
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
@@ -61,10 +114,18 @@ export function AdminView({
     }
   }
 
-  function copyVal(text: string, label: string) {
-    void navigator.clipboard.writeText(text);
-    notify(`已复制 ${label}`);
+  async function copyVal(text: string, label: string) {
+    const ok = await copyText(text);
+    notify(ok ? `已复制 ${label}` : `复制 ${label} 失败，请手动选中复制`);
   }
+
+  const hasTcpFallbackPeer = easytier.peers.some(
+    (p) =>
+      p.cost !== "Local" &&
+      p.tunnel &&
+      p.tunnel.toLowerCase().includes("tcp") &&
+      !p.tunnel.toLowerCase().includes("udp"),
+  );
 
   return (
     <div className="space-y-5">
@@ -93,15 +154,39 @@ export function AdminView({
             {!easytier.running && !easytier.needsElevation && (
               <button
                 type="button"
-                onClick={() => void onStartEasyTier()}
+                onClick={() =>
+                  void onStartEasyTier().catch((e) => notify(e instanceof Error ? e.message : String(e)))
+                }
                 className="rounded-xl bg-sky-400 px-3 py-1.5 text-xs font-bold text-slate-950"
               >
                 启动虚拟网卡
               </button>
             )}
+            {easytier.running && (
+              <button
+                type="button"
+                disabled={reconnectingUdp}
+                onClick={() => {
+                  setReconnectingUdp(true);
+                  void onReconnectUdp()
+                    .then(() => notify("已重新触发纯 UDP 直连协商"))
+                    .catch((e) => notify(e instanceof Error ? e.message : String(e)))
+                    .finally(() => setReconnectingUdp(false));
+                }}
+                title="当隧道因临时断网回落为 TCP 时，点击可强制重新尝试纯 UDP 低延迟建链"
+                className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold disabled:opacity-50 ${
+                  hasTcpFallbackPeer
+                    ? "border-amber-500/45 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25"
+                    : "border-edge bg-panelHover text-slate-200 hover:border-sky-500/40"
+                }`}
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${reconnectingUdp ? "animate-spin" : ""}`} />
+                {reconnectingUdp ? "正在重建 UDP..." : "重建纯 UDP"}
+              </button>
+            )}
             <button
               type="button"
-              onClick={() => void onRefresh()}
+              onClick={() => void onRefresh().catch((e) => notify(e instanceof Error ? e.message : String(e)))}
               className="inline-flex items-center gap-1.5 rounded-xl border border-edge bg-panelHover px-3 py-1.5 text-xs font-medium text-slate-200"
             >
               <RefreshCw className="w-3.5 h-3.5" /> 刷新路由
@@ -226,7 +311,11 @@ export function AdminView({
                     <td className="px-4 py-2.5 flex gap-2">
                       <button
                         type="button"
-                        onClick={() => void onUpdateUser(u.id, { enabled: !u.enabled }).then(reload)}
+                        onClick={() =>
+                          void onUpdateUser(u.id, { enabled: !u.enabled })
+                            .then(reload)
+                            .catch((e) => notify(e instanceof Error ? e.message : String(e)))
+                        }
                         className="rounded-lg border border-edge bg-panelHover px-2.5 py-1 text-[11px]"
                       >
                         {u.enabled ? "禁用" : "启用"}
@@ -234,10 +323,14 @@ export function AdminView({
                       {u.id !== currentUser.id && (
                         <button
                           type="button"
-                          onClick={() => void onDeleteUser(u.id).then(reload)}
-                          className="rounded-lg border border-red-500/40 bg-red-500/10 px-2.5 py-1 text-[11px] text-red-200"
+                          onClick={() => armDeleteUser(u.id)}
+                          className={`rounded-lg border px-2.5 py-1 text-[11px] font-semibold ${
+                            confirmDeleteUserId === u.id
+                              ? "border-red-400 bg-red-500/30 text-red-100"
+                              : "border-red-500/40 bg-red-500/10 text-red-200"
+                          }`}
                         >
-                          删除
+                          {confirmDeleteUserId === u.id ? "确认删除?" : "删除"}
                         </button>
                       )}
                     </td>
@@ -269,7 +362,7 @@ export function AdminView({
               <div className="text-slate-400">API 服务器：<span className="text-slate-100 font-mono">{bootstrap.rustdesk.api_server}</span></div>
               <button
                 type="button"
-                onClick={() => copyVal(bootstrap.rustdesk.public_key, "RustDesk 公钥")}
+                onClick={() => void copyVal(bootstrap.rustdesk.public_key, "RustDesk 公钥")}
                 className="mt-1 inline-flex items-center gap-1 rounded-lg border border-edge bg-panelHover px-2.5 py-1 text-[11px] text-slate-200"
               >
                 <Copy className="w-3 h-3" /> 复制 RustDesk Key
@@ -281,7 +374,7 @@ export function AdminView({
               <div className="text-slate-400">首选节点：<span className="text-slate-100 font-mono">{bootstrap.easytier.peers[0]}</span></div>
               <button
                 type="button"
-                onClick={() => copyVal(bootstrap.easytier.network_secret, "EasyTier 网络密钥")}
+                onClick={() => void copyVal(bootstrap.easytier.network_secret, "EasyTier 网络密钥")}
                 className="mt-1 inline-flex items-center gap-1 rounded-lg border border-edge bg-panelHover px-2.5 py-1 text-[11px] text-slate-200"
               >
                 <Copy className="w-3 h-3" /> 复制网络密钥

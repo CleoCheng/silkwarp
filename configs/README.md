@@ -13,7 +13,7 @@
 | **EasyTier** | 网络名称 (`network_name`) | `<SILKWARP_NETWORK_NAME>`（默认 `silkwarp-team`） |
 | EasyTier | 网络密钥 (`network_secret`) | 见 `secrets/silkwarp.env` -> `SILKWARP_NETWORK_SECRET` |
 | EasyTier | 节点列表 (`peer`) | `udp://<RELAY_HOST>:<RELAY_PORT>`、`tcp://<RELAY_HOST>:<RELAY_PORT>`、`udp://<SIGNALING_HOST>:<COORD_PORT>`、`tcp://<SIGNALING_HOST>:<COORD_PORT>` |
-| EasyTier | 建议选项 | 开启 `latency_first`（延迟优先）、`multi_thread`、`enable_ipv6` |
+| EasyTier | 建议选项 | `default_protocol = "udp"`、`latency_first = false`、`compression = "none"`、`disable_sym_hole_punching = false`、`multi_thread`、`enable_ipv6` |
 | **RustDesk** | ID 服务器 (`hbbs`) | `<SIGNALING_HOST>`（默认端口 `21116`） |
 | RustDesk | 中继服务器 (`hbbr`) | 留空即可（由 `hbbs` 自动下发 `<RELAY_HOST>:<HBBR_PORT>`） |
 | RustDesk | Key（公钥） | 见 `secrets/silkwarp.env` -> `RUSTDESK_PUBLIC_KEY` |

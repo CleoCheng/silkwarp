@@ -334,7 +334,7 @@ export function runEncodedPowerShell(script: string, timeoutMs = 10000): Promise
   });
 }
 
-function buildListDisplaysScript(): string {
+export function buildListDisplaysScript(): string {
   return String.raw`
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @'
@@ -380,6 +380,43 @@ public static class SilkWarpDisplays
         public string DeviceKey;
     }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct DEVMODEW
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string dmDeviceName;
+        public ushort dmSpecVersion;
+        public ushort dmDriverVersion;
+        public ushort dmSize;
+        public ushort dmDriverExtra;
+        public uint dmFields;
+        public int dmPositionX;
+        public int dmPositionY;
+        public uint dmDisplayOrientation;
+        public uint dmDisplayFixedOutput;
+        public short dmColor;
+        public short dmDuplex;
+        public short dmYResolution;
+        public short dmTTOption;
+        public short dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+        public string dmFormName;
+        public ushort dmLogPixels;
+        public uint dmBitsPerPel;
+        public uint dmPelsWidth;
+        public uint dmPelsHeight;
+        public uint dmDisplayFlags;
+        public uint dmDisplayFrequency;
+        public uint dmICMMethod;
+        public uint dmICMIntent;
+        public uint dmMediaType;
+        public uint dmDitherType;
+        public uint dmReserved1;
+        public uint dmReserved2;
+        public uint dmPanningWidth;
+        public uint dmPanningHeight;
+    }
+
     public delegate bool MonitorEnumProc(IntPtr hMonitor, IntPtr hdc, ref RECT rect, IntPtr data);
 
     [DllImport("user32.dll")]
@@ -390,6 +427,9 @@ public static class SilkWarpDisplays
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern bool EnumDisplayDevices(string device, uint devNum, ref DISPLAY_DEVICE info, uint flags);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern bool EnumDisplaySettingsW(string lpszDeviceName, int iModeNum, ref DEVMODEW lpDevMode);
 
     private static string Escape(string value)
     {
@@ -460,6 +500,13 @@ public static class SilkWarpDisplays
 
             int width = info.rcMonitor.Right - info.rcMonitor.Left;
             int height = info.rcMonitor.Bottom - info.rcMonitor.Top;
+            DEVMODEW devMode = new DEVMODEW();
+            devMode.dmSize = (ushort)Marshal.SizeOf(typeof(DEVMODEW));
+            if (EnumDisplaySettingsW(info.szDevice, -1, ref devMode) && devMode.dmPelsWidth > 0 && devMode.dmPelsHeight > 0)
+            {
+                width = (int)devMode.dmPelsWidth;
+                height = (int)devMode.dmPelsHeight;
+            }
             bool primary = (info.dwFlags & 1) == 1;
             bool virtualMonitor = IsVirtual(friendly, deviceId, driver);
 

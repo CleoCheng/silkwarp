@@ -323,6 +323,33 @@ class ControlPlaneTestCase(unittest.TestCase):
         self.assertIn("has_access_password", columns)
         self.assertIn("agent_port", columns)
 
+    def test_static_traversal_and_wol_unquote(self) -> None:
+        from http.client import HTTPConnection
+        from urllib.parse import urlparse
+
+        parsed = urlparse(self.base)
+        conn = HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+        try:
+            # Sibling/parent traversal must never escape static_dir.
+            conn.request("GET", "/../../app.py")
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8", errors="ignore")
+            self.assertIn(resp.status, (200, 404))
+            self.assertNotIn("ControlPlaneConfig", body)
+        finally:
+            conn.close()
+
+        wol_dir = Path(__file__).resolve().parents[3] / "services" / "wol-helper"
+        sys.path.insert(0, str(wol_dir))
+        try:
+            import silkwarp_wol  # noqa: PLC0415
+
+            encoded = "/api/wake/%E4%B8%BB%E6%9C%BA%20A"
+            decoded = silkwarp_wol.unquote(urlparse(encoded).path.removeprefix("/api/wake/").strip("/"))
+            self.assertEqual(decoded, "主机 A")
+        finally:
+            sys.path.pop(0)
+
 
 if __name__ == "__main__":
     unittest.main()

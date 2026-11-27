@@ -128,7 +128,9 @@ export function DevicesView({
   const [transferError, setTransferError] = useState("");
   const [transferTasks, setTransferTasks] = useState<TransferTaskItem[]>([]);
   const [transferDragActive, setTransferDragActive] = useState(false);
+  const [confirmDeleteDeviceId, setConfirmDeleteDeviceId] = useState<string>("");
   const transferDragDepth = useRef(0);
+  const confirmDeleteTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     void bridge.getLocalDisplayResolution().then(setLocalDisplayRes).catch(() => {});
@@ -139,6 +141,31 @@ export function DevicesView({
       setConnectProgress(ev);
     });
   }, [bridge]);
+
+  useEffect(() => {
+    return () => {
+      if (confirmDeleteTimerRef.current !== null) window.clearTimeout(confirmDeleteTimerRef.current);
+    };
+  }, []);
+
+  function updatePresetSafe(next: StreamPreset) {
+    void onUpdatePreset(next).catch((err) => notify(err instanceof Error ? err.message : String(err)));
+  }
+
+  function handleDeleteDeviceClick(device: DeviceInfo) {
+    if (confirmDeleteTimerRef.current !== null) window.clearTimeout(confirmDeleteTimerRef.current);
+    if (confirmDeleteDeviceId === device.id) {
+      setConfirmDeleteDeviceId("");
+      void onDeleteDevice(device.id)
+        .then(() => notify(`已移除设备「${device.name}」`))
+        .catch((err) => notify(err instanceof Error ? err.message : String(err)));
+      return;
+    }
+    setConfirmDeleteDeviceId(device.id);
+    confirmDeleteTimerRef.current = window.setTimeout(() => {
+      setConfirmDeleteDeviceId("");
+    }, 4000);
+  }
 
   useEffect(() => {
     if (retryCountdown <= 0) return;
@@ -481,7 +508,7 @@ export function DevicesView({
                 <button
                   key={q.label}
                   type="button"
-                  onClick={() => void onUpdatePreset({ ...preset, ...q.preset, resolutionMode: "fixed" })}
+                  onClick={() => updatePresetSafe({ ...preset, ...q.preset, resolutionMode: "fixed" })}
                   className={`rounded-xl px-3 py-1.5 text-xs font-semibold border transition-colors ${
                     active
                       ? "bg-sky-500/15 text-sky-300 border-sky-500/40"
@@ -496,7 +523,7 @@ export function DevicesView({
             <select
               aria-label="编码器"
               value={preset.codec}
-              onChange={(e) => void onUpdatePreset({ ...preset, codec: e.target.value as StreamPreset["codec"] })}
+              onChange={(e) => updatePresetSafe({ ...preset, codec: e.target.value as StreamPreset["codec"] })}
               className="rounded-xl border border-edge bg-panelHover px-2.5 py-1.5 text-xs text-slate-200"
             >
               <option value="hevc">H.265 (推荐)</option>
@@ -508,7 +535,7 @@ export function DevicesView({
               <input
                 type="checkbox"
                 checked={preset.muteHostAudio}
-                onChange={(e) => void onUpdatePreset({ ...preset, muteHostAudio: e.target.checked })}
+                onChange={(e) => updatePresetSafe({ ...preset, muteHostAudio: e.target.checked })}
                 className="rounded border-edge bg-panelHover text-sky-400"
               />
               被控端静音
@@ -518,7 +545,7 @@ export function DevicesView({
               <input
                 type="checkbox"
                 checked={preset.lowLatency}
-                onChange={(e) => void onUpdatePreset({ ...preset, lowLatency: e.target.checked })}
+                onChange={(e) => updatePresetSafe({ ...preset, lowLatency: e.target.checked })}
                 className="rounded border-edge bg-panelHover text-sky-400"
               />
               极速低延迟
@@ -527,7 +554,7 @@ export function DevicesView({
 
           <button
             type="button"
-            onClick={() => void onRefresh()}
+            onClick={() => void onRefresh().catch((err) => notify(err instanceof Error ? err.message : String(err)))}
             className="inline-flex items-center gap-1.5 rounded-xl border border-edge bg-panelHover px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-sky-500/50 transition-colors shrink-0 whitespace-nowrap"
           >
             <RefreshCw className="w-3.5 h-3.5" />
@@ -558,20 +585,20 @@ export function DevicesView({
                     type="button"
                     onClick={() => {
                       if (m.value === "follow_client") {
-                        void onUpdatePreset({
+                        updatePresetSafe({
                           ...preset,
                           resolutionMode: "follow_client",
                           resolution: localDisplayRes || preset.resolution,
                           streamApp: "Virtual Display",
                         });
                       } else if (m.value === "follow_host") {
-                        void onUpdatePreset({
+                        updatePresetSafe({
                           ...preset,
                           resolutionMode: "follow_host",
                           streamApp: "Desktop",
                         });
                       } else {
-                        void onUpdatePreset({ ...preset, resolutionMode: "fixed" });
+                        updatePresetSafe({ ...preset, resolutionMode: "fixed" });
                       }
                     }}
                     className={`rounded-md px-2 py-0.5 font-semibold transition-colors ${
@@ -598,7 +625,7 @@ export function DevicesView({
                 <button
                   key={m.value}
                   type="button"
-                  onClick={() => void onUpdatePreset({ ...preset, displayMode: m.value })}
+                  onClick={() => updatePresetSafe({ ...preset, displayMode: m.value })}
                   className={`rounded-md px-2 py-0.5 font-semibold transition-colors ${
                     preset.displayMode === m.value
                       ? "bg-sky-500/20 text-sky-300"
@@ -621,7 +648,7 @@ export function DevicesView({
                 <button
                   key={m.value}
                   type="button"
-                  onClick={() => void onUpdatePreset({ ...preset, streamApp: m.value })}
+                  onClick={() => updatePresetSafe({ ...preset, streamApp: m.value })}
                   className={`rounded-md px-2 py-0.5 font-semibold transition-colors ${
                     preset.streamApp === m.value
                       ? "bg-sky-500/20 text-sky-300"
@@ -662,7 +689,7 @@ export function DevicesView({
             return (
               <article
                 key={d.id}
-                className="rounded-2xl border border-edge bg-panel p-5 flex flex-col justify-between gap-4 hover:border-slate-600 transition-colors"
+                className="min-w-0 rounded-2xl border border-edge bg-panel p-5 flex flex-col justify-between gap-4 hover:border-slate-600 transition-colors"
               >
                 <div className="space-y-3">
                   <div className="flex items-start justify-between gap-2">
@@ -731,8 +758,8 @@ export function DevicesView({
                     {isSelf ? "当前本机" : isBusy ? "正在极速连接..." : "立即远程"}
                   </button>
 
-                  <div className="flex items-center justify-between gap-1.5">
-                    <div className="flex items-center gap-1.5">
+                  <div className="flex flex-wrap items-center justify-between gap-1.5">
+                    <div className="flex flex-wrap items-center gap-1.5 min-w-0">
                       {d.mac_address && (
                         <button
                           type="button"
@@ -773,7 +800,7 @@ export function DevicesView({
                       )}
                     </div>
 
-                    <div className="flex items-center gap-1 ml-auto">
+                    <div className="flex items-center gap-1 ml-auto shrink-0">
                       <button
                         type="button"
                         aria-label="编辑设备"
@@ -785,10 +812,14 @@ export function DevicesView({
                       <button
                         type="button"
                         aria-label="删除设备"
-                        onClick={() => void onDeleteDevice(d.id).catch((e) => notify(e.message))}
-                        className="p-1.5 rounded-lg text-slate-400 hover:text-red-300 hover:bg-red-500/10"
+                        onClick={() => handleDeleteDeviceClick(d)}
+                        className={`rounded-lg whitespace-nowrap shrink-0 transition-colors ${
+                          confirmDeleteDeviceId === d.id
+                            ? "border border-red-400/60 bg-red-500/25 px-2 py-1 text-[10px] font-semibold text-red-100"
+                            : "p-1.5 text-slate-400 hover:text-red-300 hover:bg-red-500/10"
+                        }`}
                       >
-                        <Trash2 className="w-3.5 h-3.5" />
+                        {confirmDeleteDeviceId === d.id ? "确认删除?" : <Trash2 className="w-3.5 h-3.5" />}
                       </button>
                     </div>
                   </div>

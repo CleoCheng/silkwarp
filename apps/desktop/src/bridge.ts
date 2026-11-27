@@ -356,6 +356,7 @@ const previewFallback: SilkWarpBridge = {
     return previewState;
   },
   startEasyTier: async () => previewState,
+  reconnectEasyTierUdp: async () => previewState,
   relaunchAsAdmin: async () => {},
   configureFirewall: async () => previewState,
   configureRustDesk: async () => [],

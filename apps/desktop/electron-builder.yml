@@ -13,6 +13,11 @@ extraResources:
     to: easytier
   - from: resources/moonlight
     to: moonlight
+    filter:
+      - "**/*"
+      - "!Moonlight Game Streaming Project/**"
+      - "!**/Moonlight Game Streaming Project/**"
+      - "!*.ini"
   - from: resources/installers
     to: installers
   - from: build/icon.png

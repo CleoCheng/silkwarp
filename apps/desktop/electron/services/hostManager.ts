@@ -11,6 +11,7 @@ import type { BootstrapConfig, HostHardwareInfo, ProvisionStage } from "../types
 import { APOLLO_PERM_ALL, needsApolloPermissionUpgrade } from "./apolloPermissions";
 import { APOLLO_READONLY_CONFIG_KEYS, buildOptimalApolloConfigPatch } from "./apolloTuning";
 import { ensureProgramDataEasyTierBinaries, renderEasyTierConfig, resolveEasyTierDir } from "./easytierManager";
+import { ensureOptimizedMoonlightIni, getMoonlightConfigDir } from "./streamLauncher";
 import { DEFAULT_AGENT_PORT } from "./hostAgentAuth";
 import {
   BOOT_TUNNEL_CONFIG_PATH,
@@ -51,6 +52,34 @@ let elevationPromise: Promise<boolean> | null = null;
 let firewallCache: { configured: boolean; checkedAt: number } | null = null;
 let uuCheckCache: { detected: boolean; checkedAt: number } | null = null;
 let bootTunnelCache: { configured: boolean; checkedAt: number } | null = null;
+let moonlightAclFixed = false;
+
+/**
+ * Ensures portable `Moonlight.ini` folder inside Program Files grants Modify
+ * rights to standard Users so subsequent unelevated runs (with boot tunnel)
+ * can still optimize `Moonlight.ini` and pair hosts without `EPERM`.
+ */
+export async function ensureMoonlightConfigWritable(isElevated: boolean): Promise<boolean> {
+  if (process.platform !== "win32" || !isElevated || moonlightAclFixed) {
+    return moonlightAclFixed;
+  }
+  const configDir = getMoonlightConfigDir();
+  if (!configDir) return false;
+  try {
+    fs.mkdirSync(configDir, { recursive: true });
+    ensureOptimizedMoonlightIni();
+    if (/\\program files(?: \(x86\))?\\/i.test(configDir)) {
+      await execFileAsync("icacls", [configDir, "/grant", "*S-1-5-32-545:(OI)(CI)M", "/T", "/Q"], {
+        timeout: 6000,
+        windowsHide: true,
+      });
+    }
+    moonlightAclFixed = true;
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const RUSTDESK_EXE_PATHS = [
   "C:\\Program Files\\RustDesk\\rustdesk.exe",

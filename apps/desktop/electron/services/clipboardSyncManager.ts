@@ -10,6 +10,7 @@
  */
 
 import { execFile } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -50,6 +51,7 @@ export interface ElectronClipboardLike {
   readImage(): { isEmpty(): boolean; toPNG(): Buffer };
   writeImage(image: unknown): void;
   availableFormats?(): string[];
+  readBuffer?(format: string): Buffer;
 }
 
 /** Minimal surface of Electron's `nativeImage` module used by the adapter. */
@@ -205,6 +207,27 @@ function normalizeFileList(raw: string[] | undefined): string[] {
   return files;
 }
 
+function readClipboardDropSignature(clipboardObj: ElectronClipboardLike): string | null {
+  if (typeof clipboardObj.readBuffer !== "function") return null;
+  const parts: Buffer[] = [];
+  for (const fmt of ["Shell IDList Array", "FileNameW"]) {
+    try {
+      const buf = clipboardObj.readBuffer(fmt);
+      if (Buffer.isBuffer(buf) && buf.length > 0) {
+        parts.push(Buffer.from(fmt, "utf8"), buf);
+      }
+    } catch {
+      // ignore unsupported/unavailable buffer formats
+    }
+  }
+  if (parts.length === 0) return null;
+  const hash = crypto.createHash("sha256");
+  for (const part of parts) {
+    hash.update(part);
+  }
+  return hash.digest("hex");
+}
+
 /**
  * Builds the real Electron clipboard adapter.
  *
@@ -214,6 +237,7 @@ function normalizeFileList(raw: string[] | undefined): string[] {
 export function createElectronClipboardAdapter(deps?: ElectronClipboardDeps): ClipboardAdapter {
   const resolved = deps ?? loadElectronClipboardDeps();
   const fileDropList = resolved.fileDropList ?? createWindowsFileDropListHelper();
+  let cachedFileDrop: { sig: string; files: string[] } | null = null;
 
   return {
     async read(): Promise<ClipboardPayload> {
@@ -232,11 +256,23 @@ export function createElectronClipboardAdapter(deps?: ElectronClipboardDeps): Cl
         maybeFiles = true;
       }
       if (maybeFiles) {
-        const rawFiles = await fileDropList.read();
+        const sig = readClipboardDropSignature(resolved.clipboard);
+        let rawFiles: string[];
+        if (sig && cachedFileDrop && cachedFileDrop.sig === sig) {
+          rawFiles = cachedFileDrop.files;
+        } else {
+          rawFiles = await fileDropList.read();
+          if (sig) {
+            cachedFileDrop = { sig, files: normalizeFileList(rawFiles).filter(isRegularFile) };
+            rawFiles = cachedFileDrop.files;
+          }
+        }
         const files = normalizeFileList(rawFiles).filter(isRegularFile);
         if (files.length > 0) {
           return { kind: "files", files, updatedAt };
         }
+      } else {
+        cachedFileDrop = null;
       }
 
       // 2. Image payloads (PNG re-encoded so the remote side can write them
@@ -267,6 +303,7 @@ export function createElectronClipboardAdapter(deps?: ElectronClipboardDeps): Cl
     },
 
     async write(payload: ClipboardPayload): Promise<{ ok: boolean; kind: ClipboardKind; message?: string }> {
+      cachedFileDrop = null;
       if (!payload || payload.kind === "empty") {
         return { ok: false, kind: "empty", message: "剪贴板载荷为空，未写入" };
       }

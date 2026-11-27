@@ -229,9 +229,10 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
 
     def _serve_static(self, req_path: str) -> None:
         rel = req_path.lstrip("/") or "index.html"
-        target = (self.static_dir / rel).resolve()
-        if not str(target).startswith(str(self.static_dir.resolve())) or not target.is_file():
-            target = self.static_dir / "index.html"
+        static_root = self.static_dir.resolve()
+        target = (static_root / rel).resolve()
+        if not target.is_relative_to(static_root) or not target.is_file():
+            target = static_root / "index.html"
         if not target.is_file():
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "static_not_found"})
             return

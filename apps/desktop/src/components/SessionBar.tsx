@@ -443,13 +443,20 @@ export function SessionBar() {
   }, []);
 
   function patchOptions(patch: Partial<StreamPreset>) {
-    void bridge.updateSessionOptions(patch).then((next) => {
-      if (next) setState(next);
-    });
+    void bridge
+      .updateSessionOptions(patch)
+      .then((next) => {
+        if (next) setState(next);
+      })
+      .catch((err) => showBanner(false, err instanceof Error ? err.message : String(err)));
   }
 
   function applySession(next: ActiveSessionState | null) {
     if (next) setState(next);
+  }
+
+  function reportSessionError(err: unknown) {
+    showBanner(false, err instanceof Error ? err.message : String(err));
   }
 
   function toggleExpanded() {
@@ -762,7 +769,7 @@ export function SessionBar() {
             type="button"
             aria-label={isFullscreen ? "退出全屏" : "进入全屏"}
             title={isFullscreen ? "退出全屏 (Ctrl+Alt+F)" : "进入全屏 (Ctrl+Alt+F)"}
-            onClick={() => void bridge.toggleSessionFullscreen().then(applySession)}
+            onClick={() => void bridge.toggleSessionFullscreen().then(applySession).catch(reportSessionError)}
             className="rounded-full p-1 text-slate-400 hover:bg-white/10 hover:text-white"
           >
             {isFullscreen ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
@@ -793,7 +800,7 @@ export function SessionBar() {
   }
 
   return (
-    <div className="flex h-full w-full justify-center bg-transparent p-1" {...dragProps}>
+    <div className="flex h-screen w-full justify-center bg-transparent p-1" {...dragProps}>
       <div
         className={`relative flex h-full w-full max-w-[610px] flex-col overflow-hidden rounded-2xl border shadow-[0_16px_50px_rgba(0,0,0,0.6)] backdrop-blur-2xl transition-colors ${
           dragActive ? "border-sky-400/80 bg-[#0d1220]/98 ring-2 ring-sky-400/50" : "border-white/10 bg-[#0d1220]/92"
@@ -883,7 +890,7 @@ export function SessionBar() {
                   onChange={(displayMode) => {
                     if (displayMode === preset.displayMode) return;
                     if (displayMode !== "borderless" && preset.displayMode !== "borderless") {
-                      void bridge.toggleSessionFullscreen().then(applySession);
+                      void bridge.toggleSessionFullscreen().then(applySession).catch(reportSessionError);
                     } else {
                       patchOptions({ displayMode });
                     }
@@ -923,7 +930,7 @@ export function SessionBar() {
                   { value: "fit_window", label: "适应窗口" },
                   { value: "fixed", label: "固定" },
                 ]}
-                onChange={(mode) => void bridge.setSessionResolutionMode(mode).then(applySession)}
+                onChange={(mode) => void bridge.setSessionResolutionMode(mode).then(applySession).catch(reportSessionError)}
               />
             </div>
 
@@ -932,7 +939,7 @@ export function SessionBar() {
                 <span>固定分辨率快速选择</span>
                 <button
                   type="button"
-                  onClick={() => void bridge.fitSessionWindow().then(applySession)}
+                  onClick={() => void bridge.fitSessionWindow().then(applySession).catch(reportSessionError)}
                   className="rounded border border-sky-400/40 bg-sky-400/10 px-1.5 py-0.5 text-[9px] font-semibold text-sky-200 hover:bg-sky-400/20"
                 >
                   自适应当前窗口
@@ -943,7 +950,7 @@ export function SessionBar() {
                   <button
                     key={r.value}
                     type="button"
-                    onClick={() => void bridge.setSessionResolutionMode("fixed", r.value).then(applySession)}
+                    onClick={() => void bridge.setSessionResolutionMode("fixed", r.value).then(applySession).catch(reportSessionError)}
                     className={`flex-1 rounded-md border px-1 py-1 text-[10px] font-semibold ${
                       preset.resolutionMode === "fixed" && preset.resolution === r.value
                         ? "border-sky-400/60 bg-sky-400/15 text-sky-200"
@@ -1049,8 +1056,14 @@ export function SessionBar() {
               <Toggle
                 checked={preset.adaptiveRelayCap}
                 onChange={(adaptiveRelayCap) => patchOptions({ adaptiveRelayCap })}
-                label="原画稳帧"
-                hint="不降画质，自动匹配 60FPS 与帧步调平滑"
+                label="原画稳流"
+                hint="不降分辨率，中继/丢包自动稳码率防断流"
+              />
+              <Toggle
+                checked={Boolean(preset.yuv444)}
+                onChange={(yuv444) => patchOptions({ yuv444 })}
+                label="原彩文本 4:4:4"
+                hint="代码/文字锐利原彩（需双方硬件支持，中继自动切回 4:2:0）"
               />
             </div>
 
@@ -1071,7 +1084,7 @@ export function SessionBar() {
 
             <button
               type="button"
-              onClick={() => void bridge.switchSessionOfficeMode().catch(() => {})}
+              onClick={() => void bridge.switchSessionOfficeMode().catch(reportSessionError)}
               className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-emerald-400/40 bg-gradient-to-r from-emerald-500/25 to-teal-500/20 px-2 py-1.5 text-[11px] font-bold text-emerald-100 hover:from-emerald-500/35 hover:to-teal-500/30"
             >
               <MousePointer2 className="h-3.5 w-3.5" />
@@ -1085,7 +1098,7 @@ export function SessionBar() {
             <div className="flex flex-wrap gap-1">
               <button
                 type="button"
-                onClick={() => void bridge.toggleSessionFullscreen().then(applySession)}
+                onClick={() => void bridge.toggleSessionFullscreen().then(applySession).catch(reportSessionError)}
                 className="inline-flex items-center gap-1 rounded-md border border-sky-400/35 bg-sky-500/10 px-2 py-1 text-[10px] font-semibold text-sky-200 hover:bg-sky-500/20"
                 title="快捷切换全屏/窗口（支持 Ctrl+Alt+F 或 Ctrl+Alt+Enter）"
               >
@@ -1350,9 +1363,12 @@ export function SessionBar() {
         </div>
 
         <div className="flex items-center justify-between border-t border-white/10 px-3 py-1.5 text-[9px] text-slate-500">
-          <span className="inline-flex items-center gap-1">
-            <Radio className="h-2.5 w-2.5" /> {state.resolvedApp === "Virtual Display" ? "扩展虚拟屏" : "物理桌面"}
-            {state.availableApps.length > 0 ? ` · ${state.availableApps.length} 个桌面模式` : ""}
+          <span className="inline-flex items-center gap-1 font-mono text-slate-400">
+            <Radio className="h-2.5 w-2.5 text-sky-400" />
+            {state.resolvedApp === "Virtual Display" ? "扩展虚拟屏" : "物理桌面"} ·{" "}
+            {state.effectivePreset.resolution.replace("x", "×")} · {state.effectivePreset.fps}FPS ·{" "}
+            {state.effectivePreset.bitrateMbps}M · {state.effectivePreset.codec.toUpperCase()}
+            {state.effectivePreset.yuv444 ? " 4:4:4" : ""}
           </span>
           <span className="inline-flex items-center gap-1">
             {preset.lowLatency ? <Zap className="h-2.5 w-2.5 text-amber-300" /> : <MonitorOff className="h-2.5 w-2.5" />}

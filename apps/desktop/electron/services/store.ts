@@ -30,6 +30,7 @@ export interface PersistedState {
   allowSameAccountBypass: boolean;
   autoLockOnDisconnect: boolean;
   savedDevicePasswords: Record<string, string>;
+  hostDisplayResolutions: Record<string, string>;
 }
 
 function normalizeApiUrl(raw: unknown): string {
@@ -108,6 +109,7 @@ export class StateStore {
       allowSameAccountBypass: true,
       autoLockOnDisconnect: false,
       savedDevicePasswords: {},
+      hostDisplayResolutions: {},
     };
     try {
       if (!fs.existsSync(this.filePath)) {
@@ -133,6 +135,12 @@ export class StateStore {
           typeof parsed.savedDevicePasswords === "object" &&
           !Array.isArray(parsed.savedDevicePasswords)
             ? parsed.savedDevicePasswords
+            : {},
+        hostDisplayResolutions:
+          parsed.hostDisplayResolutions &&
+          typeof parsed.hostDisplayResolutions === "object" &&
+          !Array.isArray(parsed.hostDisplayResolutions)
+            ? parsed.hostDisplayResolutions
             : {},
       };
       let needsSync = false;
@@ -235,6 +243,22 @@ export class StateStore {
     const next = { ...this.state.savedDevicePasswords };
     delete next[deviceId];
     this.update({ savedDevicePasswords: next });
+  }
+
+  getHostDisplayResolution(deviceId: string): string {
+    const val = this.state.hostDisplayResolutions[deviceId];
+    return typeof val === "string" ? val : "";
+  }
+
+  setHostDisplayResolution(deviceId: string, resolution: string): void {
+    if (!deviceId || !resolution) return;
+    if (this.state.hostDisplayResolutions[deviceId] === resolution) return;
+    this.update({
+      hostDisplayResolutions: {
+        ...this.state.hostDisplayResolutions,
+        [deviceId]: resolution,
+      },
+    });
   }
 
   update(patch: Partial<PersistedState>): PersistedState {

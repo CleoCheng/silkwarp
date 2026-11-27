@@ -23,6 +23,8 @@ export const APOLLO_READONLY_CONFIG_KEYS = [
  * - `minimum_fps_target: 0`: automatic VFR so static desktop views don't flood uplink
  * - `hevc_mode: 0`: auto-enable hardware HEVC
  * - `ping_timeout: 20000`: tolerates WAN jitter without spurious disconnect popups
+ * - `nvenc_intra_refresh: "enabled"` & `nvenc_latency_over_power: "enabled"`: heals WAN drops row-by-row on NVIDIA hosts
+ * - `amd_usage: "ultralowlatency"` & `amd_rc: "vbr_latency"`: minimizes encoder buffering on AMD AMF hosts
  */
 export const SILKWARP_APOLLO_TUNING = {
   fec_percentage: 20,
@@ -31,6 +33,10 @@ export const SILKWARP_APOLLO_TUNING = {
   minimum_fps_target: 0,
   hevc_mode: 0,
   ping_timeout: 20000,
+  nvenc_intra_refresh: "enabled",
+  nvenc_latency_over_power: "enabled",
+  amd_usage: "ultralowlatency",
+  amd_rc: "vbr_latency",
 } as const;
 
 export interface ApolloConfigPatchResult {

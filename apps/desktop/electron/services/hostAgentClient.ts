@@ -357,7 +357,7 @@ export class HostAgentClient {
       };
 
       const req = http.request(
-        { host, port, method: "POST", path: "/api/agent/files/upload", headers, timeout: timeoutMs },
+        { host, port, method: "POST", path: "/api/agent/files/upload", headers, agent: false, timeout: timeoutMs },
         (res) => {
           const chunks: Buffer[] = [];
           res.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -480,6 +480,7 @@ export class HostAgentClient {
           method: "GET",
           path: `/api/agent/files/download?path=${encodeURIComponent(remoteFilePath)}`,
           headers: { Accept: "application/octet-stream", Authorization: `Bearer ${token}` },
+          agent: false,
           timeout: timeoutMs,
         },
         (res) => {

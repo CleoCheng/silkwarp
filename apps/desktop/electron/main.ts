@@ -20,6 +20,7 @@ import {
   ensureApolloCredentials,
   ensureApolloServiceRunning,
   ensureApolloStreamingTuning,
+  ensureMoonlightConfigWritable,
   getApolloOutputName,
   grantAllApolloClientPermissions,
   invalidateFirewallCache,
@@ -640,13 +641,19 @@ export interface SyncAllOptions {
   forceFirewallCheck?: boolean;
 }
 
-async function syncAll(opts: SyncAllOptions = {}): Promise<void> {
+let syncInFlight: Promise<void> | null = null;
+let pendingSyncOpts: SyncAllOptions | null = null;
+
+async function runSyncAllPass(opts: SyncAllOptions = {}): Promise<void> {
   const force = Boolean(opts.force);
   hostInfoCache = await collectHostInfo({
     forceFirewallCheck: Boolean(opts.forceFirewallCheck || force),
     forceUuCheck: force,
     forceBootTunnelCheck: force,
   });
+  if (hostInfoCache.isElevated) {
+    void ensureMoonlightConfigWritable(true).catch(() => {});
+  }
   await syncHostAgentServer();
   const s = store.get();
   if (!s.token) {
@@ -795,6 +802,31 @@ async function syncAll(opts: SyncAllOptions = {}): Promise<void> {
     }
   }
   emitState();
+}
+
+async function syncAll(opts: SyncAllOptions = {}): Promise<void> {
+  if (syncInFlight) {
+    pendingSyncOpts = {
+      force: Boolean(pendingSyncOpts?.force || opts.force),
+      forceFirewallCheck: Boolean(pendingSyncOpts?.forceFirewallCheck || opts.forceFirewallCheck),
+    };
+    return syncInFlight;
+  }
+
+  let nextOpts: SyncAllOptions | null = opts;
+  syncInFlight = (async () => {
+    while (nextOpts) {
+      const current = nextOpts;
+      pendingSyncOpts = null;
+      await runSyncAllPass(current);
+      nextOpts = pendingSyncOpts;
+    }
+  })().finally(() => {
+    syncInFlight = null;
+    pendingSyncOpts = null;
+  });
+
+  return syncInFlight;
 }
 
 function startHeartbeatLoop(): void {
@@ -969,18 +1001,37 @@ app.whenReady().then(async () => {
   startPairFastPoll();
 });
 
-app.on("before-quit", () => {
+let quitCleanupDone = false;
+
+app.on("before-quit", (e) => {
   isQuitting = true;
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   pairPollStopped = true;
   stopPairPoll();
   syncSessionTelemetryLoop(false);
-  void sessionManager.disconnect();
   syncSessionGlobalShortcuts(false);
   easyTier.stop();
   privacyScreen.dispose();
-  void hostAgentServer.stop().catch(() => {});
   authManager.revokeAllTokens();
+
+  if (!quitCleanupDone && (sessionManager.getState() || agentServerRunning)) {
+    e.preventDefault();
+    quitCleanupDone = true;
+    agentServerRunning = false;
+    void Promise.race([
+      Promise.allSettled([sessionManager.disconnect(), hostAgentServer.stop()]),
+      new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, 2000);
+        t.unref?.();
+      }),
+    ]).finally(() => {
+      app.quit();
+    });
+    return;
+  }
+
+  void sessionManager.disconnect().catch(() => {});
+  void hostAgentServer.stop().catch(() => {});
   agentServerRunning = false;
 });
 
@@ -1446,6 +1497,19 @@ ipcMain.handle("easytier:start", async () => {
   if (bootstrapCache) {
     hostInfoCache = await collectHostInfo({ forceFirewallCheck: true, forceBootTunnelCheck: true });
     await easyTier.ensureStarted(bootstrapCache, hostInfoCache.isElevated);
+  }
+  return buildRuntimeState();
+});
+
+ipcMain.handle("easytier:reconnectUdp", async () => {
+  if (bootstrapCache) {
+    hostInfoCache = await collectHostInfo({ forceFirewallCheck: true, forceBootTunnelCheck: true });
+    if (easyTier.getStatus().externalService && hostInfoCache.isElevated) {
+      easyTier.syncMachineConfig(bootstrapCache);
+      await restartBootTunnelTask(true);
+    }
+    await easyTier.reconnectUdp(bootstrapCache, hostInfoCache.isElevated);
+    await syncAll({ force: true });
   }
   return buildRuntimeState();
 });

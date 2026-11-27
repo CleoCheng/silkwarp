@@ -43,6 +43,7 @@ const api = {
     apolloPass?: string;
   }): Promise<AppRuntimeState> => ipcRenderer.invoke("host:updateSettings", patch),
   startEasyTier: (): Promise<AppRuntimeState> => ipcRenderer.invoke("easytier:start"),
+  reconnectEasyTierUdp: (): Promise<AppRuntimeState> => ipcRenderer.invoke("easytier:reconnectUdp"),
   relaunchAsAdmin: (): Promise<void> => ipcRenderer.invoke("app:relaunchAdmin"),
   configureFirewall: (): Promise<AppRuntimeState> => ipcRenderer.invoke("host:configureFirewall"),
   configureRustDesk: (): Promise<string[]> => ipcRenderer.invoke("host:configureRustDesk"),

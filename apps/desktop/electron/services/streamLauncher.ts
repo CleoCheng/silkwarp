@@ -51,10 +51,16 @@ export function resolveMoonlightExe(): string | null {
   return null;
 }
 
-function getMoonlightIniPath(): string | null {
+export function getMoonlightConfigDir(): string | null {
   const exe = resolveMoonlightExe();
   if (!exe) return null;
-  return path.join(path.dirname(exe), "Moonlight Game Streaming Project", "Moonlight.ini");
+  return path.join(path.dirname(exe), "Moonlight Game Streaming Project");
+}
+
+function getMoonlightIniPath(): string | null {
+  const dir = getMoonlightConfigDir();
+  if (!dir) return null;
+  return path.join(dir, "Moonlight.ini");
 }
 
 /**
@@ -65,7 +71,12 @@ export function ensureOptimizedMoonlightIni(): boolean {
   const iniPath = getMoonlightIniPath();
   if (!iniPath) return false;
   try {
-    if (!fs.existsSync(iniPath)) return false;
+    if (!fs.existsSync(iniPath)) {
+      fs.mkdirSync(path.dirname(iniPath), { recursive: true });
+      const seeded = optimizeMoonlightIni("");
+      fs.writeFileSync(iniPath, seeded.content, "utf-8");
+      return true;
+    }
     const raw = fs.readFileSync(iniPath, "utf-8");
     const next = optimizeMoonlightIni(raw);
     if (!next.changed) return false;

@@ -120,7 +120,7 @@ export class EasyTierManager {
     }
     try {
       fs.mkdirSync(BOOT_TUNNEL_PROGRAM_DATA_DIR, { recursive: true });
-      const content = renderEasyTierConfig(cfg, os.hostname(), this.transportMode);
+      const content = renderEasyTierConfig(cfg, os.hostname(), "udp_only");
       if (!this.lastMachineConfigContent && fs.existsSync(BOOT_TUNNEL_CONFIG_PATH)) {
         this.lastMachineConfigContent = fs.readFileSync(BOOT_TUNNEL_CONFIG_PATH, "utf-8");
       }
@@ -308,9 +308,6 @@ export class EasyTierManager {
         this.tcpFallbackAttempted = true;
         cfgPath = this.writeConfig(cfg);
         this.userConfigChanged = false;
-        if (fs.existsSync(BOOT_TUNNEL_PROGRAM_DATA_DIR) || fs.existsSync(BOOT_TUNNEL_CONFIG_PATH)) {
-          this.syncMachineConfig(cfg);
-        }
         this.killChildOnly();
         await new Promise((r) => setTimeout(r, 300));
         this.spawnManagedCore(core, dir, cfgPath);
@@ -324,6 +321,15 @@ export class EasyTierManager {
     }
     this.status.running = startedPeers !== null || Boolean(this.proc);
     return this.status;
+  }
+
+  async reconnectUdp(cfg: BootstrapConfig, isElevated: boolean): Promise<EasyTierStatus> {
+    this.transportMode = "udp_only";
+    this.tcpFallbackAttempted = false;
+    this.lastConfigContent = "";
+    this.userConfigChanged = true;
+    this.killChildOnly();
+    return this.ensureStarted(cfg, isElevated);
   }
 
   async refreshPeers(): Promise<PeerStatus[]> {

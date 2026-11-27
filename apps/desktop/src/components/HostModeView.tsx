@@ -89,6 +89,14 @@ export function HostModeView({
   const { host, easytier, settings, lastPairLogs } = state;
 
   useEffect(() => {
+    setApolloUser(state.settings.apolloUser);
+  }, [state.settings.apolloUser]);
+
+  useEffect(() => {
+    setApolloPass(state.settings.apolloPass);
+  }, [state.settings.apolloPass]);
+
+  useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 30_000);
     return () => clearInterval(timer);
   }, []);
@@ -187,7 +195,11 @@ export function HostModeView({
               <input
                 type="checkbox"
                 checked={settings.autoStart}
-                onChange={(e) => void onUpdateHostSettings({ autoStart: e.target.checked })}
+                onChange={(e) =>
+                  void onUpdateHostSettings({ autoStart: e.target.checked }).catch((err) =>
+                    notify(err instanceof Error ? err.message : String(err)),
+                  )
+                }
                 className="rounded border-edge bg-panelHover text-sky-400"
               />
               <span>开机自启 SilkWarp</span>
@@ -205,7 +217,11 @@ export function HostModeView({
             </label>
             <button
               type="button"
-              onClick={() => void onUpdateHostSettings({ isHost: !settings.isHost })}
+              onClick={() =>
+                void onUpdateHostSettings({ isHost: !settings.isHost }).catch((err) =>
+                  notify(err instanceof Error ? err.message : String(err)),
+                )
+              }
               className={`rounded-xl px-5 py-2.5 text-sm font-bold transition-colors ${
                 settings.isHost
                   ? "bg-red-500/20 text-red-200 border border-red-500/40 hover:bg-red-500/30"
@@ -618,7 +634,9 @@ export function HostModeView({
                   <button
                     type="button"
                     onClick={() =>
-                      void onUpdateHostSettings({ apolloUser, apolloPass }).then(() => notify("已保存并重新校验 Apollo 凭据"))
+                      void onUpdateHostSettings({ apolloUser, apolloPass })
+                        .then(() => notify("已保存并重新校验 Apollo 凭据"))
+                        .catch((err) => notify(err instanceof Error ? err.message : String(err)))
                     }
                     className="rounded-lg border border-edge bg-panelHover px-3 py-1.5 font-medium text-slate-200"
                   >

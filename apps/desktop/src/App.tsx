@@ -46,7 +46,7 @@ export default function App() {
   }
 
   return (
-    <div className="h-screen overflow-hidden flex bg-obsidian text-slate-100">
+    <div className="h-screen w-full overflow-hidden flex bg-obsidian text-slate-100">
       {/* Sidebar */}
       <aside className="w-60 shrink-0 border-r border-edge bg-panel/80 flex flex-col justify-between p-4 overflow-y-auto">
         <div className="space-y-6">
@@ -130,7 +130,7 @@ export default function App() {
       </aside>
 
       {/* Main Content */}
-      <main className="flex-1 p-6 overflow-y-auto space-y-5">
+      <main className="flex-1 min-w-0 p-6 overflow-y-auto space-y-5">
         {(state.easytier.needsElevation || (state.settings.isHost && state.host.provisionStage === "needs_admin")) && (
           <div className="rounded-2xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2 text-xs text-amber-100">
@@ -195,6 +195,7 @@ export default function App() {
             bootstrap={state.bootstrap}
             easytier={state.easytier}
             onStartEasyTier={async () => setState(await bridge.startEasyTier())}
+            onReconnectUdp={async () => setState(await bridge.reconnectEasyTierUdp())}
             onRelaunchAdmin={() => bridge.relaunchAsAdmin()}
             onRefresh={async () => setState(await bridge.refresh())}
             onListUsers={() => bridge.adminListUsers()}

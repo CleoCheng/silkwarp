@@ -11,6 +11,8 @@ export interface PairRequestItem {
   message?: string;
 }
 
+const DEFAULT_CONTROL_TIMEOUT_MS = 12_000;
+
 export class ControlClient {
   constructor(
     private getBaseUrl: () => string,
@@ -29,7 +31,20 @@ export class ControlClient {
       headers.Authorization = `Bearer ${tok}`;
     }
 
-    const resp = await net.fetch(url, { ...(init as RequestInit), headers });
+    let resp: Response;
+    try {
+      resp = await net.fetch(url, {
+        ...(init as RequestInit),
+        headers,
+        signal: init.signal ?? AbortSignal.timeout(DEFAULT_CONTROL_TIMEOUT_MS),
+      });
+    } catch (err) {
+      const name = err instanceof Error ? err.name : "";
+      if (name === "TimeoutError" || name === "AbortError") {
+        throw new Error("连接控制中心超时，请检查网络连接");
+      }
+      throw err;
+    }
     const text = await resp.text();
     let json: Record<string, unknown> = {};
     try {

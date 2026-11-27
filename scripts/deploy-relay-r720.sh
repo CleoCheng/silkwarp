@@ -161,7 +161,9 @@ multi_thread_count = 4
 latency_first = false
 enable_ipv6 = true
 enable_encryption = true
+compression = "none"
 disable_tcp_hole_punching = true
+disable_sym_hole_punching = false
 EOF
 chmod 600 "${ET_DIR}/config.toml"
 

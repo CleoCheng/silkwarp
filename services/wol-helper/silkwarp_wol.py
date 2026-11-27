@@ -20,7 +20,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -308,7 +308,7 @@ class WolHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
 
-        target_name = path.removeprefix("/api/wake/").strip("/")
+        target_name = unquote(path.removeprefix("/api/wake/").strip("/"))
         if not target_name:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing_device_name"})
             return

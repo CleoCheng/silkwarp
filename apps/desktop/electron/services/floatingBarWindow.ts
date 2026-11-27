@@ -85,13 +85,13 @@ export class FloatingBarWindow {
     const { width: curWidth, height: curHeight } = this.currentSize();
 
     let workArea: Electron.Rectangle;
-    let targetX: number;
+    let baseX: number;
     let targetY: number;
 
     if (winRect === null) {
       const primary = screen.getPrimaryDisplay();
       workArea = primary.workArea;
-      targetX = Math.round(workArea.x + (workArea.width - curWidth) / 2 + this.offsetX);
+      baseX = Math.round(workArea.x + (workArea.width - curWidth) / 2);
       targetY = workArea.y + 8;
     } else {
       const dipRect = screen.screenToDipRect(null, {
@@ -101,17 +101,18 @@ export class FloatingBarWindow {
         height: Math.max(1, winRect.height),
       });
       workArea = screen.getDisplayMatching(dipRect).workArea;
-      targetX = Math.round(dipRect.x + (dipRect.width - curWidth) / 2 + this.offsetX);
+      baseX = Math.round(dipRect.x + (dipRect.width - curWidth) / 2);
       targetY = Math.round(dipRect.y + TOP_OFFSET);
     }
 
     const minX = workArea.x + EDGE_MARGIN;
-    const maxX = workArea.x + workArea.width - curWidth - EDGE_MARGIN;
+    const maxX = Math.max(minX, workArea.x + workArea.width - curWidth - EDGE_MARGIN);
     const minY = workArea.y + EDGE_MARGIN;
-    const maxY = workArea.y + workArea.height - curHeight - EDGE_MARGIN;
+    const maxY = Math.max(minY, workArea.y + workArea.height - curHeight - EDGE_MARGIN);
 
-    const x = Math.max(minX, Math.min(maxX, targetX));
+    const x = Math.max(minX, Math.min(maxX, baseX + this.offsetX));
     const y = Math.max(minY, Math.min(maxY, targetY));
+    this.offsetX = x - baseX;
 
     win.setBounds({ x, y, width: curWidth, height: curHeight }, false);
   }

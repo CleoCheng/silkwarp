@@ -1337,3 +1337,59 @@ test("createElectronClipboardAdapter: oversized image payloads are rejected", as
   assert.equal(result.ok, false);
   assert.match(result.message, /10 MiB/);
 });
+
+test("createElectronClipboardAdapter: caches CF_HDROP probe when native clipboard buffers are unchanged", async () => {
+  const { createElectronClipboardAdapter } = require("../dist-electron/services/clipboardSyncManager.js");
+  const dir = makeTempDir("adapter-drop-cache");
+  const file1 = path.join(dir, "one.txt");
+  const file2 = path.join(dir, "two.txt");
+  fs.writeFileSync(file1, "1");
+  fs.writeFileSync(file2, "2");
+
+  let activeFiles = [file1];
+  let currentBuf = Buffer.from("drop-v1", "utf8");
+  let readCalls = 0;
+
+  const adapter = createElectronClipboardAdapter({
+    clipboard: {
+      readText: () => "",
+      writeText: () => {},
+      readImage: () => ({ isEmpty: () => true, toPNG: () => Buffer.alloc(0) }),
+      writeImage: () => {},
+      availableFormats: () => ["FileNameW"],
+      readBuffer: (fmt) => (fmt === "FileNameW" ? currentBuf : Buffer.alloc(0)),
+    },
+    nativeImage: { createFromBuffer: (buffer) => ({ buffer }) },
+    fileDropList: {
+      read: async () => {
+        readCalls += 1;
+        return activeFiles;
+      },
+      write: async () => true,
+    },
+  });
+
+  const first = await adapter.read();
+  assert.deepEqual(first.files, [file1]);
+  assert.equal(readCalls, 1);
+
+  // Repeated polls with identical buffer signature reuse the cache instead of respawning PowerShell.
+  const second = await adapter.read();
+  const third = await adapter.read();
+  assert.deepEqual(second.files, [file1]);
+  assert.deepEqual(third.files, [file1]);
+  assert.equal(readCalls, 1);
+
+  // Changing the native clipboard buffer invalidates the cache immediately.
+  activeFiles = [file2];
+  currentBuf = Buffer.from("drop-v2", "utf8");
+  const updated = await adapter.read();
+  assert.deepEqual(updated.files, [file2]);
+  assert.equal(readCalls, 2);
+
+  // Calling write() invalidates the cache even if mock buffer stayed identical.
+  await adapter.write({ kind: "text", text: "reset", updatedAt: Date.now() });
+  const afterWrite = await adapter.read();
+  assert.deepEqual(afterWrite.files, [file2]);
+  assert.equal(readCalls, 3);
+});

@@ -82,6 +82,7 @@ export interface StreamPreset {
   muteHostAudio: boolean;
   lowLatency: boolean;
   adaptiveRelayCap: boolean;
+  yuv444?: boolean;
   absoluteMouse: boolean;
   showPerfOverlay: boolean;
   captureSystemKeys: SystemKeyCaptureMode;

@@ -119,6 +119,21 @@ export class StreamSessionManager {
     this.agentClient = agentClient;
     this.clipboardAdapterOverride = options.clipboardAdapter ?? null;
     this.refreshPeersFn = options.refreshPeers ?? null;
+
+    const savedResolutions = this.store.get().hostDisplayResolutions;
+    if (savedResolutions && typeof savedResolutions === "object") {
+      for (const [devId, res] of Object.entries(savedResolutions)) {
+        if (devId && typeof res === "string" && res) {
+          this.hostNativeResolutionCache.set(devId, res);
+        }
+      }
+    }
+  }
+
+  private rememberHostDisplayResolution(deviceId: string, resolution: string): void {
+    if (!deviceId || !resolution) return;
+    this.hostNativeResolutionCache.set(deviceId, resolution);
+    this.store.setHostDisplayResolution?.(deviceId, resolution);
   }
 
   getState(): ActiveSessionState | null {
@@ -726,7 +741,7 @@ export class StreamSessionManager {
       if (native) {
         const hostRes = normalizeWindowResolution(native.width, native.height);
         active.hostDisplayResolution = hostRes;
-        this.hostNativeResolutionCache.set(active.device.id, hostRes);
+        this.rememberHostDisplayResolution(active.device.id, hostRes);
         if (
           active.preset.resolutionMode === "follow_host" &&
           (hostRes !== active.preset.resolution || active.preset.streamApp !== "Desktop")
@@ -780,7 +795,8 @@ export class StreamSessionManager {
       patch.bitrateMbps !== undefined ||
       patch.fps !== undefined ||
       patch.streamApp !== undefined ||
-      patch.codec !== undefined
+      patch.codec !== undefined ||
+      patch.yuv444 !== undefined
     ) {
       this.recoveryBitrateCapMbps = null;
     }
@@ -1268,8 +1284,31 @@ export class StreamSessionManager {
       const clientSize = this.getClientDisplaySize(active.windowRect);
       const clientRes = normalizeWindowResolution(clientSize.width, clientSize.height);
       active.clientDisplayResolution = clientRes;
+      const cachedHostRes = this.hostNativeResolutionCache.get(active.device.id) || "";
+      const hostDisplays: DisplayMonitorInfo[] =
+        active.displays.length > 0
+          ? active.displays
+          : cachedHostRes
+            ? [
+                {
+                  index: 0,
+                  id: "cached-host",
+                  deviceName: "cached-host",
+                  friendlyName: "Host Primary",
+                  width: Number(cachedHostRes.split("x")[0]) || 1920,
+                  height: Number(cachedHostRes.split("x")[1]) || 1080,
+                  x: 0,
+                  y: 0,
+                  isPrimary: true,
+                  isVirtual: false,
+                  active: true,
+                },
+              ]
+            : [];
       const target = resolveTargetResolution("follow_client", current.resolution, {
         clientSize,
+        hostDisplays,
+        selectedDisplayId: active.selectedDisplayId,
         availableApps: active.availableApps,
         currentStreamApp: active.preset.streamApp,
       });
@@ -1288,7 +1327,7 @@ export class StreamSessionManager {
       if (native) {
         const hostRes = normalizeWindowResolution(native.width, native.height);
         active.hostDisplayResolution = hostRes;
-        this.hostNativeResolutionCache.set(active.device.id, hostRes);
+        this.rememberHostDisplayResolution(active.device.id, hostRes);
       }
       const target = resolveTargetResolution("follow_host", active.hostDisplayResolution || current.resolution, {
         hostDisplays: active.displays,

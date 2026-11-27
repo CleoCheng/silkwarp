@@ -33,10 +33,14 @@ test("buildOptimalApolloConfigPatch: strips readonly metadata (including vdispla
   assert.equal(JSON.stringify(raw), snapshot, "input config must not be mutated");
   assert.equal(patch.changed, true);
   assert.deepEqual(patch.changedKeys.sort(), [
+    "amd_rc",
+    "amd_usage",
     "fec_percentage",
     "hevc_mode",
     "lan_encryption_mode",
     "minimum_fps_target",
+    "nvenc_intra_refresh",
+    "nvenc_latency_over_power",
     "ping_timeout",
     "qsv_preset",
   ]);
@@ -54,6 +58,10 @@ test("buildOptimalApolloConfigPatch: strips readonly metadata (including vdispla
   assert.equal(patch.nextConfig.minimum_fps_target, 0);
   assert.equal(patch.nextConfig.hevc_mode, 0);
   assert.equal(patch.nextConfig.ping_timeout, "20000");
+  assert.equal(patch.nextConfig.nvenc_intra_refresh, "enabled");
+  assert.equal(patch.nextConfig.nvenc_latency_over_power, "enabled");
+  assert.equal(patch.nextConfig.amd_usage, "ultralowlatency");
+  assert.equal(patch.nextConfig.amd_rc, "vbr_latency");
 });
 
 test("buildOptimalApolloConfigPatch: is idempotent even when Apollo returns stringified integers", () => {
@@ -64,6 +72,10 @@ test("buildOptimalApolloConfigPatch: is idempotent even when Apollo returns stri
     minimum_fps_target: "0",
     hevc_mode: "0",
     ping_timeout: "20000",
+    nvenc_intra_refresh: "enabled",
+    nvenc_latency_over_power: "enabled",
+    amd_usage: "ultralowlatency",
+    amd_rc: "vbr_latency",
     output_name: "",
   };
 

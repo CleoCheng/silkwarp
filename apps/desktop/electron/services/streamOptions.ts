@@ -28,6 +28,7 @@ export const DEFAULT_STREAM_PRESET: StreamPreset = {
   muteHostAudio: true,
   lowLatency: true,
   adaptiveRelayCap: true,
+  yuv444: false,
   absoluteMouse: true,
   showPerfOverlay: false,
   captureSystemKeys: "fullscreen",
@@ -157,6 +158,7 @@ export function normalizeStreamPreset(raw?: Partial<StreamPreset> | null): Strea
     muteHostAudio: boolOr(src.muteHostAudio, d.muteHostAudio),
     lowLatency: boolOr(src.lowLatency, d.lowLatency),
     adaptiveRelayCap: boolOr(src.adaptiveRelayCap, d.adaptiveRelayCap),
+    yuv444: boolOr(src.yuv444, Boolean(d.yuv444)),
     absoluteMouse: boolOr(src.absoluteMouse, d.absoluteMouse),
     showPerfOverlay: boolOr(src.showPerfOverlay, d.showPerfOverlay),
     captureSystemKeys,
@@ -311,7 +313,9 @@ export function computeEffectivePreset(
   link?: StreamLinkQuality | null,
 ): StreamPreset {
   let bitrateMbps = preset.bitrateMbps;
-  if (typeof link?.recoveryBitrateCapMbps === "number" && Number.isFinite(link.recoveryBitrateCapMbps)) {
+  const hasRecoveryCap =
+    typeof link?.recoveryBitrateCapMbps === "number" && Number.isFinite(link.recoveryBitrateCapMbps);
+  if (hasRecoveryCap) {
     const recoveryCap = clampBitrate(link.recoveryBitrateCapMbps);
     bitrateMbps = Math.min(bitrateMbps, recoveryCap);
   }
@@ -320,6 +324,7 @@ export function computeEffectivePreset(
     return {
       ...preset,
       bitrateMbps,
+      yuv444: hasRecoveryCap ? false : Boolean(preset.yuv444),
     };
   }
 
@@ -345,10 +350,14 @@ export function computeEffectivePreset(
     bitrateMbps = Math.min(bitrateMbps, ceiling);
   }
 
+  const yuv444 =
+    Boolean(preset.yuv444) && !isRelay && !tcpOnly && loss < 2 && !hasRecoveryCap;
+
   return {
     ...preset,
     fps,
     bitrateMbps,
+    yuv444,
   };
 }
 
@@ -401,6 +410,7 @@ export function buildMoonlightStreamArgs(
     "--audio-config",
     "stereo",
     "--no-hdr",
+    effective.yuv444 ? "--yuv444" : "--no-yuv444",
     "--keep-awake",
     "--capture-system-keys",
     effective.captureSystemKeys,

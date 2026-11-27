@@ -30,6 +30,7 @@ test("normalizeStreamPreset: undefined returns the full default preset", () => {
   assert.equal(DEFAULT_STREAM_PRESET.muteHostAudio, true);
   assert.equal(DEFAULT_STREAM_PRESET.lowLatency, true);
   assert.equal(DEFAULT_STREAM_PRESET.streamApp, "Virtual Display");
+  assert.equal(DEFAULT_STREAM_PRESET.yuv444, false);
   assert.equal(DEFAULT_STREAM_PRESET.packetSize, "auto");
 });
 
@@ -399,4 +400,40 @@ test("computeEffectivePreset preserves full resolution while shielding TCP, loss
   assert.ok(tcpArgs.includes("--no-hdr"));
   assert.ok(tcpArgs.includes("--keep-awake"));
   assert.equal(flagValue("--audio-config"), "stereo");
+});
+
+test("yuv444 mode: emits --yuv444 on healthy P2P and auto-disables on relay/TCP/loss/recovery without lowering resolution", () => {
+  const preset = normalizeStreamPreset({ resolution: "2560x1440", yuv444: true, adaptiveRelayCap: true });
+  assert.equal(preset.yuv444, true);
+  assert.equal(normalizeStreamPreset({ yuv444: "yes" }).yuv444, false);
+
+  const p2pArgs = buildMoonlightStreamArgs("10.144.0.11", preset, "p2p", "Desktop", {
+    tunnel: "udp",
+    latencyMs: 12,
+    lossPercent: 0,
+  });
+  assert.ok(p2pArgs.includes("--yuv444"));
+  assert.ok(!p2pArgs.includes("--no-yuv444"));
+
+  const defaultArgs = buildMoonlightStreamArgs("10.144.0.11", normalizeStreamPreset(), "p2p", "Desktop");
+  assert.ok(defaultArgs.includes("--no-yuv444"));
+  assert.ok(!defaultArgs.includes("--yuv444"));
+
+  const relayEff = computeEffectivePreset(preset, "relay(2)");
+  assert.equal(relayEff.resolution, "2560x1440");
+  assert.equal(relayEff.yuv444, false);
+
+  const tcpEff = computeEffectivePreset(preset, "p2p", { tunnel: "tcp", latencyMs: 10, lossPercent: 0 });
+  assert.equal(tcpEff.yuv444, false);
+
+  const lossEff = computeEffectivePreset(preset, "p2p", { tunnel: "udp", latencyMs: 15, lossPercent: 2.5 });
+  assert.equal(lossEff.yuv444, false);
+
+  const recoveryEvenManual = computeEffectivePreset(
+    { ...preset, adaptiveRelayCap: false },
+    "p2p",
+    { tunnel: "udp", latencyMs: 15, lossPercent: 0, recoveryBitrateCapMbps: 8 },
+  );
+  assert.equal(recoveryEvenManual.resolution, "2560x1440");
+  assert.equal(recoveryEvenManual.yuv444, false);
 });
