@@ -6,10 +6,18 @@ import path from "node:path";
 import { promisify } from "node:util";
 import type { BootstrapConfig, EasyTierStatus, PeerStatus } from "../types";
 import {
+  type EasyTierTransportMode,
+  hasConnectedRemotePeer,
+  renderEasyTierConfig,
+  selectEasyTierPeers,
+} from "./easytierConfig";
+import {
   BOOT_TUNNEL_BIN_DIR,
   BOOT_TUNNEL_CONFIG_PATH,
   BOOT_TUNNEL_PROGRAM_DATA_DIR,
 } from "./hostMaintenance";
+
+export { type EasyTierTransportMode, hasConnectedRemotePeer, renderEasyTierConfig, selectEasyTierPeers };
 
 const execFileAsync = promisify(execFile);
 
@@ -28,42 +36,6 @@ export function resolveEasyTierDir(): string {
     }
   }
   return candidates[0];
-}
-
-export function renderEasyTierConfig(cfg: BootstrapConfig, hostname = os.hostname()): string {
-  const meshCidrPrefix = cfg.mesh_cidr.split("/")[1] || "24";
-  const lines = [
-    `hostname = "${hostname.replace(/"/g, "")}"`,
-    `ipv4 = "${cfg.mesh_ip}/${meshCidrPrefix}"`,
-    `dhcp = false`,
-    ``,
-    `listeners = [`,
-    `    "udp://0.0.0.0:0",`,
-    `    "udp://[::]:0",`,
-    `    "tcp://0.0.0.0:0",`,
-    `    "tcp://[::]:0",`,
-    `]`,
-    ``,
-    `rpc_portal = "127.0.0.1:15888"`,
-    ``,
-    ...cfg.easytier.peers.flatMap((uri) => [`[[peer]]`, `uri = "${uri}"`, ``]),
-    `[network_identity]`,
-    `network_name = "${cfg.easytier.network_name}"`,
-    `network_secret = "${cfg.easytier.network_secret}"`,
-    ``,
-    `[flags]`,
-    `dev_name = "SilkWarp"`,
-    `default_protocol = "udp"`,
-    `enable_exit_node = false`,
-    `accept_dns = false`,
-    `latency_first = false`,
-    `multi_thread = true`,
-    `multi_thread_count = 4`,
-    `enable_ipv6 = true`,
-    `enable_encryption = true`,
-    ``,
-  ];
-  return lines.join("\n");
 }
 
 export function ensureProgramDataEasyTierBinaries(sourceDir = resolveEasyTierDir()): string {
@@ -96,6 +68,8 @@ export class EasyTierManager {
   private lastMachineConfigContent = "";
   private machineConfigChanged = false;
   private userConfigChanged = false;
+  private transportMode: EasyTierTransportMode = "udp_only";
+  private tcpFallbackAttempted = false;
   private lastBootstrapCfg: BootstrapConfig | null = null;
   private lastElevated = false;
   private intentionallyStopped = false;
@@ -128,7 +102,7 @@ export class EasyTierManager {
     const p = this.getConfigPath();
     const etDir = path.dirname(p);
     fs.mkdirSync(etDir, { recursive: true });
-    const content = renderEasyTierConfig(cfg);
+    const content = renderEasyTierConfig(cfg, os.hostname(), this.transportMode);
     if (!this.lastConfigContent && fs.existsSync(p)) {
       this.lastConfigContent = fs.readFileSync(p, "utf-8");
     }
@@ -146,7 +120,7 @@ export class EasyTierManager {
     }
     try {
       fs.mkdirSync(BOOT_TUNNEL_PROGRAM_DATA_DIR, { recursive: true });
-      const content = renderEasyTierConfig(cfg);
+      const content = renderEasyTierConfig(cfg, os.hostname(), this.transportMode);
       if (!this.lastMachineConfigContent && fs.existsSync(BOOT_TUNNEL_CONFIG_PATH)) {
         this.lastMachineConfigContent = fs.readFileSync(BOOT_TUNNEL_CONFIG_PATH, "utf-8");
       }
@@ -206,58 +180,7 @@ export class EasyTierManager {
     }
   }
 
-  async ensureStarted(cfg: BootstrapConfig, isElevated: boolean): Promise<EasyTierStatus> {
-    this.lastBootstrapCfg = cfg;
-    this.lastElevated = isElevated;
-    this.intentionallyStopped = false;
-    if (this.crashRestartTimer) {
-      clearTimeout(this.crashRestartTimer);
-      this.crashRestartTimer = null;
-    }
-
-    this.status.meshIp = cfg.mesh_ip;
-    const cfgPath = this.writeConfig(cfg);
-    const shouldRestartManagedChild = Boolean(this.proc && this.userConfigChanged);
-    this.userConfigChanged = false;
-
-    if (isElevated && (fs.existsSync(BOOT_TUNNEL_PROGRAM_DATA_DIR) || fs.existsSync(BOOT_TUNNEL_CONFIG_PATH))) {
-      this.syncMachineConfig(cfg);
-    }
-
-    if (shouldRestartManagedChild) {
-      this.killChildOnly();
-      await new Promise((r) => setTimeout(r, 300));
-    } else {
-      const livePeers = await this.probePeersRpc();
-      if (livePeers !== null) {
-        this.crashRestartAttempts = 0;
-        this.status.running = true;
-        this.status.externalService = !this.proc;
-        this.status.needsElevation = false;
-        this.status.error = "";
-        return this.status;
-      }
-    }
-
-    if (!isElevated) {
-      this.status.running = false;
-      this.status.needsElevation = true;
-      this.status.error = "创建虚拟网卡需要管理员权限（或安装系统开机自启服务）。";
-      return this.status;
-    }
-
-    const dir = resolveEasyTierDir();
-    const core = path.join(dir, "easytier-core.exe");
-    if (!fs.existsSync(core)) {
-      this.status.running = false;
-      this.status.error = `未找到内核文件: ${core}`;
-      return this.status;
-    }
-
-    this.killChildOnly();
-    this.status.needsElevation = false;
-    this.status.error = "";
-
+  private spawnManagedCore(core: string, dir: string, cfgPath: string): ChildProcess {
     const child = spawn(
       core,
       ["-c", cfgPath, "--rpc-portal", "127.0.0.1:15888", "--rpc-portal-whitelist", "127.0.0.1,127.0.0.0/8,::1/128"],
@@ -295,9 +218,107 @@ export class EasyTierManager {
         this.crashRestartTimer.unref?.();
       }
     });
+    return child;
+  }
 
-    await new Promise((r) => setTimeout(r, 1400));
-    const startedPeers = await this.probePeersRpc();
+  async ensureStarted(cfg: BootstrapConfig, isElevated: boolean): Promise<EasyTierStatus> {
+    this.lastBootstrapCfg = cfg;
+    this.lastElevated = isElevated;
+    this.intentionallyStopped = false;
+    if (this.crashRestartTimer) {
+      clearTimeout(this.crashRestartTimer);
+      this.crashRestartTimer = null;
+    }
+
+    this.status.meshIp = cfg.mesh_ip;
+    let cfgPath = this.writeConfig(cfg);
+    const configChanged = this.userConfigChanged;
+    this.userConfigChanged = false;
+
+    if (isElevated && (fs.existsSync(BOOT_TUNNEL_PROGRAM_DATA_DIR) || fs.existsSync(BOOT_TUNNEL_CONFIG_PATH))) {
+      this.syncMachineConfig(cfg);
+    }
+
+    if (this.proc && configChanged) {
+      this.killChildOnly();
+      await new Promise((r) => setTimeout(r, 300));
+    } else {
+      const livePeers = await this.probePeersRpc();
+      if (livePeers !== null) {
+        if (
+          !this.proc &&
+          configChanged &&
+          isElevated &&
+          process.platform === "win32" &&
+          !fs.existsSync(BOOT_TUNNEL_CONFIG_PATH)
+        ) {
+          // Kill orphaned external process running stale TCP/latency_first config so upgraded pure-UDP takes effect immediately
+          await execFileAsync("taskkill", ["/F", "/IM", "easytier-core.exe"], {
+            timeout: 4000,
+            windowsHide: true,
+          }).catch(() => {});
+          await new Promise((r) => setTimeout(r, 300));
+        } else {
+          this.crashRestartAttempts = 0;
+          this.status.running = true;
+          this.status.externalService = !this.proc;
+          this.status.needsElevation = false;
+          this.status.error = "";
+          return this.status;
+        }
+      }
+    }
+
+    if (!isElevated) {
+      this.status.running = false;
+      this.status.needsElevation = true;
+      this.status.error = "创建虚拟网卡需要管理员权限（或安装系统开机自启服务）。";
+      return this.status;
+    }
+
+    const dir = resolveEasyTierDir();
+    const core = path.join(dir, "easytier-core.exe");
+    if (!fs.existsSync(core)) {
+      this.status.running = false;
+      this.status.error = `未找到内核文件: ${core}`;
+      return this.status;
+    }
+
+    this.killChildOnly();
+    this.status.needsElevation = false;
+    this.status.error = "";
+
+    this.spawnManagedCore(core, dir, cfgPath);
+
+    await new Promise((r) => setTimeout(r, 1500));
+    let startedPeers = await this.probePeersRpc();
+
+    const hasTcpFallback = cfg.easytier.peers.some((u) => u.trim().toLowerCase().startsWith("tcp://"));
+    if (
+      this.proc &&
+      this.transportMode === "udp_only" &&
+      !this.tcpFallbackAttempted &&
+      hasTcpFallback &&
+      !hasConnectedRemotePeer(startedPeers ?? [])
+    ) {
+      await new Promise((r) => setTimeout(r, 2000));
+      startedPeers = await this.probePeersRpc();
+      if (this.proc && !hasConnectedRemotePeer(startedPeers ?? [])) {
+        this.transportMode = "udp_and_tcp";
+        this.tcpFallbackAttempted = true;
+        cfgPath = this.writeConfig(cfg);
+        this.userConfigChanged = false;
+        if (fs.existsSync(BOOT_TUNNEL_PROGRAM_DATA_DIR) || fs.existsSync(BOOT_TUNNEL_CONFIG_PATH)) {
+          this.syncMachineConfig(cfg);
+        }
+        this.killChildOnly();
+        await new Promise((r) => setTimeout(r, 300));
+        this.spawnManagedCore(core, dir, cfgPath);
+        await new Promise((r) => setTimeout(r, 1400));
+        startedPeers = await this.probePeersRpc();
+      }
+    }
+
     if (startedPeers !== null) {
       this.crashRestartAttempts = 0;
     }
@@ -312,6 +333,8 @@ export class EasyTierManager {
   stop(): void {
     this.intentionallyStopped = true;
     this.crashRestartAttempts = 0;
+    this.transportMode = "udp_only";
+    this.tcpFallbackAttempted = false;
     if (this.crashRestartTimer) {
       clearTimeout(this.crashRestartTimer);
       this.crashRestartTimer = null;

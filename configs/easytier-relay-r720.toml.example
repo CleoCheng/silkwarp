@@ -6,10 +6,10 @@ ipv4 = "10.144.0.1/24"
 dhcp = false
 
 listeners = [
-    "tcp://0.0.0.0:11011",
     "udp://0.0.0.0:11011",
-    "tcp://[::]:11011",
     "udp://[::]:11011",
+    "tcp://0.0.0.0:11011",
+    "tcp://[::]:11011",
 ]
 
 # Enforce localhost-only RPC via CLI: --rpc-portal 127.0.0.1:15888 --rpc-portal-whitelist 127.0.0.1,127.0.0.0/8,::1/128
@@ -27,9 +27,12 @@ network_name = "silkwarp-team"
 network_secret = "<REPLACE_WITH_SILKWARP_NETWORK_SECRET>"
 
 [flags]
+default_protocol = "udp"
 relay_network_whitelist = "silkwarp-team"
 relay_all_peer_rpc = false
 multi_thread = true
-latency_first = true
+multi_thread_count = 4
+latency_first = false
 enable_ipv6 = true
 enable_encryption = true
+disable_tcp_hole_punching = true

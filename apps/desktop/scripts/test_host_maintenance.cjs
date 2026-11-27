@@ -200,11 +200,24 @@ test("buildEasyTierBootTaskXml & xmlEscape: renders LocalSystem BootTrigger XML 
   assert.match(xml, /-c &quot;C:\\ProgramData\\SilkWarp\\easytier\.toml&quot;/);
 });
 
-test("easytier-node.toml.example: enforces UDP-first listeners, default_protocol=udp, and latency_first=false", () => {
+test("easytier-node.toml.example & easytier-relay-r720.toml.example: enforce pure/UDP-first, disable_tcp_hole_punching, and latency_first=false", () => {
   const examplePath = path.resolve(__dirname, "../../../configs/easytier-node.toml.example");
   const text = fs.readFileSync(examplePath, "utf8");
   assert.match(text, /default_protocol\s*=\s*"udp"/);
   assert.match(text, /latency_first\s*=\s*false/);
   assert.match(text, /multi_thread_count\s*=\s*4/);
-  assert.ok(text.indexOf('"udp://0.0.0.0:0"') < text.indexOf('"tcp://0.0.0.0:0"'));
+  assert.match(text, /disable_tcp_hole_punching\s*=\s*true/);
+  assert.match(text, /relay_network_whitelist\s*=\s*""/);
+  assert.match(text, /mtu\s*=\s*1360/);
+  assert.match(text, /"udp:\/\/0\.0\.0\.0:0"/);
+  assert.doesNotMatch(text, /"tcp:\/\/0\.0\.0\.0:0"/);
+  assert.doesNotMatch(text, /uri\s*=\s*"tcp:\/\//);
+
+  const relayPath = path.resolve(__dirname, "../../../configs/easytier-relay-r720.toml.example");
+  const relayText = fs.readFileSync(relayPath, "utf8");
+  assert.match(relayText, /default_protocol\s*=\s*"udp"/);
+  assert.match(relayText, /latency_first\s*=\s*false/);
+  assert.match(relayText, /multi_thread_count\s*=\s*4/);
+  assert.match(relayText, /disable_tcp_hole_punching\s*=\s*true/);
+  assert.ok(relayText.indexOf('"udp://0.0.0.0:11011"') < relayText.indexOf('"tcp://0.0.0.0:11011"'));
 });

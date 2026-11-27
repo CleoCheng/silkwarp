@@ -19,7 +19,6 @@ import {
   Wifi,
   WifiOff,
   X,
-  Zap,
 } from "lucide-react";
 import { getBridge } from "../bridge";
 import type {
@@ -697,14 +696,6 @@ export function DevicesView({
                       {statusLabel}
                     </span>
                   </div>
-
-                  {d.route_type?.startsWith("relay") &&
-                    preset.adaptiveRelayCap &&
-                    (preset.fps > 60 || preset.bitrateMbps > 8) && (
-                      <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/35 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold text-amber-200">
-                        <Zap className="w-3 h-3" /> 中继智能稳帧 · 8M
-                      </span>
-                    )}
 
                   <div className="rounded-xl bg-obsidian/70 border border-edge/70 p-3 space-y-1.5 text-xs">
                     <div className="flex items-center justify-between gap-2 text-slate-300">

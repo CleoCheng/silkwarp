@@ -94,7 +94,6 @@ export class StreamSessionManager {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private reloadChain: Promise<void> = Promise.resolve();
   private autoReconnectCount = 0;
-  private degradedTicks = 0;
   private stderrTail: string[] = [];
 
   private clipboardSync: ClipboardSyncManager | null = null;
@@ -407,7 +406,6 @@ export class StreamSessionManager {
       this.reconnectTimer = null;
     }
     this.autoReconnectCount = 0;
-    this.degradedTicks = 0;
 
     // A new session replaces the previous one without going through
     // disconnect(); tell the old host to restore mute/privacy and honour its
@@ -641,17 +639,11 @@ export class StreamSessionManager {
     const current = this.store.get().preset;
     const merged: Partial<StreamPreset> = { ...current, ...patch };
 
-    // An explicit user override of the relay guardrail (raising fps/bitrate
-    // above the cap) disables it unless the caller re-enables it in the same
-    // patch. Re-sending an already-high value is not a raise.
-    const activeCapBitrate = this.active?.effectivePreset.bitrateMbps ?? 8;
+    // An explicit user override raising fps above 60 disables the automatic
+    // 60fps cap unless the caller re-enables it in the same patch.
     const raisesFps =
       typeof patch.fps === "number" && patch.fps > 60 && patch.fps > current.fps;
-    const raisesBitrate =
-      typeof patch.bitrateMbps === "number" &&
-      patch.bitrateMbps > activeCapBitrate &&
-      patch.bitrateMbps > current.bitrateMbps;
-    if ((raisesFps || raisesBitrate) && patch.adaptiveRelayCap === undefined) {
+    if (raisesFps && patch.adaptiveRelayCap === undefined) {
       merged.adaptiveRelayCap = false;
     }
 
@@ -1256,29 +1248,7 @@ export class StreamSessionManager {
     active.latencyMs = nextLatency;
     active.tunnelProto = nextTunnel;
     active.lossPercent = nextLoss;
-
-    const nextEffective = computeEffectivePreset(active.preset, nextRoute, this.buildLinkQuality(active));
-    const degraded =
-      nextEffective.bitrateMbps < active.effectivePreset.bitrateMbps ||
-      nextEffective.fps < active.effectivePreset.fps ||
-      (nextEffective.resolution !== active.effectivePreset.resolution &&
-        (nextRoute.trim().toLowerCase().startsWith("relay") ||
-          (nextLoss ?? 0) >= 1 ||
-          (nextLatency ?? 0) >= 60));
-
-    if (degraded) {
-      this.degradedTicks += 1;
-      if (this.degradedTicks >= 2 && !active.reconnecting) {
-        this.degradedTicks = 0;
-        active.effectivePreset = nextEffective;
-        active.reconnectStatus = "链路波动，正在自动降码率保流畅…";
-        this.broadcast();
-        this.scheduleReload();
-        return;
-      }
-    } else {
-      this.degradedTicks = 0;
-    }
+    active.effectivePreset = computeEffectivePreset(active.preset, nextRoute, this.buildLinkQuality(active));
 
     if (telemetryChanged) {
       this.broadcast();
@@ -1327,7 +1297,6 @@ export class StreamSessionManager {
         this.reconnectTimer = null;
       }
       this.autoReconnectCount = 0;
-      this.degradedTicks = 0;
       this.stderrTail = [];
 
       const closingSession = this.active;

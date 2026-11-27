@@ -7,9 +7,9 @@ const {
   DEFAULT_STREAM_PRESET,
   buildMoonlightSpawnEnv,
   buildMoonlightStreamArgs,
-  capResolutionForBandwidth,
   computeEffectivePreset,
   isDegradedLink,
+  isLocalLanLink,
   isTcpOnlyTunnel,
   normalizeStreamPreset,
   normalizeWindowResolution,
@@ -88,12 +88,12 @@ test("resolvePacketSize: p2p / relay defaults and explicit overrides", () => {
   assert.equal(resolvePacketSize({ ...preset, packetSize: 9999 }, "p2p"), 1320);
 });
 
-test("computeEffectivePreset: relay guardrail caps 120fps/35Mbps to 1080p/60fps/8Mbps", () => {
+test("computeEffectivePreset: never downgrades resolution or bitrate; trims >60fps only on relay, TCP, or <=65Hz display", () => {
   const preset = normalizeStreamPreset({ resolution: "2560x1440", fps: 120, bitrateMbps: 35, adaptiveRelayCap: true });
   const relayed = computeEffectivePreset(preset, "relay(2)");
-  assert.equal(relayed.resolution, "1920x1080");
+  assert.equal(relayed.resolution, "2560x1440");
   assert.equal(relayed.fps, 60);
-  assert.equal(relayed.bitrateMbps, 8);
+  assert.equal(relayed.bitrateMbps, 35);
   // The persisted preset must not be mutated.
   assert.equal(preset.resolution, "2560x1440");
   assert.equal(preset.fps, 120);
@@ -126,19 +126,24 @@ test("resolveStreamAppTarget: prefers Virtual Display, falls back to Desktop", (
   assert.equal(resolveStreamAppTarget("Desktop", ["Virtual Display"]), "Desktop");
 });
 
-test("buildMoonlightStreamArgs: default low-latency windowed P2P session", () => {
+test("buildMoonlightStreamArgs: low-latency P2P LAN skips frame-pacing while WAN P2P keeps frame-pacing and auto decoder", () => {
   const preset = normalizeStreamPreset();
-  const args = buildMoonlightStreamArgs("10.144.0.11", preset, "p2p", "Virtual Display");
+  const lanArgs = buildMoonlightStreamArgs("10.144.0.11", preset, "p2p", "Virtual Display", {
+    tunnel: "udp",
+    latencyMs: 3,
+    lossPercent: 0,
+  });
 
-  const flagValue = (flag) => args[args.indexOf(flag) + 1];
-  assert.equal(flagValue("--display-mode"), "windowed");
-  assert.equal(flagValue("--packet-size"), "1200");
-  assert.equal(flagValue("--resolution"), "2560x1440");
-  assert.equal(flagValue("--fps"), "60");
-  assert.equal(flagValue("--bitrate"), "20000");
-  assert.equal(flagValue("--video-codec"), "HEVC");
-  assert.equal(flagValue("--audio-config"), "stereo");
-  assert.equal(flagValue("--capture-system-keys"), "fullscreen");
+  const lanVal = (flag) => lanArgs[lanArgs.indexOf(flag) + 1];
+  assert.equal(lanVal("--display-mode"), "windowed");
+  assert.equal(lanVal("--packet-size"), "1200");
+  assert.equal(lanVal("--resolution"), "2560x1440");
+  assert.equal(lanVal("--fps"), "60");
+  assert.equal(lanVal("--bitrate"), "20000");
+  assert.equal(lanVal("--video-codec"), "HEVC");
+  assert.equal(lanVal("--audio-config"), "stereo");
+  assert.equal(lanVal("--capture-system-keys"), "fullscreen");
+  assert.equal(lanVal("--video-decoder"), "auto");
 
   for (const flag of [
     "--no-hdr",
@@ -150,27 +155,37 @@ test("buildMoonlightStreamArgs: default low-latency windowed P2P session", () =>
     "--absolute-mouse",
     "--no-performance-overlay",
   ]) {
-    assert.ok(args.includes(flag), `expected ${flag} in ${args.join(" ")}`);
+    assert.ok(lanArgs.includes(flag), `expected ${flag} in ${lanArgs.join(" ")}`);
   }
-  assert.equal(flagValue("--video-decoder"), "hardware");
-  assert.ok(!args.includes("--vsync"));
-  assert.ok(!args.includes("--frame-pacing"));
-  assert.ok(!args.includes("--audio-on-host"));
-  assert.ok(!args.includes("--performance-overlay"));
+  assert.ok(!lanArgs.includes("--vsync"));
+  assert.ok(!lanArgs.includes("--frame-pacing"));
+  assert.ok(!lanArgs.includes("--audio-on-host"));
+  assert.ok(!lanArgs.includes("--performance-overlay"));
 
-  assert.deepEqual(args.slice(-3), ["stream", "10.144.0.11", "Virtual Display"]);
-  // Every flag must precede the `stream` verb.
-  assert.equal(args.lastIndexOf("stream"), args.length - 3);
+  assert.deepEqual(lanArgs.slice(-3), ["stream", "10.144.0.11", "Virtual Display"]);
+  assert.equal(lanArgs.lastIndexOf("stream"), lanArgs.length - 3);
+
+  const wanArgs = buildMoonlightStreamArgs("10.144.0.11", preset, "p2p", "Virtual Display", {
+    tunnel: "udp",
+    latencyMs: 28,
+    lossPercent: 0,
+  });
+  assert.ok(wanArgs.includes("--frame-pacing"));
+  assert.ok(!wanArgs.includes("--no-frame-pacing"));
+  assert.equal(wanArgs[wanArgs.indexOf("--packet-size") + 1], "1024");
+  assert.equal(wanArgs[wanArgs.indexOf("--video-decoder") + 1], "auto");
 });
 
-test("buildMoonlightStreamArgs: relay session uses packet-size 1024 and 8Mbps capped params", () => {
+test("buildMoonlightStreamArgs: relay preserves native 2K resolution and user bitrate while using 1024-byte packets and frame-pacing", () => {
   const preset = normalizeStreamPreset();
   const args = buildMoonlightStreamArgs("10.144.0.12", preset, "relay(2)", "Desktop");
   const flagValue = (flag) => args[args.indexOf(flag) + 1];
-  assert.equal(flagValue("--resolution"), "1920x1080");
+  assert.equal(flagValue("--resolution"), "2560x1440");
   assert.equal(flagValue("--packet-size"), "1024");
   assert.equal(flagValue("--fps"), "60");
-  assert.equal(flagValue("--bitrate"), "8000");
+  assert.equal(flagValue("--bitrate"), "20000");
+  assert.ok(args.includes("--frame-pacing"));
+  assert.equal(flagValue("--video-decoder"), "auto");
   assert.deepEqual(args.slice(-3), ["stream", "10.144.0.12", "Desktop"]);
 });
 
@@ -292,7 +307,7 @@ test("buildMoonlightSpawnEnv injects SDL3/SDL2 IME UI suppression hints", () => 
   assert.equal(env.SDL_IME_IMPLEMENTED_UI, "composition,candidates");
 });
 
-test("parseLossPercent & isTcpOnlyTunnel & isDegradedLink classify link health accurately", () => {
+test("parseLossPercent & isTcpOnlyTunnel & isLocalLanLink & isDegradedLink classify link health accurately", () => {
   assert.equal(parseLossPercent("0.0%"), 0);
   assert.equal(parseLossPercent("2.5%"), 2.5);
   assert.equal(parseLossPercent("-"), null);
@@ -303,6 +318,12 @@ test("parseLossPercent & isTcpOnlyTunnel & isDegradedLink classify link health a
   assert.equal(isTcpOnlyTunnel("udp"), false);
   assert.equal(isTcpOnlyTunnel("-"), false);
 
+  assert.equal(isLocalLanLink("local"), true);
+  assert.equal(isLocalLanLink("p2p", { tunnel: "udp", latencyMs: 3, lossPercent: 0 }), true);
+  assert.equal(isLocalLanLink("p2p", { tunnel: "udp", latencyMs: 18, lossPercent: 0 }), false);
+  assert.equal(isLocalLanLink("p2p", { tunnel: "tcp", latencyMs: 2, lossPercent: 0 }), false);
+  assert.equal(isLocalLanLink("relay(2)", { tunnel: "udp", latencyMs: 5, lossPercent: 0 }), false);
+
   assert.equal(isDegradedLink("p2p", { tunnel: "udp", latencyMs: 5, lossPercent: 0 }), false);
   assert.equal(isDegradedLink("p2p", { tunnel: "tcp", latencyMs: 2, lossPercent: 0 }), true);
   assert.equal(isDegradedLink("p2p", { tunnel: "udp", latencyMs: 75, lossPercent: 0 }), true);
@@ -310,28 +331,23 @@ test("parseLossPercent & isTcpOnlyTunnel & isDegradedLink classify link health a
   assert.equal(isDegradedLink("relay(2)", { tunnel: "udp", latencyMs: 25, lossPercent: 0 }), true);
 });
 
-test("capResolutionForBandwidth & computeEffectivePreset adapt to TCP-only, relay, extreme loss, and 60Hz panels", () => {
-  assert.equal(capResolutionForBandwidth("2560x1440", 1920, 1200), "1920x1080");
-  assert.equal(capResolutionForBandwidth("3840x2160", 1920, 1200), "1920x1080");
-  assert.equal(capResolutionForBandwidth("2560x1600", 1920, 1200), "1920x1200");
-  assert.equal(capResolutionForBandwidth("1920x1080", 1920, 1200), "1920x1080");
-
+test("computeEffectivePreset preserves full resolution & bitrate across TCP, extreme WAN, and 60Hz panels", () => {
   const highPreset = normalizeStreamPreset({ resolution: "2560x1440", fps: 120, bitrateMbps: 35, adaptiveRelayCap: true });
 
   const tcpCap = computeEffectivePreset(highPreset, "p2p", { tunnel: "tcp", latencyMs: 2, lossPercent: 0 });
-  assert.equal(tcpCap.resolution, "1920x1080");
+  assert.equal(tcpCap.resolution, "2560x1440");
   assert.equal(tcpCap.fps, 60);
-  assert.equal(tcpCap.bitrateMbps, 6);
+  assert.equal(tcpCap.bitrateMbps, 35);
 
   const highLatCap = computeEffectivePreset(highPreset, "p2p", { tunnel: "udp", latencyMs: 65, lossPercent: 0 });
-  assert.equal(highLatCap.resolution, "1920x1080");
-  assert.equal(highLatCap.fps, 60);
-  assert.equal(highLatCap.bitrateMbps, 8);
+  assert.equal(highLatCap.resolution, "2560x1440");
+  assert.equal(highLatCap.fps, 120);
+  assert.equal(highLatCap.bitrateMbps, 35);
 
   const extremeCap = computeEffectivePreset(highPreset, "relay(2)", { tunnel: "udp", latencyMs: 160, lossPercent: 5 });
-  assert.equal(extremeCap.resolution, "1600x900");
-  assert.equal(extremeCap.fps, 30);
-  assert.equal(extremeCap.bitrateMbps, 6);
+  assert.equal(extremeCap.resolution, "2560x1440");
+  assert.equal(extremeCap.fps, 60);
+  assert.equal(extremeCap.bitrateMbps, 35);
 
   const hzCap = computeEffectivePreset(highPreset, "p2p", {
     tunnel: "udp",
@@ -349,10 +365,11 @@ test("capResolutionForBandwidth & computeEffectivePreset adapt to TCP-only, rela
     lossPercent: 0,
   });
   const flagValue = (flag) => tcpArgs[tcpArgs.indexOf(flag) + 1];
-  assert.equal(flagValue("--resolution"), "1920x1080");
+  assert.equal(flagValue("--resolution"), "2560x1440");
   assert.equal(flagValue("--packet-size"), "1024");
-  assert.equal(flagValue("--bitrate"), "6000");
+  assert.equal(flagValue("--bitrate"), "35000");
   assert.equal(flagValue("--fps"), "60");
+  assert.equal(flagValue("--video-decoder"), "auto");
   assert.ok(tcpArgs.includes("--frame-pacing"));
   assert.ok(!tcpArgs.includes("--no-frame-pacing"));
   assert.ok(tcpArgs.includes("--no-hdr"));

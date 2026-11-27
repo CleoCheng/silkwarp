@@ -9,6 +9,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import type { BootstrapConfig, HostHardwareInfo, ProvisionStage } from "../types";
 import { APOLLO_PERM_ALL, needsApolloPermissionUpgrade } from "./apolloPermissions";
+import { APOLLO_READONLY_CONFIG_KEYS, buildOptimalApolloConfigPatch } from "./apolloTuning";
 import { ensureProgramDataEasyTierBinaries, renderEasyTierConfig, resolveEasyTierDir } from "./easytierManager";
 import { DEFAULT_AGENT_PORT } from "./hostAgentAuth";
 import {
@@ -1111,15 +1112,6 @@ export async function grantAllApolloClientPermissions(
   return { total, updated };
 }
 
-const APOLLO_READONLY_CONFIG_KEYS = [
-  "status",
-  "status_code",
-  "version",
-  "platform",
-  "has_session",
-  "login_pin",
-];
-
 /**
  * Reads Apollo/Sunshine's configured capture output name (empty string when
  * unset or unreachable).
@@ -1185,6 +1177,44 @@ export async function setApolloOutputName(
       writeRes.statusCode === 0
         ? `连接本机 Apollo (${port}) 失败: ${writeRes.text}`
         : `Apollo 拒绝新配置 (HTTP ${writeRes.statusCode}): ${writeRes.text.slice(0, 200)}`,
+  };
+}
+
+/**
+ * Ensures Apollo host encoder & network settings are tuned for low-latency
+ * WAN streaming without reducing visual quality.
+ */
+export async function ensureApolloStreamingTuning(
+  apolloUser: string,
+  apolloPass: string,
+  port = 47990,
+): Promise<{ ok: boolean; updated: boolean; changedKeys: string[] }> {
+  if (!apolloUser || !apolloPass) {
+    return { ok: false, updated: false, changedKeys: [] };
+  }
+
+  const readRes = await apolloAuthedRequest(port, "GET", "/api/config", apolloUser, apolloPass);
+  if (
+    readRes.statusCode < 200 ||
+    readRes.statusCode >= 300 ||
+    !readRes.json ||
+    typeof readRes.json !== "object" ||
+    Array.isArray(readRes.json)
+  ) {
+    return { ok: false, updated: false, changedKeys: [] };
+  }
+
+  const patch = buildOptimalApolloConfigPatch(readRes.json);
+  if (!patch.changed) {
+    return { ok: true, updated: false, changedKeys: [] };
+  }
+
+  const writeRes = await apolloAuthedRequest(port, "POST", "/api/config", apolloUser, apolloPass, patch.nextConfig);
+  const ok = writeRes.statusCode >= 200 && writeRes.statusCode < 300;
+  return {
+    ok,
+    updated: ok,
+    changedKeys: ok ? patch.changedKeys : [],
   };
 }
 

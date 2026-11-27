@@ -9,23 +9,16 @@ dhcp = false
 listeners = [
     "udp://0.0.0.0:0",
     "udp://[::]:0",
-    "tcp://0.0.0.0:0",
-    "tcp://[::]:0",
 ]
 
 rpc_portal = "127.0.0.1:15888"
 
+# Pure UDP by default (SilkWarp clients auto-fallback to TCP only when a strict network blocks all UDP)
 [[peer]]
 uri = "udp://relay.example.com:11011"
 
 [[peer]]
-uri = "tcp://relay.example.com:11011"
-
-[[peer]]
 uri = "udp://signaling.example.com:11010"
-
-[[peer]]
-uri = "tcp://signaling.example.com:11010"
 
 [network_identity]
 network_name = "silkwarp-team"
@@ -39,3 +32,6 @@ multi_thread = true
 multi_thread_count = 4
 enable_ipv6 = true
 enable_encryption = true
+disable_tcp_hole_punching = true
+relay_network_whitelist = ""
+mtu = 1360

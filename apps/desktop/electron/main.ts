@@ -19,6 +19,7 @@ import {
   downloadAndRunRustDeskInstaller,
   ensureApolloCredentials,
   ensureApolloServiceRunning,
+  ensureApolloStreamingTuning,
   getApolloOutputName,
   grantAllApolloClientPermissions,
   invalidateFirewallCache,
@@ -206,6 +207,7 @@ let pairPollStopped = false;
 let provisionStage: ProvisionStage = "idle";
 let provisionMessage = "";
 let apolloAuthReady = false;
+let apolloTuningSynced = false;
 let autoHealExhausted = false;
 let provisionInFlight: Promise<void> | null = null;
 const activePairReqIds = new Set<string>();
@@ -540,6 +542,10 @@ async function autoProvisionHostIfNeeded(forceManualRetry = false): Promise<void
           }
         }
         lastApolloPermSyncAt = 0;
+        const tuningRes = await ensureApolloStreamingTuning(cred.user, cred.pass).catch(() => null);
+        if (tuningRes?.ok) {
+          apolloTuningSynced = true;
+        }
         apolloAuthReady = true;
         autoHealExhausted = false;
         provisionStage = "ready";
@@ -709,6 +715,20 @@ async function syncAll(opts: SyncAllOptions = {}): Promise<void> {
       provisionMessage = "";
     }
 
+    if (
+      s.isHost &&
+      hostInfoCache.apolloRunning &&
+      apolloAuthReady &&
+      !apolloTuningSynced &&
+      s.apolloUser &&
+      s.apolloPass
+    ) {
+      const tuningRes = await ensureApolloStreamingTuning(s.apolloUser, s.apolloPass).catch(() => null);
+      if (tuningRes?.ok) {
+        apolloTuningSynced = true;
+      }
+    }
+
     // Throttled self-heal: refresh Apollo client permissions once per 10 minutes
     // (initial pairing still triggers immediate burst grants via scheduleGrantApolloPermissions).
     if (
@@ -769,6 +789,7 @@ async function syncAll(opts: SyncAllOptions = {}): Promise<void> {
       lastPairCheckAt = 0;
       lastPairActivityAt = 0;
       apolloAuthReady = false;
+      apolloTuningSynced = false;
       easyTier.stop();
     }
   }
@@ -1005,6 +1026,7 @@ ipcMain.handle("auth:logout", async () => {
   lastPairCheckAt = 0;
   lastPairActivityAt = 0;
   apolloAuthReady = false;
+  apolloTuningSynced = false;
   provisionStage = "idle";
   provisionMessage = "";
   easyTier.stop();
@@ -1398,6 +1420,7 @@ ipcMain.handle("host:updateSettings", async (_evt, patch: Record<string, unknown
   store.update(patch);
   if ("apolloUser" in patch || "apolloPass" in patch || patch.isHost === true) {
     apolloAuthReady = false;
+    apolloTuningSynced = false;
     autoHealExhausted = false;
   }
   if (typeof patch.autoStart === "boolean") {

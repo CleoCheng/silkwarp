@@ -56,6 +56,18 @@ export function isTcpOnlyTunnel(tunnel?: string | null): boolean {
   return t.includes("tcp") && !t.includes("udp");
 }
 
+export function isLocalLanLink(routeType: string, link?: StreamLinkQuality | null): boolean {
+  const route = routeType.trim().toLowerCase();
+  if (route === "local") return true;
+  if (route !== "p2p") return false;
+  if (isTcpOnlyTunnel(link?.tunnel)) return false;
+  if (typeof link?.latencyMs !== "number" || !Number.isFinite(link.latencyMs) || link.latencyMs >= 8) {
+    return false;
+  }
+  const loss = typeof link?.lossPercent === "number" && Number.isFinite(link.lossPercent) ? link.lossPercent : 0;
+  return loss < 0.5;
+}
+
 export function isDegradedLink(routeType: string, link?: StreamLinkQuality | null): boolean {
   if (routeType.trim().toLowerCase().startsWith("relay")) return true;
   if (isTcpOnlyTunnel(link?.tunnel)) return true;
@@ -265,7 +277,8 @@ export function buildMoonlightSpawnEnv(baseEnv?: NodeJS.ProcessEnv): NodeJS.Proc
 /**
  * Resolves the UDP payload size passed to Moonlight. The default 1392-byte
  * payload fragments over SilkWarp's 1360-MTU Wintun adapter, so we stay below
- * it; degraded/TCP/relay hops get a smaller 1024-byte payload to avoid stutter.
+ * it; WAN/degraded/TCP/relay hops get a smaller 1024-byte payload to avoid
+ * fragmentation or bufferbloat without reducing picture quality.
  */
 export function resolvePacketSize(
   preset: StreamPreset,
@@ -275,31 +288,14 @@ export function resolvePacketSize(
   if (typeof preset.packetSize === "number" && Number.isFinite(preset.packetSize)) {
     return Math.min(MAX_PACKET_SIZE, Math.max(MIN_PACKET_SIZE, Math.round(preset.packetSize)));
   }
-  return isDegradedLink(routeType, link) ? 1024 : 1200;
+  const wanLatency = typeof link?.latencyMs === "number" && Number.isFinite(link.latencyMs) && link.latencyMs >= 25;
+  return isDegradedLink(routeType, link) || wanLatency ? 1024 : 1200;
 }
 
 /**
- * Caps overly high stream resolutions on bandwidth-constrained relay/WAN links
- * so encoders do not waste bits on 2K/4K detail at low bitrates.
- */
-export function capResolutionForBandwidth(
-  resolution: string,
-  maxWidth: number,
-  maxHeight: number,
-): string {
-  const m = RESOLUTION_RE.exec(resolution);
-  if (!m) return resolution;
-  const [width, height] = resolution.split("x").map(Number);
-  if (!Number.isFinite(width) || !Number.isFinite(height) || (width <= maxWidth && height <= maxHeight)) {
-    return resolution;
-  }
-  const scale = Math.min(maxWidth / width, maxHeight / height);
-  return normalizeWindowResolution(Math.round(width * scale), Math.round(height * scale));
-}
-
-/**
- * Applies the relay & link-quality guardrail. Only the effective command-line
- * preset is clamped; the user's persisted P2P preset is never mutated.
+ * Applies lossless frame-rate matching without ever downgrading resolution or
+ * bitrate: only trims wasted >60 FPS when the client display is <=65 Hz or the
+ * path runs over a relay / TCP fallback.
  */
 export function computeEffectivePreset(
   preset: StreamPreset,
@@ -310,45 +306,15 @@ export function computeEffectivePreset(
     return { ...preset };
   }
 
-  const loss = typeof link?.lossPercent === "number" && Number.isFinite(link.lossPercent) ? link.lossPercent : 0;
-  const latency = typeof link?.latencyMs === "number" && Number.isFinite(link.latencyMs) ? link.latencyMs : 0;
   const tcpOnly = isTcpOnlyTunnel(link?.tunnel);
   const isRelay = routeType.trim().toLowerCase().startsWith("relay");
-
-  if (loss >= 4 || latency >= 150) {
-    return {
-      ...preset,
-      resolution: capResolutionForBandwidth(preset.resolution, 1600, 1000),
-      fps: preset.fps > 30 ? 30 : preset.fps,
-      bitrateMbps: Math.min(preset.bitrateMbps, 6),
-    };
-  }
-
-  if (tcpOnly || loss >= 2 || latency >= 100) {
-    return {
-      ...preset,
-      resolution: capResolutionForBandwidth(preset.resolution, 1920, 1200),
-      fps: preset.fps > 60 ? 60 : preset.fps,
-      bitrateMbps: Math.min(preset.bitrateMbps, 6),
-    };
-  }
-
-  if (isRelay || latency >= 60 || loss >= 1) {
-    return {
-      ...preset,
-      resolution: capResolutionForBandwidth(preset.resolution, 1920, 1200),
-      fps: preset.fps > 60 ? 60 : preset.fps,
-      bitrateMbps: Math.min(preset.bitrateMbps, 8),
-    };
-  }
-
-  if (
+  const refresh60Only =
     typeof link?.clientRefreshHz === "number" &&
     Number.isFinite(link.clientRefreshHz) &&
     link.clientRefreshHz > 0 &&
-    link.clientRefreshHz <= 65 &&
-    preset.fps > 60
-  ) {
+    link.clientRefreshHz <= 65;
+
+  if ((refresh60Only || isRelay || tcpOnly) && preset.fps > 60) {
     return {
       ...preset,
       fps: 60,
@@ -384,7 +350,7 @@ export function buildMoonlightStreamArgs(
 ): string[] {
   const effective = computeEffectivePreset(preset, routeType, link);
   const packetSize = resolvePacketSize(effective, routeType, link);
-  const degraded = isDegradedLink(routeType, link);
+  const localLan = isLocalLanLink(routeType, link);
   const codecMap: Record<StreamPreset["codec"], string> = {
     hevc: "HEVC",
     av1: "AV1",
@@ -418,10 +384,10 @@ export function buildMoonlightStreamArgs(
   if (effective.lowLatency) {
     args.push(
       "--no-vsync",
-      degraded ? "--frame-pacing" : "--no-frame-pacing",
+      localLan ? "--no-frame-pacing" : "--frame-pacing",
       "--no-game-optimization",
       "--video-decoder",
-      "hardware",
+      "auto",
     );
   } else {
     args.push("--vsync", "--frame-pacing", "--video-decoder", "auto");
