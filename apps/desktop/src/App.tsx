@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
-import { Laptop, LogOut, Monitor, Network, ShieldAlert } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ArrowDownToLine, ExternalLink, Laptop, LogOut, Monitor, Network, RefreshCw, ShieldAlert } from "lucide-react";
 import { getBridge } from "./bridge";
 import { AdminView } from "./components/AdminView";
 import { DevicesView } from "./components/DevicesView";
 import { HostModeView } from "./components/HostModeView";
 import { LoginView } from "./components/LoginView";
-import type { AppRuntimeState } from "../electron/types";
+import type { AppRuntimeState, UpdateCheckResult, UpdateDownloadProgress } from "../electron/types";
 
 type TabId = "devices" | "host" | "admin";
 
@@ -14,6 +14,12 @@ export default function App() {
   const [state, setState] = useState<AppRuntimeState | null>(null);
   const [tab, setTab] = useState<TabId>("devices");
   const [toastMsg, setToastMsg] = useState("");
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateCheck, setUpdateCheck] = useState<UpdateCheckResult | null>(null);
+  const [downloadProgress, setDownloadProgress] = useState<UpdateDownloadProgress | null>(null);
+  const [downloadedPath, setDownloadedPath] = useState("");
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const autoCheckedRef = useRef(false);
 
   function notify(msg: string) {
     setToastMsg(msg);
@@ -22,8 +28,93 @@ export default function App() {
 
   useEffect(() => {
     void bridge.getState().then(setState);
-    return bridge.onStateChanged(setState);
+    const unsubState = bridge.onStateChanged(setState);
+    const unsubProgress = bridge.onUpdateProgress((progress) => {
+      setDownloadProgress(progress);
+      if (progress.phase === "ready" && progress.filePath) {
+        setDownloadedPath(progress.filePath);
+      }
+    });
+    return () => {
+      unsubState();
+      unsubProgress();
+    };
   }, [bridge]);
+
+  useEffect(() => {
+    if (!state?.authenticated) {
+      autoCheckedRef.current = false;
+      return;
+    }
+    if (autoCheckedRef.current) return;
+    autoCheckedRef.current = true;
+    const timer = window.setTimeout(() => {
+      void bridge
+        .checkForUpdates()
+        .then((res) => {
+          if (res.hasUpdate && res.release) {
+            setUpdateCheck(res);
+          }
+        })
+        .catch(() => {});
+    }, 8000);
+    return () => window.clearTimeout(timer);
+  }, [bridge, state?.authenticated]);
+
+  async function handleManualCheckUpdate() {
+    setCheckingUpdate(true);
+    try {
+      const res = await bridge.checkForUpdates();
+      setUpdateCheck(res);
+      if (res.status !== "available") {
+        setDownloadedPath("");
+        setDownloadProgress(null);
+        notify(res.message);
+      }
+    } catch (err) {
+      notify(err instanceof Error ? err.message : String(err));
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
+
+  async function handleDownloadUpdate() {
+    if (!updateCheck?.release) return;
+    setDownloadedPath("");
+    setDownloadProgress({
+      phase: "downloading",
+      version: updateCheck.release.version,
+      downloadedBytes: 0,
+      totalBytes: updateCheck.release.sizeBytes,
+      percent: 0,
+    });
+    try {
+      const res = await bridge.downloadUpdate(updateCheck.release);
+      if (res.ok && res.filePath) {
+        setDownloadedPath(res.filePath);
+        notify(res.message);
+      } else {
+        setDownloadProgress(null);
+        notify(res.message);
+      }
+    } catch (err) {
+      setDownloadProgress(null);
+      notify(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function handleInstallUpdate() {
+    if (!downloadedPath) return;
+    setInstallingUpdate(true);
+    try {
+      const res = await bridge.installUpdate(downloadedPath);
+      notify(res.message);
+      if (!res.ok) setInstallingUpdate(false);
+    } catch (err) {
+      setInstallingUpdate(false);
+      notify(err instanceof Error ? err.message : String(err));
+    }
+  }
 
   if (!state) {
     return (
@@ -118,6 +209,76 @@ export default function App() {
             </div>
           </div>
 
+          {updateCheck?.hasUpdate && updateCheck.release && (
+            <div className="rounded-xl border border-sky-500/40 bg-sky-500/10 p-2.5 text-[11px] space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-bold text-sky-200">发现新版本 v{updateCheck.release.version}</span>
+                <button
+                  type="button"
+                  onClick={() => void bridge.openExternal(updateCheck.release!.releaseUrl)}
+                  className="inline-flex items-center gap-0.5 text-slate-300 hover:text-white"
+                  title="查看更新说明"
+                >
+                  详情 <ExternalLink className="w-3 h-3" />
+                </button>
+              </div>
+              {downloadProgress &&
+                (downloadProgress.phase === "downloading" || downloadProgress.phase === "verifying") && (
+                  <div className="space-y-1">
+                    <div className="h-1.5 w-full rounded-full bg-slate-800 overflow-hidden">
+                      <div
+                        className="h-full bg-sky-400 transition-all duration-150"
+                        style={{ width: `${downloadProgress.percent}%` }}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between text-[10px] text-slate-300">
+                      <span>
+                        {downloadProgress.phase === "verifying" ? "正在校验完整性..." : "正在下载安装包..."}
+                      </span>
+                      <span className="font-mono">{downloadProgress.percent}%</span>
+                    </div>
+                  </div>
+                )}
+              {downloadedPath ? (
+                <button
+                  type="button"
+                  disabled={installingUpdate}
+                  onClick={() => void handleInstallUpdate()}
+                  className="w-full rounded-lg bg-emerald-400 py-1.5 text-[11px] font-bold text-slate-950 hover:bg-emerald-300 disabled:opacity-50"
+                >
+                  {installingUpdate ? "正在启动安装程序..." : "立即安装升级"}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={downloadProgress?.phase === "downloading" || downloadProgress?.phase === "verifying"}
+                  onClick={() => void handleDownloadUpdate()}
+                  className="w-full inline-flex items-center justify-center gap-1 rounded-lg bg-sky-400 py-1.5 text-[11px] font-bold text-slate-950 hover:bg-sky-300 disabled:opacity-50"
+                >
+                  <ArrowDownToLine className="w-3.5 h-3.5" />
+                  {downloadProgress?.phase === "downloading"
+                    ? "下载中..."
+                    : updateCheck.release.sizeBytes > 0
+                      ? `下载更新 (${Math.round(updateCheck.release.sizeBytes / (1024 * 1024))} MB)`
+                      : "下载更新"}
+                </button>
+              )}
+            </div>
+          )}
+
+          <div className="flex items-center justify-between px-1 text-[11px] text-slate-400">
+            <span className="font-mono">v{state.appVersion || "3.3.0"}</span>
+            <button
+              type="button"
+              disabled={checkingUpdate}
+              onClick={() => void handleManualCheckUpdate()}
+              className="inline-flex items-center gap-1 text-sky-300 hover:text-sky-200 disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3 h-3 ${checkingUpdate ? "animate-spin" : ""}`} />
+              {checkingUpdate ? "检查中..." : "检查更新"}
+            </button>
+          </div>
+
           <button
             type="button"
             onClick={() => void bridge.logout().then(setState)}
@@ -196,6 +357,7 @@ export default function App() {
             easytier={state.easytier}
             onStartEasyTier={async () => setState(await bridge.startEasyTier())}
             onReconnectUdp={async () => setState(await bridge.reconnectEasyTierUdp())}
+            onDiagnoseNetwork={() => bridge.diagnoseNetwork()}
             onRelaunchAdmin={() => bridge.relaunchAsAdmin()}
             onRefresh={async () => setState(await bridge.refresh())}
             onListUsers={() => bridge.adminListUsers()}

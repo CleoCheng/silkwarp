@@ -11,6 +11,8 @@ files:
 extraResources:
   - from: resources/easytier
     to: easytier
+  - from: resources/helper
+    to: helper
   - from: resources/moonlight
     to: moonlight
     filter:
@@ -33,6 +35,7 @@ win:
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
+  include: packaging/installer.nsh
   installerIcon: build/icon.ico
   uninstallerIcon: build/icon.ico
   createDesktopShortcut: true

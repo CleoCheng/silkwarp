@@ -1,14 +1,15 @@
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import type { SessionHotkeyAction, WindowRect } from "../types";
+import { buildWindowTrackerHelperArgs, resolveWinHelperExe } from "./winHelper";
 
 /**
  * Lightweight Win32 window tracker + hotkey injector.
  *
  * Design constraints:
- * - No native C++ / node-gyp dependency. One hidden `powershell.exe` helper is
- *   kept resident per active session; it compiles a small C# P/Invoke helper
- *   with `Add-Type` once and then polls the Moonlight window every 150ms.
+ * - No native C++ / node-gyp dependency. Prefers the pre-compiled zero-dep
+ *   `silkwarp-win-helper.exe` (~20 KB, instant startup) and falls back to one
+ *   hidden `powershell.exe` helper when the binary is absent.
  * - A background .NET thread drains stdin into a ConcurrentQueue so the polling
  *   loop never blocks on console input.
  * - The helper only writes a line to stdout when the rect or window state
@@ -339,13 +340,22 @@ export class WindowTracker {
 
   private start(): void {
     try {
-      const script = buildTrackerScript(this.targetPid, this.options);
-      const encoded = Buffer.from(script, "utf16le").toString("base64");
-      this.child = spawn(
-        "powershell.exe",
-        ["-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
-        { windowsHide: true, stdio: ["pipe", "pipe", "ignore"] },
-      );
+      const helperExe = resolveWinHelperExe();
+      if (helperExe) {
+        const args = buildWindowTrackerHelperArgs(this.targetPid, this.options);
+        this.child = spawn(helperExe, args, {
+          windowsHide: true,
+          stdio: ["pipe", "pipe", "ignore"],
+        });
+      } else {
+        const script = buildTrackerScript(this.targetPid, this.options);
+        const encoded = Buffer.from(script, "utf16le").toString("base64");
+        this.child = spawn(
+          "powershell.exe",
+          ["-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+          { windowsHide: true, stdio: ["pipe", "pipe", "ignore"] },
+        );
+      }
 
       // Broken pipes during teardown dispatch async `error` events on next tick.
       this.child.stdin?.on("error", () => {});

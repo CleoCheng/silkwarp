@@ -1,13 +1,37 @@
 import type { DisplayMonitorInfo, SystemActionType } from "./services/hostAgentServer";
+import type {
+  DiagnosticCheckItem,
+  DiagnosticSeverity,
+  NetworkDiagnosticsReport,
+  PeerDiagnosticItem,
+} from "./services/networkDiagnostics";
 import type { ClipboardKind, RemoteFileEntry, RemoteRootDir } from "./services/transferValidation";
+import type {
+  UpdateCheckResult,
+  UpdateDownloadProgress,
+  UpdateDownloadResult,
+  UpdateReleaseInfo,
+} from "./services/updateLogic";
 
 export type { DisplayMonitorInfo, SystemActionType } from "./services/hostAgentServer";
+export type {
+  DiagnosticCheckItem,
+  DiagnosticSeverity,
+  NetworkDiagnosticsReport,
+  PeerDiagnosticItem,
+} from "./services/networkDiagnostics";
 export type {
   ClipboardKind,
   ClipboardPayload,
   RemoteFileEntry,
   RemoteRootDir,
 } from "./services/transferValidation";
+export type {
+  UpdateCheckResult,
+  UpdateDownloadProgress,
+  UpdateDownloadResult,
+  UpdateReleaseInfo,
+} from "./services/updateLogic";
 
 export interface UserInfo {
   id: string;
@@ -257,6 +281,7 @@ export interface AppSettings {
 }
 
 export interface AppRuntimeState {
+  appVersion: string;
   authenticated: boolean;
   user: UserInfo | null;
   bootstrap: BootstrapConfig | null;

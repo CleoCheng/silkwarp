@@ -5,9 +5,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { checkForUpdates, downloadUpdate, launchDownloadedInstaller } from "./services/appUpdater";
 import { createElectronClipboardAdapter } from "./services/clipboardSyncManager";
+import { ConnectPrewarmCache, selectPrewarmCandidates } from "./services/connectPrewarm";
 import { ControlClient, type PairRequestItem } from "./services/controlClient";
 import { EasyTierManager } from "./services/easytierManager";
+import { buildNetworkDiagnostics, inspectLocalIpv6Interfaces } from "./services/networkDiagnostics";
 import {
   checkApolloAuthStatus,
   collectHostInfo,
@@ -70,6 +73,7 @@ import type {
   DeviceInfo,
   DisplayMonitorInfo,
   HostHardwareInfo,
+  PeerStatus,
   ProvisionStage,
   RemoteFileListing,
   ResolutionMode,
@@ -77,6 +81,7 @@ import type {
   StreamPreset,
   SystemActionType,
   TransferTaskItem,
+  UpdateReleaseInfo,
 } from "./types";
 
 const execFileAsync = promisify(execFile);
@@ -147,9 +152,19 @@ function resolveLivePeerLink(device: DeviceInfo): {
   };
 }
 
+const prewarmCache = new ConnectPrewarmCache();
+let lastActiveSessionDeviceId = "";
+let prewarmRunning = false;
+
 const sessionManager = new StreamSessionManager(
   store,
   (sessionState: ActiveSessionState | null) => {
+    if (sessionState?.device?.id) {
+      lastActiveSessionDeviceId = sessionState.device.id;
+    } else if (lastActiveSessionDeviceId) {
+      prewarmCache.invalidatePermission(lastActiveSessionDeviceId);
+      lastActiveSessionDeviceId = "";
+    }
     syncSessionGlobalShortcuts(Boolean(sessionState));
     syncSessionTelemetryLoop(Boolean(sessionState));
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -410,6 +425,87 @@ async function syncHostAgentServer(): Promise<void> {
   }
 }
 
+async function prewarmSingleDevice(device: DeviceInfo): Promise<void> {
+  if (!device || !device.mesh_ip || isQuitting || sessionManager.getState() !== null) return;
+  prewarmCache.markPrewarmAttempt(device.id);
+  const apolloPort = device.apollo_port || 47984;
+  const s = store.get();
+
+  const [permInfo, appEntries] = await Promise.all([
+    probeRemoteApolloPermission(device.mesh_ip, apolloPort, 1200).catch(() => null),
+    fetchAvailableApolloAppEntries(device.mesh_ip, apolloPort, 1200).catch(() => []),
+  ]);
+
+  if (permInfo) {
+    prewarmCache.setPermission(device.id, device.mesh_ip, apolloPort, permInfo);
+  }
+  if (appEntries.length > 0) {
+    prewarmCache.setAppEntries(device.id, device.mesh_ip, apolloPort, appEntries);
+  }
+
+  const agentPort = device.agent_port || DEFAULT_AGENT_PORT;
+  const userId = s.user?.id || "";
+  const savedPassword = store.getSavedDevicePassword(device.id);
+  const canPreAuthAgent =
+    !device.has_access_password ||
+    Boolean(savedPassword) ||
+    Boolean(userId && device.owner_user_id === userId);
+
+  if (canPreAuthAgent && !prewarmCache.getValidAgentToken(device.id, device.mesh_ip, agentPort, userId)) {
+    try {
+      const auth = await agentClient.authenticate(
+        device.mesh_ip,
+        agentPort,
+        {
+          password: savedPassword || undefined,
+          clientUserId: userId || undefined,
+          deviceId: s.deviceId,
+        },
+        1000,
+      );
+      if (auth?.token) {
+        prewarmCache.setAgentToken(device.id, device.mesh_ip, agentPort, userId, auth.token, auth.expiresAt);
+      }
+    } catch {
+      // ignore passive pre-warm agent auth misses
+    }
+  }
+}
+
+async function scheduleBackgroundPrewarm(devices: DeviceInfo[], peers: PeerStatus[]): Promise<void> {
+  if (prewarmRunning || isQuitting) return;
+  if (!easyTier.getStatus().running) return;
+  if (sessionManager.getState() !== null) return;
+  if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible() || mainWindow.isMinimized()) {
+    return;
+  }
+
+  const s = store.get();
+  if (!s.token) return;
+
+  const candidates = selectPrewarmCandidates(devices, s.deviceId, s.pairedHosts, peers, 4).filter((d) =>
+    prewarmCache.shouldPrewarm(d.id),
+  );
+  if (candidates.length === 0) return;
+
+  prewarmRunning = true;
+  try {
+    const queue = [...candidates];
+    const workerCount = Math.min(2, queue.length);
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        while (queue.length > 0) {
+          const next = queue.shift();
+          if (!next || isQuitting || sessionManager.getState() !== null) return;
+          await prewarmSingleDevice(next);
+        }
+      }),
+    );
+  } finally {
+    prewarmRunning = false;
+  }
+}
+
 function pushPairLog(line: string): void {
   pairLogs.unshift(`${new Date().toLocaleTimeString()} ${line}`);
   if (pairLogs.length > 20) pairLogs.pop();
@@ -431,6 +527,7 @@ function buildRuntimeState(): AppRuntimeState {
     settings.tempAccessPasswordExpiresAt = 0;
   }
   return {
+    appVersion: app.getVersion(),
     authenticated: Boolean(s.token && s.user),
     user: s.user,
     bootstrap: bootstrapCache,
@@ -785,9 +882,11 @@ async function runSyncAllPass(opts: SyncAllOptions = {}): Promise<void> {
 
     const listResp = await client.listDevices();
     devicesCache = enrichDevicesWithEasyTierPeers(listResp.devices, peers);
+    void scheduleBackgroundPrewarm(devicesCache, peers);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("unauthorized") || msg.includes("401")) {
+      prewarmCache.clear();
       store.update({ token: "", user: null });
       bootstrapCache = null;
       devicesCache = [];
@@ -937,6 +1036,9 @@ function createWindow(): void {
   const onVisibilityChange = () => {
     if (!pairPollStopped && !isQuitting && store.get().token) {
       schedulePairPoll();
+      if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() && !mainWindow.isMinimized()) {
+        void scheduleBackgroundPrewarm(devicesCache, easyTier.getStatus().peers);
+      }
     }
   };
   mainWindow.on("show", onVisibilityChange);
@@ -1069,6 +1171,7 @@ ipcMain.handle("auth:logout", async () => {
   }
   pairPollStopped = true;
   stopPairPoll();
+  prewarmCache.clear();
   store.update({ token: "", user: null });
   bootstrapCache = null;
   devicesCache = [];
@@ -1261,12 +1364,19 @@ function resolveTransferTarget(args: TransferTargetArgs): { host: string; port: 
 
 ipcMain.handle("transfer:listFiles", async (_evt, args: TransferTargetArgs = {}): Promise<RemoteFileListing> => {
   const target = resolveTransferTarget(args);
-  return agentClient.listRemoteFiles(
-    target.host,
-    target.port,
-    target.token,
-    typeof args.dirPath === "string" && args.dirPath.trim() ? args.dirPath : undefined,
-  );
+  try {
+    return await agentClient.listRemoteFiles(
+      target.host,
+      target.port,
+      target.token,
+      typeof args.dirPath === "string" && args.dirPath.trim() ? args.dirPath : undefined,
+    );
+  } catch (err) {
+    if (err instanceof AgentClientError && err.statusCode === 401) {
+      prewarmCache.invalidateAgentByEndpoint(target.host, target.port);
+    }
+    throw err;
+  }
 });
 
 ipcMain.handle(
@@ -1307,6 +1417,9 @@ ipcMain.handle(
         task.filename = result.filename;
         task.remotePath = result.path;
       } catch (err) {
+        if (err instanceof AgentClientError && err.statusCode === 401) {
+          prewarmCache.invalidateAgentByEndpoint(target.host, target.port);
+        }
         task.status = "error";
         task.message = err instanceof Error ? err.message : String(err);
       }
@@ -1355,6 +1468,9 @@ ipcMain.handle(
         task.filename = result.filename;
         task.remotePath = result.path;
       } catch (err) {
+        if (err instanceof AgentClientError && err.statusCode === 401) {
+          prewarmCache.invalidateAgentByEndpoint(target.host, target.port);
+        }
         task.status = "error";
         task.message = err instanceof Error ? err.message : String(err);
       }
@@ -1403,6 +1519,9 @@ ipcMain.handle(
       task.total = result.size;
       task.localPath = result.path;
     } catch (err) {
+      if (err instanceof AgentClientError && err.statusCode === 401) {
+        prewarmCache.invalidateAgentByEndpoint(target.host, target.port);
+      }
       task.status = "error";
       task.message = err instanceof Error ? err.message : String(err);
     }
@@ -1514,6 +1633,50 @@ ipcMain.handle("easytier:reconnectUdp", async () => {
   return buildRuntimeState();
 });
 
+ipcMain.handle("network:diagnose", async () => {
+  const status = easyTier.getStatus();
+  const peers = status.running
+    ? await easyTier.refreshPeers().catch(() => status.peers)
+    : status.peers;
+  const nodeInfo = status.running
+    ? await easyTier.probeNodeDiagnostics().catch(() => null)
+    : null;
+  const localIpv6 = inspectLocalIpv6Interfaces();
+  const latestStatus = easyTier.getStatus();
+  return buildNetworkDiagnostics({
+    easytierRunning: latestStatus.running,
+    needsElevation: latestStatus.needsElevation,
+    peers,
+    localIpv6,
+    nodeInfo,
+  });
+});
+
+ipcMain.handle("updater:check", async () => checkForUpdates(app.getVersion()));
+
+ipcMain.handle("updater:download", async (_evt, release: UpdateReleaseInfo) =>
+  downloadUpdate(release, (progress) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("updater:progress", progress);
+    }
+  }),
+);
+
+ipcMain.handle("updater:install", async (_evt, filePath: string) => {
+  const res = await launchDownloadedInstaller(filePath);
+  if (res.ok) {
+    isQuitting = true;
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    pairPollStopped = true;
+    stopPairPoll();
+    syncSessionTelemetryLoop(false);
+    easyTier.stop();
+    const quitTimer = setTimeout(() => app.quit(), 350);
+    quitTimer.unref?.();
+  }
+  return res;
+});
+
 ipcMain.handle("app:relaunchAdmin", async () => {
   if (process.platform !== "win32") return;
   const sq = (v: string) => `'${v.replace(/'/g, "''")}'`;
@@ -1604,9 +1767,17 @@ async function ensureRemoteAgentSession(
 ): Promise<AgentSessionResult> {
   const port = device.agent_port || DEFAULT_AGENT_PORT;
   const s = store.get();
+  const userId = s.user?.id || "";
   const explicitPassword = typeof opts?.password === "string" ? opts.password : "";
   const savedPassword = store.getSavedDevicePassword(device.id);
   const password = explicitPassword || savedPassword;
+
+  if (!explicitPassword) {
+    const cachedToken = prewarmCache.getValidAgentToken(device.id, device.mesh_ip, port, userId);
+    if (cachedToken) {
+      return { ok: true, agentConnected: true, port, token: cachedToken };
+    }
+  }
 
   try {
     const auth = await agentClient.authenticate(
@@ -1614,12 +1785,13 @@ async function ensureRemoteAgentSession(
       port,
       {
         password: password || undefined,
-        clientUserId: s.user?.id || undefined,
+        clientUserId: userId || undefined,
         deviceId: s.deviceId,
       },
       1200,
     );
     if (!auth?.token) {
+      prewarmCache.invalidateAgent(device.id);
       return {
         ok: false,
         needsPassword: true,
@@ -1629,6 +1801,7 @@ async function ensureRemoteAgentSession(
     if (explicitPassword && opts?.rememberPassword) {
       store.setSavedDevicePassword(device.id, explicitPassword);
     }
+    prewarmCache.setAgentToken(device.id, device.mesh_ip, port, userId, auth.token, auth.expiresAt);
     return { ok: true, agentConnected: true, port, token: auth.token };
   } catch (err) {
     if (err instanceof AgentClientError) {
@@ -1642,6 +1815,7 @@ async function ensureRemoteAgentSession(
         };
       }
       if (err.statusCode === 401) {
+        prewarmCache.invalidateAgent(device.id);
         // Drop the cached password only when the failing credential came from
         // the cache (or the user retyped that same stale value).
         if (!explicitPassword || (savedPassword && savedPassword === explicitPassword)) {
@@ -1694,10 +1868,27 @@ async function prepareConnectPreflight(
     return res;
   });
 
+  const cachedApps = prewarmCache.getFreshAppEntries(device.id, device.mesh_ip, primaryPort);
+  const cachedPerm = prewarmCache.getFreshPermission(device.id, device.mesh_ip, primaryPort);
+  const canReusePerm = Boolean(
+    cachedPerm && cachedPerm.paired && cachedPerm.hasInput && cachedPerm.currentGameId === 0,
+  );
+
   const [permInfo, appEntries] = await Promise.all([
-    probeRemoteApolloPermission(device.mesh_ip, primaryPort, 1800),
-    fetchAvailableApolloAppEntries(device.mesh_ip, primaryPort, 1800),
+    canReusePerm
+      ? Promise.resolve(cachedPerm)
+      : probeRemoteApolloPermission(device.mesh_ip, primaryPort, 1800),
+    cachedApps
+      ? Promise.resolve(cachedApps)
+      : fetchAvailableApolloAppEntries(device.mesh_ip, primaryPort, 1800),
   ]);
+
+  if (permInfo && !canReusePerm) {
+    prewarmCache.setPermission(device.id, device.mesh_ip, primaryPort, permInfo);
+  }
+  if (appEntries.length > 0 && !cachedApps) {
+    prewarmCache.setAppEntries(device.id, device.mesh_ip, primaryPort, appEntries);
+  }
 
   if (!settledAgent) {
     if (device.has_access_password) {
@@ -1946,6 +2137,7 @@ ipcMain.handle(
       }
       throw new Error(`自动安全配对失败：${lastReason}。请确认对方「本机受控」显示已就绪后重试。`);
     } catch (err) {
+      prewarmCache.invalidateDevice(device.id);
       emitConnectProgress(null);
       throw err;
     }
@@ -2044,6 +2236,7 @@ ipcMain.handle(
         message: `正在连接「${device.name}」…`,
       } satisfies ConnectDeviceResult;
     } catch (err) {
+      prewarmCache.invalidateDevice(device.id);
       emitConnectProgress(null);
       throw err;
     }

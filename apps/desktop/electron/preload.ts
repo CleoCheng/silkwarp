@@ -6,12 +6,17 @@ import type {
   ConnectProgressEvent,
   DeviceAgentSessionResult,
   DeviceInfo,
+  NetworkDiagnosticsReport,
   RemoteFileListing,
   ResolutionMode,
   SessionHotkeyAction,
   StreamPreset,
   SystemActionType,
   TransferTaskItem,
+  UpdateCheckResult,
+  UpdateDownloadProgress,
+  UpdateDownloadResult,
+  UpdateReleaseInfo,
   UserInfo,
 } from "./types";
 
@@ -44,6 +49,17 @@ const api = {
   }): Promise<AppRuntimeState> => ipcRenderer.invoke("host:updateSettings", patch),
   startEasyTier: (): Promise<AppRuntimeState> => ipcRenderer.invoke("easytier:start"),
   reconnectEasyTierUdp: (): Promise<AppRuntimeState> => ipcRenderer.invoke("easytier:reconnectUdp"),
+  diagnoseNetwork: (): Promise<NetworkDiagnosticsReport> => ipcRenderer.invoke("network:diagnose"),
+  checkForUpdates: (): Promise<UpdateCheckResult> => ipcRenderer.invoke("updater:check"),
+  downloadUpdate: (release: UpdateReleaseInfo): Promise<UpdateDownloadResult> =>
+    ipcRenderer.invoke("updater:download", release),
+  installUpdate: (filePath: string): Promise<{ ok: boolean; message: string }> =>
+    ipcRenderer.invoke("updater:install", filePath),
+  onUpdateProgress: (cb: (progress: UpdateDownloadProgress) => void): (() => void) => {
+    const listener = (_evt: Electron.IpcRendererEvent, progress: UpdateDownloadProgress) => cb(progress);
+    ipcRenderer.on("updater:progress", listener);
+    return () => ipcRenderer.removeListener("updater:progress", listener);
+  },
   relaunchAsAdmin: (): Promise<void> => ipcRenderer.invoke("app:relaunchAdmin"),
   configureFirewall: (): Promise<AppRuntimeState> => ipcRenderer.invoke("host:configureFirewall"),
   configureRustDesk: (): Promise<string[]> => ipcRenderer.invoke("host:configureRustDesk"),

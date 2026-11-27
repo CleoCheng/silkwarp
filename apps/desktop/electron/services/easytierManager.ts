@@ -11,6 +11,7 @@ import {
   renderEasyTierConfig,
   selectEasyTierPeers,
 } from "./easytierConfig";
+import { type EasyTierNodeDiagnostics, parseEasyTierNodeInfo } from "./networkDiagnostics";
 import {
   BOOT_TUNNEL_BIN_DIR,
   BOOT_TUNNEL_CONFIG_PATH,
@@ -334,6 +335,20 @@ export class EasyTierManager {
 
   async refreshPeers(): Promise<PeerStatus[]> {
     return (await this.probePeersRpc()) ?? [];
+  }
+
+  async probeNodeDiagnostics(): Promise<EasyTierNodeDiagnostics | null> {
+    const cli = path.join(resolveEasyTierDir(), "easytier-cli.exe");
+    if (!fs.existsSync(cli)) return null;
+    try {
+      const { stdout } = await execFileAsync(cli, ["-p", "127.0.0.1:15888", "-o", "json", "node"], {
+        timeout: 2500,
+        windowsHide: true,
+      });
+      return parseEasyTierNodeInfo(stdout);
+    } catch {
+      return null;
+    }
   }
 
   stop(): void {

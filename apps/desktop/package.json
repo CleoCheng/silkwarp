@@ -1,13 +1,14 @@
 {
   "name": "silkwarp-desktop",
-  "version": "3.2.0",
+  "version": "3.3.0",
   "description": "SilkWarp — 低延迟远程桌面与高刷串流控制中心",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite",
+    "build:helper": "node scripts/build_win_helper.cjs",
     "build:electron": "tsc -p tsconfig.node.json",
     "build:renderer": "tsc --noEmit && vite build",
-    "build": "npm run build:electron && npm run build:renderer",
+    "build": "npm run build:helper && npm run build:electron && npm run build:renderer",
     "pack:win": "npm run build && electron-builder --win nsis"
   },
   "dependencies": {

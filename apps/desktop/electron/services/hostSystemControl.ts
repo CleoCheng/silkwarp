@@ -12,6 +12,26 @@
 
 import { execFile, spawn } from "node:child_process";
 import type { DisplayMonitorInfo, SystemActionType } from "./hostAgentServer";
+import { resolveWinHelperExe } from "./winHelper";
+
+function runWinHelper(args: string[], timeoutMs: number): Promise<string | null> {
+  const helperExe = resolveWinHelperExe();
+  if (!helperExe) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    execFile(
+      helperExe,
+      args,
+      { timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
+      (error, stdout) => {
+        if (error) {
+          resolve(null);
+          return;
+        }
+        resolve(String(stdout || ""));
+      },
+    );
+  });
+}
 
 export interface SystemActionScript {
   powershell?: string;
@@ -683,6 +703,10 @@ function parseMuteMarker(output: string): boolean {
  */
 export async function listHostDisplays(): Promise<DisplayMonitorInfo[]> {
   if (process.platform !== "win32") return [];
+  const helperOutput = await runWinHelper(["displays"], 5000);
+  if (helperOutput !== null && helperOutput.includes(MONITOR_START_MARKER)) {
+    return parseMonitorLines(helperOutput);
+  }
   try {
     const output = await runEncodedPowerShell(buildListDisplaysScript(), 15000);
     return parseMonitorLines(output);
@@ -694,6 +718,10 @@ export async function listHostDisplays(): Promise<DisplayMonitorInfo[]> {
 /** Reads the default render endpoint's master mute state. */
 export async function getHostMasterMute(): Promise<boolean> {
   if (process.platform !== "win32") return false;
+  const helperOutput = await runWinHelper(["mute-get"], 4000);
+  if (helperOutput !== null && MUTE_MARKER_PATTERN.test(helperOutput)) {
+    return parseMuteMarker(helperOutput);
+  }
   try {
     const output = await runEncodedPowerShell(buildMasterMuteScript("get"), 10000);
     return parseMuteMarker(output);
@@ -705,12 +733,30 @@ export async function getHostMasterMute(): Promise<boolean> {
 /** Sets the default render endpoint's master mute state and returns the new state. */
 export async function setHostMasterMute(muted: boolean): Promise<boolean> {
   if (process.platform !== "win32") return false;
+  const helperOutput = await runWinHelper(["mute-set", muted ? "true" : "false"], 4000);
+  if (helperOutput !== null && MUTE_MARKER_PATTERN.test(helperOutput)) {
+    return parseMuteMarker(helperOutput);
+  }
   try {
     const output = await runEncodedPowerShell(buildMasterMuteScript("set", muted), 10000);
     return parseMuteMarker(output);
   } catch {
     return false;
   }
+}
+
+function interpretActionOutput(action: SystemActionType, output: string): { ok: boolean; message: string } {
+  if (action === "sas") {
+    if (output.includes(SAS_OK_MARKER)) {
+      return { ok: true, message: ACTION_SUCCESS_MESSAGES.sas };
+    }
+    return { ok: false, message: SAS_DENIED_MESSAGE };
+  }
+
+  if (output.includes(ACTION_OK_MARKER)) {
+    return { ok: true, message: ACTION_SUCCESS_MESSAGES[action] };
+  }
+  return { ok: false, message: `系统动作未成功执行: ${action}` };
 }
 
 /**
@@ -760,20 +806,16 @@ export async function runHostSystemAction(
       return { ok: true, message: ACTION_SUCCESS_MESSAGES[action] };
     }
 
+    if (action === "lock" || action === "show_desktop" || action === "sas" || action === "repair_ime") {
+      const helperOutput = await runWinHelper(["action", action], 8000);
+      if (helperOutput !== null) {
+        return interpretActionOutput(action, helperOutput);
+      }
+    }
+
     if (spec.powershell) {
       const output = await runEncodedPowerShell(spec.powershell, 12000);
-
-      if (action === "sas") {
-        if (output.includes(SAS_OK_MARKER)) {
-          return { ok: true, message: ACTION_SUCCESS_MESSAGES.sas };
-        }
-        return { ok: false, message: SAS_DENIED_MESSAGE };
-      }
-
-      if (output.includes(ACTION_OK_MARKER)) {
-        return { ok: true, message: ACTION_SUCCESS_MESSAGES[action] };
-      }
-      return { ok: false, message: `系统动作未成功执行: ${action}` };
+      return interpretActionOutput(action, output);
     }
 
     return { ok: false, message: `系统动作未配置执行方式: ${action}` };

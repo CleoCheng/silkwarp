@@ -347,18 +347,30 @@ export class HostAgentClient {
       headers["x-silkwarp-target-dir"] = encodeURIComponent(opts.targetDir);
     }
 
+    const uploadAgent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+
     return new Promise((resolve, reject) => {
       let settled = false;
+      let responseStarted = false;
+      let readStream: fs.ReadStream | null = null;
       const finish = (err: AgentClientError | null, value?: { ok: boolean; filename: string; path: string; size: number }) => {
         if (settled) return;
         settled = true;
+        readStream?.destroy();
+        uploadAgent.destroy();
         if (err) reject(err);
         else resolve(value as { ok: boolean; filename: string; path: string; size: number });
       };
 
       const req = http.request(
-        { host, port, method: "POST", path: "/api/agent/files/upload", headers, agent: false, timeout: timeoutMs },
+        { host, port, method: "POST", path: "/api/agent/files/upload", headers, agent: uploadAgent, timeout: timeoutMs },
         (res) => {
+          responseStarted = true;
+          const status = res.statusCode ?? 0;
+          if (status < 200 || status >= 300) {
+            readStream?.unpipe(req);
+            readStream?.destroy();
+          }
           const chunks: Buffer[] = [];
           res.on("data", (chunk: Buffer) => chunks.push(chunk));
           res.on("end", () => {
@@ -384,6 +396,7 @@ export class HostAgentClient {
         req.destroy(new AgentClientError("上传超时", 0, { code: "timeout" }));
       });
       req.on("error", (err: Error) => {
+        if (responseStarted) return;
         if (err instanceof AgentClientError) {
           finish(err);
           return;
@@ -391,10 +404,12 @@ export class HostAgentClient {
         finish(new AgentClientError(err.message || "上传失败", 0, { code: "network_error" }));
       });
 
-      const readStream = fs.createReadStream(localFilePath);
+      readStream = fs.createReadStream(localFilePath);
+      const stream = readStream;
       let transferred = 0;
       let progressError: Error | null = null;
-      readStream.on("data", (chunk: Buffer | string) => {
+      stream.on("data", (chunk: Buffer | string) => {
+        if (responseStarted) return;
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         transferred += buffer.length;
         if (opts.onProgress && !progressError) {
@@ -402,11 +417,12 @@ export class HostAgentClient {
             opts.onProgress({ transferred, total });
           } catch (err) {
             progressError = err instanceof Error ? err : new Error("progress_callback_error");
-            readStream.destroy(progressError);
+            stream.destroy(progressError);
           }
         }
       });
-      readStream.on("error", (err: Error) => {
+      stream.on("error", (err: Error) => {
+        if (responseStarted && !progressError) return;
         req.destroy();
         if (progressError) {
           finish(
@@ -418,7 +434,7 @@ export class HostAgentClient {
         }
         finish(new AgentClientError(err.message || "读取本地文件失败", 0, { code: "local_read_error" }));
       });
-      readStream.pipe(req);
+      stream.pipe(req);
     });
   }
 

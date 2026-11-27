@@ -1,6 +1,23 @@
 import { useEffect, useRef, useState } from "react";
-import { Activity, Copy, RefreshCw, Smartphone, UserPlus } from "lucide-react";
-import type { BootstrapConfig, EasyTierStatus, UserInfo } from "../../electron/types";
+import {
+  Activity,
+  AlertTriangle,
+  CheckCircle2,
+  Copy,
+  RefreshCw,
+  Smartphone,
+  Stethoscope,
+  UserPlus,
+  X,
+  XCircle,
+} from "lucide-react";
+import type {
+  BootstrapConfig,
+  DiagnosticSeverity,
+  EasyTierStatus,
+  NetworkDiagnosticsReport,
+  UserInfo,
+} from "../../electron/types";
 
 interface AdminViewProps {
   currentUser: UserInfo;
@@ -9,6 +26,7 @@ interface AdminViewProps {
   easytier: EasyTierStatus;
   onStartEasyTier: () => Promise<void>;
   onReconnectUdp: () => Promise<void>;
+  onDiagnoseNetwork: () => Promise<NetworkDiagnosticsReport>;
   onRelaunchAdmin: () => Promise<void>;
   onRefresh: () => Promise<void>;
   onListUsers: () => Promise<UserInfo[]>;
@@ -49,6 +67,7 @@ export function AdminView({
   easytier,
   onStartEasyTier,
   onReconnectUdp,
+  onDiagnoseNetwork,
   onRelaunchAdmin,
   onRefresh,
   onListUsers,
@@ -63,8 +82,30 @@ export function AdminView({
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<"member" | "admin">("member");
   const [reconnectingUdp, setReconnectingUdp] = useState(false);
+  const [diagnosing, setDiagnosing] = useState(false);
+  const [diagReport, setDiagReport] = useState<NetworkDiagnosticsReport | null>(null);
+  const [diagOpen, setDiagOpen] = useState(false);
   const [confirmDeleteUserId, setConfirmDeleteUserId] = useState<string>("");
   const confirmTimerRef = useRef<number | null>(null);
+
+  async function runDiagnostics() {
+    setDiagnosing(true);
+    setDiagOpen(true);
+    try {
+      const report = await onDiagnoseNetwork();
+      setDiagReport(report);
+    } catch (err) {
+      notify(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDiagnosing(false);
+    }
+  }
+
+  function renderSeverityIcon(severity: DiagnosticSeverity) {
+    if (severity === "ok") return <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />;
+    if (severity === "warn") return <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />;
+    return <XCircle className="w-4 h-4 text-rose-400 shrink-0" />;
+  }
 
   async function reload() {
     if (currentUser.role !== "admin") return;
@@ -141,7 +182,7 @@ export function AdminView({
               <div className="text-xs text-slate-400">本机虚拟 IP：{easytier.meshIp || "-"}</div>
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {easytier.needsElevation && (
               <button
                 type="button"
@@ -162,6 +203,15 @@ export function AdminView({
                 启动虚拟网卡
               </button>
             )}
+            <button
+              type="button"
+              disabled={diagnosing}
+              onClick={() => void runDiagnostics()}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-sky-500/40 bg-sky-500/10 px-3 py-1.5 text-xs font-semibold text-sky-200 hover:bg-sky-500/20 disabled:opacity-50"
+            >
+              <Stethoscope className="w-3.5 h-3.5" />
+              {diagnosing ? "体检中..." : "链路体检"}
+            </button>
             {easytier.running && (
               <button
                 type="button"
@@ -169,7 +219,10 @@ export function AdminView({
                 onClick={() => {
                   setReconnectingUdp(true);
                   void onReconnectUdp()
-                    .then(() => notify("已重新触发纯 UDP 直连协商"))
+                    .then(() => {
+                      notify("已重新触发纯 UDP 直连协商");
+                      if (diagOpen) void runDiagnostics();
+                    })
                     .catch((e) => notify(e instanceof Error ? e.message : String(e)))
                     .finally(() => setReconnectingUdp(false));
                 }}
@@ -193,6 +246,141 @@ export function AdminView({
             </button>
           </div>
         </div>
+
+        {diagOpen && (
+          <div className="p-4 border-b border-edge bg-obsidian/70 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-slate-100">链路与 IPv6 直连体检报告</span>
+                {diagReport && (
+                  <span
+                    className={`px-2 py-0.5 rounded-full text-[11px] font-semibold ${
+                      diagReport.overall === "excellent"
+                        ? "bg-emerald-500/15 text-emerald-300"
+                        : diagReport.overall === "good"
+                          ? "bg-sky-500/15 text-sky-300"
+                          : "bg-rose-500/15 text-rose-300"
+                    }`}
+                  >
+                    {diagReport.overall === "excellent"
+                      ? "链路极佳"
+                      : diagReport.overall === "good"
+                        ? "链路良好"
+                        : "需排查优化"}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2 text-[11px] text-slate-400">
+                {diagReport && <span>检测于 {new Date(diagReport.checkedAt).toLocaleTimeString()}</span>}
+                <button
+                  type="button"
+                  onClick={() => setDiagOpen(false)}
+                  className="p-1 rounded-lg hover:bg-panelHover text-slate-400 hover:text-slate-200"
+                  title="收起体检报告"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </div>
+
+            {!diagReport ? (
+              <div className="text-xs text-slate-400 py-2">正在检测本机 NAT、公网 IPv6 与对端链路协议...</div>
+            ) : (
+              <>
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 text-xs">
+                  <div className="rounded-xl border border-edge bg-panel px-3 py-2">
+                    <div className="text-[11px] text-slate-400">本机 NAT 类型</div>
+                    <div className="font-mono font-semibold text-slate-100 mt-0.5">{diagReport.localNatType}</div>
+                  </div>
+                  <div className="rounded-xl border border-edge bg-panel px-3 py-2">
+                    <div className="text-[11px] text-slate-400">公网 IPv6 直连</div>
+                    <div
+                      className={`font-semibold mt-0.5 ${
+                        diagReport.ipv6GlobalReady ? "text-emerald-300" : "text-amber-300"
+                      }`}
+                    >
+                      {diagReport.ipv6GlobalReady
+                        ? `已就绪 (${diagReport.ipv6InterfaceCount})`
+                        : "未检测到全局 IPv6"}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-edge bg-panel px-3 py-2">
+                    <div className="text-[11px] text-slate-400">P2P 直连设备</div>
+                    <div className="font-semibold text-slate-100 mt-0.5">
+                      {diagReport.p2pCount} 直连 / {diagReport.relayCount} 中转
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-edge bg-panel px-3 py-2">
+                    <div className="text-[11px] text-slate-400">传输协议健康</div>
+                    <div
+                      className={`font-semibold mt-0.5 ${
+                        diagReport.tcpFallbackCount > 0 ? "text-rose-300" : "text-emerald-300"
+                      }`}
+                    >
+                      {diagReport.tcpFallbackCount > 0
+                        ? `${diagReport.tcpFallbackCount} 路回落为 TCP`
+                        : "纯 UDP 低延迟"}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  {diagReport.checks.map((item) => (
+                    <div
+                      key={item.id}
+                      className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-edge bg-panel/80 px-3 py-2 text-xs"
+                    >
+                      <div className="flex items-start gap-2 min-w-0">
+                        {renderSeverityIcon(item.severity)}
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-semibold text-slate-200">{item.label}</span>
+                            <span className="text-slate-300">{item.summary}</span>
+                          </div>
+                          <div className="text-[11px] text-slate-400 mt-0.5">{item.detail}</div>
+                        </div>
+                      </div>
+                      {item.action === "reconnect_udp" && easytier.running && (
+                        <button
+                          type="button"
+                          disabled={reconnectingUdp}
+                          onClick={() => {
+                            setReconnectingUdp(true);
+                            void onReconnectUdp()
+                              .then(() => runDiagnostics())
+                              .catch((e) => notify(e instanceof Error ? e.message : String(e)))
+                              .finally(() => setReconnectingUdp(false));
+                          }}
+                          className="rounded-lg bg-amber-400 px-2.5 py-1 text-[11px] font-bold text-slate-950 shrink-0"
+                        >
+                          立即重建纯 UDP
+                        </button>
+                      )}
+                      {item.action === "relaunch_admin" && easytier.needsElevation && (
+                        <button
+                          type="button"
+                          onClick={() => void onRelaunchAdmin().catch((e) => notify(e instanceof Error ? e.message : String(e)))}
+                          className="rounded-lg bg-amber-400 px-2.5 py-1 text-[11px] font-bold text-slate-950 shrink-0"
+                        >
+                          一键授权启用
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+
+                {diagReport.recommendations.length > 0 && (
+                  <div className="rounded-xl border border-edge bg-panel/60 px-3 py-2 text-[11px] text-slate-300 space-y-1">
+                    <div className="font-semibold text-sky-300">优化建议</div>
+                    {diagReport.recommendations.map((rec, i) => (
+                      <div key={i}>• {rec}</div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
 
         <div className="overflow-x-auto">
           <table className="w-full text-left text-xs">
