@@ -347,6 +347,10 @@ export class WindowTracker {
         { windowsHide: true, stdio: ["pipe", "pipe", "ignore"] },
       );
 
+      // Broken pipes during teardown dispatch async `error` events on next tick.
+      this.child.stdin?.on("error", () => {});
+      this.child.stdout?.on("error", () => {});
+
       this.child.stdout?.on("data", (chunk: Buffer) => {
         this.stdoutBuffer += chunk.toString("utf-8");
         this.drainLines();
@@ -424,13 +428,23 @@ export class WindowTracker {
     this.writeCommand("FOCUS");
   }
 
-  private writeCommand(cmd: string): void {
-    if (!this.child || this.child.killed || !this.child.stdin?.writable) return;
+  private safeWriteStdin(child: ChildProcess | null, payload: string, endAfter = false): void {
+    if (!child || child.killed || child.exitCode !== null || child.signalCode !== null) return;
+    const stdin = child.stdin;
+    if (!stdin || stdin.destroyed || stdin.writableEnded || !stdin.writable) return;
     try {
-      this.child.stdin.write(`${cmd}\n`);
+      stdin.write(payload, () => {});
+      if (endAfter && !stdin.destroyed && !stdin.writableEnded) {
+        stdin.end();
+      }
     } catch {
-      // helper already gone; exit callback will clean up
+      // helper already gone; async pipe errors are also swallowed on stdin error listener
     }
+  }
+
+  private writeCommand(cmd: string): void {
+    if (this.stopped) return;
+    this.safeWriteStdin(this.child, `${cmd}\n`, false);
   }
 
   stop(): void {
@@ -442,23 +456,17 @@ export class WindowTracker {
     this.child = null;
     if (!child) return;
 
-    try {
-      child.stdin?.write("QUIT\n");
-    } catch {
-      // ignore
-    }
-    try {
-      child.stdin?.end();
-    } catch {
-      // ignore
-    }
-    child.stdout?.removeAllListeners();
+    this.safeWriteStdin(child, "QUIT\n", true);
+    child.stdout?.removeAllListeners("data");
     child.removeAllListeners("exit");
     child.removeAllListeners("error");
+    child.on("error", () => {});
 
     const killTimer = setTimeout(() => {
       try {
-        if (!child.killed) child.kill();
+        if (!child.killed && child.exitCode === null && child.signalCode === null) {
+          child.kill();
+        }
       } catch {
         // ignore
       }

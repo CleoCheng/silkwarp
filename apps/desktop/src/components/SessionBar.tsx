@@ -683,7 +683,9 @@ export function SessionBar() {
   const isFullscreen = preset.displayMode === "fullscreen";
   const cappedByRelay =
     preset.adaptiveRelayCap &&
-    (state.effectivePreset.fps < preset.fps || state.effectivePreset.bitrateMbps < preset.bitrateMbps);
+    (state.effectivePreset.fps < preset.fps ||
+      state.effectivePreset.bitrateMbps < preset.bitrateMbps ||
+      state.effectivePreset.resolution !== preset.resolution);
 
   const statusDot = state.reconnecting ? (
     <span className={`h-2 w-2 rounded-full ${pulse ? "bg-amber-300" : "bg-amber-500/40"} transition-colors`} />
@@ -737,7 +739,7 @@ export function SessionBar() {
           {cappedByRelay && (
             <span
               className="rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[9px] font-bold text-amber-200"
-              title={`当前已自动调整为 ${state.effectivePreset.fps}FPS / ${state.effectivePreset.bitrateMbps}Mbps 保障流畅`}
+              title={`当前智能稳帧：${state.effectivePreset.resolution.replace("x", "×")} · ${state.effectivePreset.fps}FPS · ${state.effectivePreset.bitrateMbps}Mbps`}
             >
               智能稳帧
             </span>
@@ -1045,6 +1047,12 @@ export function SessionBar() {
                 onChange={(absoluteMouse) => patchOptions({ absoluteMouse })}
                 label="绝对鼠标"
                 hint={preset.absoluteMouse ? "桌面定位" : "相对游戏"}
+              />
+              <Toggle
+                checked={preset.adaptiveRelayCap}
+                onChange={(adaptiveRelayCap) => patchOptions({ adaptiveRelayCap })}
+                label="智能稳帧"
+                hint="中继/弱网自动调优码率防卡顿"
               />
             </div>
 

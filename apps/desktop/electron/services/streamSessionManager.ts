@@ -283,6 +283,7 @@ export class StreamSessionManager {
     this.moonlight = child;
     this.stderrTail = [];
 
+    child.stderr?.on("error", () => {});
     child.stderr?.on("data", (chunk: Buffer) => {
       const lines = chunk
         .toString("utf-8")
@@ -643,11 +644,12 @@ export class StreamSessionManager {
     // An explicit user override of the relay guardrail (raising fps/bitrate
     // above the cap) disables it unless the caller re-enables it in the same
     // patch. Re-sending an already-high value is not a raise.
+    const activeCapBitrate = this.active?.effectivePreset.bitrateMbps ?? 8;
     const raisesFps =
       typeof patch.fps === "number" && patch.fps > 60 && patch.fps > current.fps;
     const raisesBitrate =
       typeof patch.bitrateMbps === "number" &&
-      patch.bitrateMbps > 15 &&
+      patch.bitrateMbps > activeCapBitrate &&
       patch.bitrateMbps > current.bitrateMbps;
     if ((raisesFps || raisesBitrate) && patch.adaptiveRelayCap === undefined) {
       merged.adaptiveRelayCap = false;
@@ -1258,7 +1260,11 @@ export class StreamSessionManager {
     const nextEffective = computeEffectivePreset(active.preset, nextRoute, this.buildLinkQuality(active));
     const degraded =
       nextEffective.bitrateMbps < active.effectivePreset.bitrateMbps ||
-      nextEffective.fps < active.effectivePreset.fps;
+      nextEffective.fps < active.effectivePreset.fps ||
+      (nextEffective.resolution !== active.effectivePreset.resolution &&
+        (nextRoute.trim().toLowerCase().startsWith("relay") ||
+          (nextLoss ?? 0) >= 1 ||
+          (nextLatency ?? 0) >= 60));
 
     if (degraded) {
       this.degradedTicks += 1;

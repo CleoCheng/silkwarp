@@ -264,6 +264,9 @@ export class EasyTierManager {
       { cwd: dir, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
     );
     this.proc = child;
+    child.stdout?.on("error", () => {});
+    child.stderr?.on("error", () => {});
+    child.stdout?.resume();
 
     child.stderr?.on("data", (chunk: Buffer) => {
       const msg = chunk.toString("utf-8").trim();

@@ -7,6 +7,7 @@ const {
   DEFAULT_STREAM_PRESET,
   buildMoonlightSpawnEnv,
   buildMoonlightStreamArgs,
+  capResolutionForBandwidth,
   computeEffectivePreset,
   isDegradedLink,
   isTcpOnlyTunnel,
@@ -87,29 +88,34 @@ test("resolvePacketSize: p2p / relay defaults and explicit overrides", () => {
   assert.equal(resolvePacketSize({ ...preset, packetSize: 9999 }, "p2p"), 1320);
 });
 
-test("computeEffectivePreset: relay guardrail caps 120fps/35Mbps to 60fps/15Mbps", () => {
-  const preset = normalizeStreamPreset({ fps: 120, bitrateMbps: 35, adaptiveRelayCap: true });
+test("computeEffectivePreset: relay guardrail caps 120fps/35Mbps to 1080p/60fps/8Mbps", () => {
+  const preset = normalizeStreamPreset({ resolution: "2560x1440", fps: 120, bitrateMbps: 35, adaptiveRelayCap: true });
   const relayed = computeEffectivePreset(preset, "relay(2)");
+  assert.equal(relayed.resolution, "1920x1080");
   assert.equal(relayed.fps, 60);
-  assert.equal(relayed.bitrateMbps, 15);
+  assert.equal(relayed.bitrateMbps, 8);
   // The persisted preset must not be mutated.
+  assert.equal(preset.resolution, "2560x1440");
   assert.equal(preset.fps, 120);
   assert.equal(preset.bitrateMbps, 35);
 
   const cappedOff = computeEffectivePreset({ ...preset, adaptiveRelayCap: false }, "relay(2)");
+  assert.equal(cappedOff.resolution, "2560x1440");
   assert.equal(cappedOff.fps, 120);
   assert.equal(cappedOff.bitrateMbps, 35);
 
   const p2p = computeEffectivePreset(preset, "p2p");
+  assert.equal(p2p.resolution, "2560x1440");
   assert.equal(p2p.fps, 120);
   assert.equal(p2p.bitrateMbps, 35);
 });
 
 test("computeEffectivePreset: does not raise low fps/bitrate", () => {
-  const preset = normalizeStreamPreset({ fps: 30, bitrateMbps: 8, adaptiveRelayCap: true });
+  const preset = normalizeStreamPreset({ resolution: "1920x1080", fps: 30, bitrateMbps: 6, adaptiveRelayCap: true });
   const effective = computeEffectivePreset(preset, "relay");
+  assert.equal(effective.resolution, "1920x1080");
   assert.equal(effective.fps, 30);
-  assert.equal(effective.bitrateMbps, 8);
+  assert.equal(effective.bitrateMbps, 6);
 });
 
 test("resolveStreamAppTarget: prefers Virtual Display, falls back to Desktop", () => {
@@ -157,13 +163,14 @@ test("buildMoonlightStreamArgs: default low-latency windowed P2P session", () =>
   assert.equal(args.lastIndexOf("stream"), args.length - 3);
 });
 
-test("buildMoonlightStreamArgs: relay session uses packet-size 1024 and capped params", () => {
+test("buildMoonlightStreamArgs: relay session uses packet-size 1024 and 8Mbps capped params", () => {
   const preset = normalizeStreamPreset();
   const args = buildMoonlightStreamArgs("10.144.0.12", preset, "relay(2)", "Desktop");
   const flagValue = (flag) => args[args.indexOf(flag) + 1];
+  assert.equal(flagValue("--resolution"), "1920x1080");
   assert.equal(flagValue("--packet-size"), "1024");
   assert.equal(flagValue("--fps"), "60");
-  assert.equal(flagValue("--bitrate"), "15000");
+  assert.equal(flagValue("--bitrate"), "8000");
   assert.deepEqual(args.slice(-3), ["stream", "10.144.0.12", "Desktop"]);
 });
 
@@ -303,16 +310,28 @@ test("parseLossPercent & isTcpOnlyTunnel & isDegradedLink classify link health a
   assert.equal(isDegradedLink("relay(2)", { tunnel: "udp", latencyMs: 25, lossPercent: 0 }), true);
 });
 
-test("computeEffectivePreset & buildMoonlightStreamArgs adapt to TCP-only tunnels, jitter, and 60Hz panels", () => {
-  const highPreset = normalizeStreamPreset({ fps: 120, bitrateMbps: 35, adaptiveRelayCap: true });
+test("capResolutionForBandwidth & computeEffectivePreset adapt to TCP-only, relay, extreme loss, and 60Hz panels", () => {
+  assert.equal(capResolutionForBandwidth("2560x1440", 1920, 1200), "1920x1080");
+  assert.equal(capResolutionForBandwidth("3840x2160", 1920, 1200), "1920x1080");
+  assert.equal(capResolutionForBandwidth("2560x1600", 1920, 1200), "1920x1200");
+  assert.equal(capResolutionForBandwidth("1920x1080", 1920, 1200), "1920x1080");
+
+  const highPreset = normalizeStreamPreset({ resolution: "2560x1440", fps: 120, bitrateMbps: 35, adaptiveRelayCap: true });
 
   const tcpCap = computeEffectivePreset(highPreset, "p2p", { tunnel: "tcp", latencyMs: 2, lossPercent: 0 });
+  assert.equal(tcpCap.resolution, "1920x1080");
   assert.equal(tcpCap.fps, 60);
-  assert.equal(tcpCap.bitrateMbps, 10);
+  assert.equal(tcpCap.bitrateMbps, 6);
 
   const highLatCap = computeEffectivePreset(highPreset, "p2p", { tunnel: "udp", latencyMs: 65, lossPercent: 0 });
+  assert.equal(highLatCap.resolution, "1920x1080");
   assert.equal(highLatCap.fps, 60);
-  assert.equal(highLatCap.bitrateMbps, 15);
+  assert.equal(highLatCap.bitrateMbps, 8);
+
+  const extremeCap = computeEffectivePreset(highPreset, "relay(2)", { tunnel: "udp", latencyMs: 160, lossPercent: 5 });
+  assert.equal(extremeCap.resolution, "1600x900");
+  assert.equal(extremeCap.fps, 30);
+  assert.equal(extremeCap.bitrateMbps, 6);
 
   const hzCap = computeEffectivePreset(highPreset, "p2p", {
     tunnel: "udp",
@@ -320,6 +339,7 @@ test("computeEffectivePreset & buildMoonlightStreamArgs adapt to TCP-only tunnel
     lossPercent: 0,
     clientRefreshHz: 59,
   });
+  assert.equal(hzCap.resolution, "2560x1440");
   assert.equal(hzCap.fps, 60);
   assert.equal(hzCap.bitrateMbps, 35);
 
@@ -329,8 +349,9 @@ test("computeEffectivePreset & buildMoonlightStreamArgs adapt to TCP-only tunnel
     lossPercent: 0,
   });
   const flagValue = (flag) => tcpArgs[tcpArgs.indexOf(flag) + 1];
+  assert.equal(flagValue("--resolution"), "1920x1080");
   assert.equal(flagValue("--packet-size"), "1024");
-  assert.equal(flagValue("--bitrate"), "10000");
+  assert.equal(flagValue("--bitrate"), "6000");
   assert.equal(flagValue("--fps"), "60");
   assert.ok(tcpArgs.includes("--frame-pacing"));
   assert.ok(!tcpArgs.includes("--no-frame-pacing"));

@@ -78,6 +78,13 @@ import type {
 
 const execFileAsync = promisify(execFile);
 
+process.on("uncaughtException", (err: NodeJS.ErrnoException) => {
+  if (err && (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED")) {
+    return;
+  }
+  console.error("Uncaught exception in SilkWarp main process:", err);
+});
+
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;

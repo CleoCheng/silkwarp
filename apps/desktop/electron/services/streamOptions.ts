@@ -279,6 +279,25 @@ export function resolvePacketSize(
 }
 
 /**
+ * Caps overly high stream resolutions on bandwidth-constrained relay/WAN links
+ * so encoders do not waste bits on 2K/4K detail at low bitrates.
+ */
+export function capResolutionForBandwidth(
+  resolution: string,
+  maxWidth: number,
+  maxHeight: number,
+): string {
+  const m = RESOLUTION_RE.exec(resolution);
+  if (!m) return resolution;
+  const [width, height] = resolution.split("x").map(Number);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || (width <= maxWidth && height <= maxHeight)) {
+    return resolution;
+  }
+  const scale = Math.min(maxWidth / width, maxHeight / height);
+  return normalizeWindowResolution(Math.round(width * scale), Math.round(height * scale));
+}
+
+/**
  * Applies the relay & link-quality guardrail. Only the effective command-line
  * preset is clamped; the user's persisted P2P preset is never mutated.
  */
@@ -296,19 +315,30 @@ export function computeEffectivePreset(
   const tcpOnly = isTcpOnlyTunnel(link?.tunnel);
   const isRelay = routeType.trim().toLowerCase().startsWith("relay");
 
+  if (loss >= 4 || latency >= 150) {
+    return {
+      ...preset,
+      resolution: capResolutionForBandwidth(preset.resolution, 1600, 1000),
+      fps: preset.fps > 30 ? 30 : preset.fps,
+      bitrateMbps: Math.min(preset.bitrateMbps, 6),
+    };
+  }
+
   if (tcpOnly || loss >= 2 || latency >= 100) {
     return {
       ...preset,
+      resolution: capResolutionForBandwidth(preset.resolution, 1920, 1200),
       fps: preset.fps > 60 ? 60 : preset.fps,
-      bitrateMbps: Math.min(preset.bitrateMbps, 10),
+      bitrateMbps: Math.min(preset.bitrateMbps, 6),
     };
   }
 
   if (isRelay || latency >= 60 || loss >= 1) {
     return {
       ...preset,
+      resolution: capResolutionForBandwidth(preset.resolution, 1920, 1200),
       fps: preset.fps > 60 ? 60 : preset.fps,
-      bitrateMbps: Math.min(preset.bitrateMbps, 15),
+      bitrateMbps: Math.min(preset.bitrateMbps, 8),
     };
   }
 
