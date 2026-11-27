@@ -965,22 +965,51 @@ export function SessionBar() {
 
             <div className="grid grid-cols-[1fr_auto] gap-1.5">
               <div>
-                <div className="mb-0.5 text-[9px] text-slate-500">刷新率</div>
+                <div className="mb-0.5 flex items-center justify-between text-[9px] text-slate-500">
+                  <span>刷新率</span>
+                  {state.clientDisplayRefreshHz && (
+                    <span className="font-mono text-sky-300/90">
+                      本机 {state.clientDisplayRefreshHz}Hz · 推荐{" "}
+                      {state.clientDisplayRefreshHz <= 65
+                        ? 60
+                        : state.clientDisplayRefreshHz >= 138 && state.clientDisplayRefreshHz <= 155
+                          ? 144
+                          : state.clientDisplayRefreshHz >= 115
+                            ? 120
+                            : 60}
+                    </span>
+                  )}
+                </div>
                 <div className="flex gap-1">
-                  {FPS_PRESETS.map((fps) => (
-                    <button
-                      key={fps}
-                      type="button"
-                      onClick={() => patchOptions({ fps })}
-                      className={`flex-1 rounded-md border px-1 py-1 text-[10px] font-semibold ${
-                        preset.fps === fps
-                          ? "border-sky-400/60 bg-sky-400/15 text-sky-200"
-                          : "border-white/10 bg-black/20 text-slate-300 hover:text-white"
-                      }`}
-                    >
-                      {fps}
-                    </button>
-                  ))}
+                  {FPS_PRESETS.map((fps) => {
+                    const matchedFps = !state.clientDisplayRefreshHz
+                      ? null
+                      : state.clientDisplayRefreshHz <= 65
+                        ? 60
+                        : state.clientDisplayRefreshHz >= 138 && state.clientDisplayRefreshHz <= 155
+                          ? 144
+                          : state.clientDisplayRefreshHz >= 115
+                            ? 120
+                            : 60;
+                    const isMatched = matchedFps === fps;
+                    return (
+                      <button
+                        key={fps}
+                        type="button"
+                        title={isMatched ? "与当前显示器刷新率 1:1 同步，鼠标滑动最顺滑" : undefined}
+                        onClick={() => patchOptions({ fps })}
+                        className={`flex-1 rounded-md border px-1 py-1 text-[10px] font-semibold ${
+                          preset.fps === fps
+                            ? "border-sky-400/60 bg-sky-400/15 text-sky-200"
+                            : isMatched
+                              ? "border-sky-400/35 bg-black/20 text-sky-200 hover:text-white"
+                              : "border-white/10 bg-black/20 text-slate-300 hover:text-white"
+                        }`}
+                      >
+                        {fps}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
               <div>
@@ -1033,7 +1062,8 @@ export function SessionBar() {
                 checked={preset.lowLatency}
                 onChange={(lowLatency) => patchOptions({ lowLatency })}
                 label="极速低延迟"
-                hint="减少画面延迟与拖影"
+                hint="25ms 内直连零排队渲染"
+                title="25ms 内直连启用 --no-vsync --no-frame-pacing 零缓冲；跨网波动或关闭时自动开启 VSync+帧平滑"
               />
               <Toggle
                 checked={preset.muteHostAudio}
@@ -1048,22 +1078,36 @@ export function SessionBar() {
                 hint="实时延迟/码率"
               />
               <Toggle
-                checked={preset.absoluteMouse}
-                onChange={(absoluteMouse) => patchOptions({ absoluteMouse })}
-                label="绝对鼠标"
-                hint={preset.absoluteMouse ? "桌面定位" : "相对游戏"}
-              />
-              <Toggle
                 checked={preset.adaptiveRelayCap}
                 onChange={(adaptiveRelayCap) => patchOptions({ adaptiveRelayCap })}
                 label="原画稳流"
-                hint="不降分辨率，中继/丢包自动稳码率防断流"
+                hint="不降分辨率，中继自动稳码率"
               />
-              <Toggle
-                checked={Boolean(preset.yuv444)}
-                onChange={(yuv444) => patchOptions({ yuv444 })}
-                label="原彩文本 4:4:4"
-                hint="代码/文字锐利原彩（需双方硬件支持，中继自动切回 4:2:0）"
+            </div>
+
+            <Toggle
+              checked={Boolean(preset.yuv444)}
+              onChange={(yuv444) => patchOptions({ yuv444 })}
+              label="原彩文本 4:4:4"
+              hint="代码/文字锐利原彩（需双方硬件支持，中继/丢包自动切回 4:2:0）"
+            />
+
+            <div>
+              <div className="mb-0.5 flex items-center justify-between gap-2 text-[9px] text-slate-500">
+                <span>鼠标模式</span>
+                <span className="truncate text-slate-400">
+                  {preset.absoluteMouse
+                    ? "桌面绝对 · 自由跨窗"
+                    : "极速原生 · 批量原始输入（按 Ctrl+Alt+Shift+Z 释放指针）"}
+                </span>
+              </div>
+              <Segmented<"absolute" | "relative">
+                value={preset.absoluteMouse ? "absolute" : "relative"}
+                options={[
+                  { value: "absolute", label: "桌面绝对" },
+                  { value: "relative", label: "极速原生 (高刷/电竞鼠)" },
+                ]}
+                onChange={(m) => patchOptions({ absoluteMouse: m === "absolute" })}
               />
             </div>
 

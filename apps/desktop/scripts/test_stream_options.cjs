@@ -15,9 +15,11 @@ const {
   normalizeWindowResolution,
   parseLossPercent,
   pickHostNativeDisplay,
+  pickOptimalFpsForDisplay,
   resolvePacketSize,
   resolveStreamAppTarget,
   resolveTargetResolution,
+  shouldUseVSyncPacing,
 } = require("../dist-electron/services/streamOptions.js");
 
 test("normalizeStreamPreset: undefined returns the full default preset", () => {
@@ -25,7 +27,7 @@ test("normalizeStreamPreset: undefined returns the full default preset", () => {
   assert.deepEqual(normalizeStreamPreset(null), DEFAULT_STREAM_PRESET);
   assert.equal(DEFAULT_STREAM_PRESET.displayMode, "windowed");
   assert.equal(DEFAULT_STREAM_PRESET.resolutionMode, "follow_client");
-  assert.equal(DEFAULT_STREAM_PRESET.fps, 60);
+  assert.equal(DEFAULT_STREAM_PRESET.fps, 120);
   assert.equal(DEFAULT_STREAM_PRESET.bitrateMbps, 20);
   assert.equal(DEFAULT_STREAM_PRESET.muteHostAudio, true);
   assert.equal(DEFAULT_STREAM_PRESET.lowLatency, true);
@@ -53,7 +55,7 @@ test("normalizeStreamPreset: migrates legacy 4-field presets", () => {
 test("normalizeStreamPreset: clamps and falls back on invalid values", () => {
   assert.equal(normalizeStreamPreset({ resolution: "not-a-resolution" }).resolution, "2560x1440");
   assert.equal(normalizeStreamPreset({ resolution: "12x34" }).resolution, "2560x1440");
-  assert.equal(normalizeStreamPreset({ fps: 75 }).fps, 60);
+  assert.equal(normalizeStreamPreset({ fps: 75 }).fps, 120);
   assert.equal(normalizeStreamPreset({ bitrateMbps: 2 }).bitrateMbps, 4);
   assert.equal(normalizeStreamPreset({ bitrateMbps: 500 }).bitrateMbps, 100);
   assert.equal(normalizeStreamPreset({ bitrateMbps: Number.NaN }).bitrateMbps, 20);
@@ -135,7 +137,7 @@ test("resolveStreamAppTarget: prefers Virtual Display, falls back to Desktop", (
   assert.equal(resolveStreamAppTarget("Desktop", ["Virtual Display"]), "Desktop");
 });
 
-test("buildMoonlightStreamArgs: low-latency P2P LAN skips frame-pacing while WAN P2P keeps frame-pacing and auto decoder", () => {
+test("buildMoonlightStreamArgs: low-latency sub-25ms P2P skips vsync+pacing while WAN >=25ms enables paired --vsync + --frame-pacing", () => {
   const preset = normalizeStreamPreset();
   const lanArgs = buildMoonlightStreamArgs("10.144.0.11", preset, "p2p", "Virtual Display", {
     tunnel: "udp",
@@ -147,7 +149,7 @@ test("buildMoonlightStreamArgs: low-latency P2P LAN skips frame-pacing while WAN
   assert.equal(lanVal("--display-mode"), "windowed");
   assert.equal(lanVal("--packet-size"), "1200");
   assert.equal(lanVal("--resolution"), "2560x1440");
-  assert.equal(lanVal("--fps"), "60");
+  assert.equal(lanVal("--fps"), "120");
   assert.equal(lanVal("--bitrate"), "20000");
   assert.equal(lanVal("--video-codec"), "HEVC");
   assert.equal(lanVal("--audio-config"), "stereo");
@@ -174,18 +176,30 @@ test("buildMoonlightStreamArgs: low-latency P2P LAN skips frame-pacing while WAN
   assert.deepEqual(lanArgs.slice(-3), ["stream", "10.144.0.11", "Virtual Display"]);
   assert.equal(lanArgs.lastIndexOf("stream"), lanArgs.length - 3);
 
+  // Near-LAN 15ms P2P still keeps zero-queue --no-vsync --no-frame-pacing
+  const nearP2pArgs = buildMoonlightStreamArgs("10.144.0.11", preset, "p2p", "Virtual Display", {
+    tunnel: "udp",
+    latencyMs: 15,
+    lossPercent: 0,
+  });
+  assert.ok(nearP2pArgs.includes("--no-vsync"));
+  assert.ok(nearP2pArgs.includes("--no-frame-pacing"));
+
+  // WAN >=25ms P2P enables BOTH --vsync and --frame-pacing so Moonlight actually runs pacing
   const wanArgs = buildMoonlightStreamArgs("10.144.0.11", preset, "p2p", "Virtual Display", {
     tunnel: "udp",
     latencyMs: 28,
     lossPercent: 0,
   });
+  assert.ok(wanArgs.includes("--vsync"));
   assert.ok(wanArgs.includes("--frame-pacing"));
+  assert.ok(!wanArgs.includes("--no-vsync"));
   assert.ok(!wanArgs.includes("--no-frame-pacing"));
   assert.equal(wanArgs[wanArgs.indexOf("--packet-size") + 1], "1024");
   assert.equal(wanArgs[wanArgs.indexOf("--video-decoder") + 1], "auto");
 });
 
-test("buildMoonlightStreamArgs: relay preserves native 2K resolution with 12Mbps WAN stability ceiling, 1024-byte packets and frame-pacing", () => {
+test("buildMoonlightStreamArgs: relay preserves native 2K resolution with 12Mbps WAN stability ceiling, 1024-byte packets and paired vsync+frame-pacing", () => {
   const preset = normalizeStreamPreset();
   const args = buildMoonlightStreamArgs("10.144.0.12", preset, "relay(2)", "Desktop");
   const flagValue = (flag) => args[args.indexOf(flag) + 1];
@@ -193,7 +207,9 @@ test("buildMoonlightStreamArgs: relay preserves native 2K resolution with 12Mbps
   assert.equal(flagValue("--packet-size"), "1024");
   assert.equal(flagValue("--fps"), "60");
   assert.equal(flagValue("--bitrate"), "12000");
+  assert.ok(args.includes("--vsync"));
   assert.ok(args.includes("--frame-pacing"));
+  assert.ok(!args.includes("--no-vsync"));
   assert.equal(flagValue("--video-decoder"), "auto");
   assert.deepEqual(args.slice(-3), ["stream", "10.144.0.12", "Desktop"]);
 });
@@ -316,11 +332,65 @@ test("pickHostNativeDisplay and resolveTargetResolution cover all 4 resolution m
   assert.deepEqual(fx, { resolution: "2560x1440", streamApp: "Desktop" });
 });
 
-test("buildMoonlightSpawnEnv injects SDL3/SDL2 IME UI suppression hints", () => {
+test("buildMoonlightSpawnEnv injects SDL3/SDL2 IME and mouse scaling hints", () => {
   const env = buildMoonlightSpawnEnv({ PATH: "C:\\Windows" });
   assert.equal(env.PATH, "C:\\Windows");
   assert.equal(env.SDL_IME_SHOW_UI, "0");
   assert.equal(env.SDL_IME_IMPLEMENTED_UI, "composition,candidates");
+  assert.equal(env.SDL_MOUSE_RELATIVE_SCALING, "0");
+  assert.equal(env.SDL_MOUSE_RELATIVE_SYSTEM_SCALE, "0");
+  assert.equal(env.SDL_MOUSE_FOCUS_CLICKTHROUGH, "1");
+});
+
+test("pickOptimalFpsForDisplay & shouldUseVSyncPacing & host refreshHz reuse guard", () => {
+  assert.equal(pickOptimalFpsForDisplay(60), 60);
+  assert.equal(pickOptimalFpsForDisplay(120), 120);
+  assert.equal(pickOptimalFpsForDisplay(144), 144);
+  assert.equal(pickOptimalFpsForDisplay(240), 120);
+  assert.equal(pickOptimalFpsForDisplay(null), 120);
+
+  const ll = normalizeStreamPreset({ lowLatency: true });
+  assert.equal(shouldUseVSyncPacing(ll, "local", { tunnel: "udp", latencyMs: 1, lossPercent: 0 }), false);
+  assert.equal(shouldUseVSyncPacing(ll, "p2p", { tunnel: "udp", latencyMs: 19, lossPercent: 0 }), false);
+  assert.equal(shouldUseVSyncPacing(ll, "p2p", { tunnel: "udp", latencyMs: 30, lossPercent: 0 }), true);
+  assert.equal(shouldUseVSyncPacing(ll, "relay", { tunnel: "udp", latencyMs: 15, lossPercent: 0 }), true);
+  assert.equal(shouldUseVSyncPacing(ll, "p2p", { tunnel: "tcp", latencyMs: 5, lossPercent: 0 }), true);
+  assert.equal(shouldUseVSyncPacing({ ...ll, lowLatency: false }, "local"), true);
+
+  const host60Hz = [
+    {
+      index: 0,
+      id: "\\\\.\\DISPLAY1",
+      deviceName: "\\\\.\\DISPLAY1",
+      friendlyName: "Host 60Hz",
+      width: 2560,
+      height: 1440,
+      refreshHz: 60,
+      x: 0,
+      y: 0,
+      isPrimary: true,
+      isVirtual: false,
+      active: true,
+    },
+  ];
+  assert.deepEqual(
+    resolveTargetResolution("follow_client", "2560x1440", {
+      clientSize: { width: 2560, height: 1440 },
+      hostDisplays: host60Hz,
+      availableApps: ["Desktop", "Virtual Display"],
+      targetFps: 120,
+    }),
+    { resolution: "2560x1440", streamApp: "Virtual Display" },
+  );
+  assert.deepEqual(
+    resolveTargetResolution("follow_client", "2560x1440", {
+      clientSize: { width: 2560, height: 1440 },
+      hostDisplays: host60Hz,
+      availableApps: ["Desktop", "Virtual Display"],
+      targetFps: 60,
+    }),
+    { resolution: "2560x1440", streamApp: "Desktop" },
+  );
 });
 
 test("parseLossPercent & isTcpOnlyTunnel & isLocalLanLink & isDegradedLink classify link health accurately", () => {
@@ -395,6 +465,7 @@ test("computeEffectivePreset preserves full resolution while shielding TCP, loss
   assert.equal(flagValue("--bitrate"), "12000");
   assert.equal(flagValue("--fps"), "60");
   assert.equal(flagValue("--video-decoder"), "auto");
+  assert.ok(tcpArgs.includes("--vsync"));
   assert.ok(tcpArgs.includes("--frame-pacing"));
   assert.ok(!tcpArgs.includes("--no-frame-pacing"));
   assert.ok(tcpArgs.includes("--no-hdr"));

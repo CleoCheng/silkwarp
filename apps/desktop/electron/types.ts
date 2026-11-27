@@ -149,6 +149,7 @@ export interface ActiveSessionState {
   resolvedApp: StreamAppTarget;
   availableApps: string[];
   clientDisplayResolution?: string;
+  clientDisplayRefreshHz?: number;
   hostDisplayResolution?: string;
   windowRect: WindowRect | null;
   reconnecting: boolean;

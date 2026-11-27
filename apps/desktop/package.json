@@ -1,6 +1,6 @@
 {
   "name": "silkwarp-desktop",
-  "version": "3.3.0",
+  "version": "3.4.0",
   "description": "SilkWarp — 低延迟远程桌面与高刷串流控制中心",
   "main": "dist-electron/main.js",
   "scripts": {

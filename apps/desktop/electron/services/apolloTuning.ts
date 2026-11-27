@@ -20,7 +20,10 @@ export const APOLLO_READONLY_CONFIG_KEYS = [
  * - `fec_percentage: 20`: preserves full FEC redundancy to recover WAN UDP burst drops
  * - `lan_encryption_mode: 0`: avoids double AES-GCM encryption over EasyTier's encrypted mesh
  * - `qsv_preset: "medium"`: keeps full visual quality on Intel QuickSync without "veryfast" degradation
- * - `minimum_fps_target: 0`: automatic VFR so static desktop views don't flood uplink
+ * - `minimum_fps_target: 60`: keeps desktop capture pacing warm so mouse sweeps never suffer VFR ramp-up stutter
+ * - `double_refreshrate: "enabled"`: doubles virtual display Hz vs stream FPS to halve DWM/DDA VBlank capture wait
+ * - `limit_framerate: "enabled"`: caps host capture rate to client target FPS to prevent encoder queue buildup on rapid mouse motion
+ * - `high_resolution_scrolling: "enabled"`: enables fine-grained mouse wheel and precision touchpad scrolling
  * - `hevc_mode: 0`: auto-enable hardware HEVC
  * - `ping_timeout: 20000`: tolerates WAN jitter without spurious disconnect popups
  * - `nvenc_intra_refresh: "enabled"` & `nvenc_latency_over_power: "enabled"`: heals WAN drops row-by-row on NVIDIA hosts
@@ -30,7 +33,10 @@ export const SILKWARP_APOLLO_TUNING = {
   fec_percentage: 20,
   lan_encryption_mode: 0,
   qsv_preset: "medium",
-  minimum_fps_target: 0,
+  minimum_fps_target: 60,
+  double_refreshrate: "enabled",
+  limit_framerate: "enabled",
+  high_resolution_scrolling: "enabled",
   hevc_mode: 0,
   ping_timeout: 20000,
   nvenc_intra_refresh: "enabled",

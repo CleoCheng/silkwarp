@@ -106,6 +106,7 @@ export class StreamSessionManager {
   private transferLastEmit = new Map<string, number>();
   private availableAppEntriesCache = new Map<string, { entries: ApolloAppEntry[]; expiresAt: number }>();
   private hostNativeResolutionCache = new Map<string, string>();
+  private hostNativeRefreshHzCache = new Map<string, number>();
   private recoveryBitrateCapMbps: number | null = null;
 
   constructor(
@@ -128,12 +129,30 @@ export class StreamSessionManager {
         }
       }
     }
+
+    const savedRefreshRates = this.store.get().hostDisplayRefreshRates;
+    if (savedRefreshRates && typeof savedRefreshRates === "object") {
+      for (const [devId, hz] of Object.entries(savedRefreshRates)) {
+        if (devId && typeof hz === "number" && Number.isFinite(hz) && hz > 0) {
+          this.hostNativeRefreshHzCache.set(devId, hz);
+        }
+      }
+    }
   }
 
   private rememberHostDisplayResolution(deviceId: string, resolution: string): void {
     if (!deviceId || !resolution) return;
     this.hostNativeResolutionCache.set(deviceId, resolution);
     this.store.setHostDisplayResolution?.(deviceId, resolution);
+  }
+
+  private rememberHostDisplayRefreshHz(deviceId: string, refreshHz?: number): void {
+    if (!deviceId || typeof refreshHz !== "number" || !Number.isFinite(refreshHz) || refreshHz <= 0) {
+      return;
+    }
+    const rounded = Math.round(refreshHz);
+    this.hostNativeRefreshHzCache.set(deviceId, rounded);
+    this.store.setHostDisplayRefreshHz?.(deviceId, rounded);
   }
 
   getState(): ActiveSessionState | null {
@@ -580,7 +599,9 @@ export class StreamSessionManager {
 
     const clientSize = this.getClientDisplaySize(null);
     const clientDisplayResolution = normalizeWindowResolution(clientSize.width, clientSize.height);
+    const clientDisplayRefreshHz = this.getClientDisplayRefreshHz(null);
     const cachedHostRes = this.hostNativeResolutionCache.get(device.id) || "";
+    const cachedHostHz = this.hostNativeRefreshHzCache.get(device.id) || 0;
     const cachedHostDisplays: DisplayMonitorInfo[] = cachedHostRes
       ? [
           {
@@ -590,6 +611,7 @@ export class StreamSessionManager {
             friendlyName: "Host Primary",
             width: Number(cachedHostRes.split("x")[0]) || 1920,
             height: Number(cachedHostRes.split("x")[1]) || 1080,
+            ...(cachedHostHz > 0 ? { refreshHz: cachedHostHz } : {}),
             x: 0,
             y: 0,
             isPrimary: true,
@@ -604,6 +626,7 @@ export class StreamSessionManager {
       hostDisplays: cachedHostDisplays,
       availableApps,
       currentStreamApp: basePreset.streamApp,
+      targetFps: basePreset.fps,
     });
 
     const preset = normalizeStreamPreset({
@@ -634,7 +657,7 @@ export class StreamSessionManager {
       tunnel: tunnelProto,
       latencyMs,
       lossPercent,
-      clientRefreshHz: this.getClientDisplayRefreshHz(null),
+      clientRefreshHz: clientDisplayRefreshHz,
       recoveryBitrateCapMbps: this.recoveryBitrateCapMbps,
     };
 
@@ -650,6 +673,7 @@ export class StreamSessionManager {
       resolvedApp,
       availableApps,
       clientDisplayResolution,
+      clientDisplayRefreshHz: clientDisplayRefreshHz ?? undefined,
       hostDisplayResolution: cachedHostRes || undefined,
       windowRect: null,
       reconnecting: false,
@@ -742,6 +766,7 @@ export class StreamSessionManager {
         const hostRes = normalizeWindowResolution(native.width, native.height);
         active.hostDisplayResolution = hostRes;
         this.rememberHostDisplayResolution(active.device.id, hostRes);
+        this.rememberHostDisplayRefreshHz(active.device.id, native.refreshHz);
         if (
           active.preset.resolutionMode === "follow_host" &&
           (hostRes !== active.preset.resolution || active.preset.streamApp !== "Desktop")
@@ -750,6 +775,21 @@ export class StreamSessionManager {
             ...active.preset,
             resolution: hostRes,
             streamApp: "Desktop",
+          });
+          this.store.update({ preset: updated });
+          active.preset = updated;
+          active.effectivePreset = computeEffectivePreset(updated, active.routeType, this.buildLinkQuality(active));
+          this.scheduleReload();
+        } else if (
+          active.preset.resolutionMode === "follow_client" &&
+          active.preset.streamApp === "Desktop" &&
+          native.refreshHz &&
+          native.refreshHz + 5 < active.preset.fps &&
+          active.availableApps.some((a) => a.trim().toLowerCase() === "virtual display")
+        ) {
+          const updated = normalizeStreamPreset({
+            ...active.preset,
+            streamApp: "Virtual Display",
           });
           this.store.update({ preset: updated });
           active.preset = updated;
@@ -1284,7 +1324,9 @@ export class StreamSessionManager {
       const clientSize = this.getClientDisplaySize(active.windowRect);
       const clientRes = normalizeWindowResolution(clientSize.width, clientSize.height);
       active.clientDisplayResolution = clientRes;
+      active.clientDisplayRefreshHz = this.getClientDisplayRefreshHz(active.windowRect) ?? active.clientDisplayRefreshHz;
       const cachedHostRes = this.hostNativeResolutionCache.get(active.device.id) || "";
+      const cachedHostHz = this.hostNativeRefreshHzCache.get(active.device.id) || 0;
       const hostDisplays: DisplayMonitorInfo[] =
         active.displays.length > 0
           ? active.displays
@@ -1297,6 +1339,7 @@ export class StreamSessionManager {
                   friendlyName: "Host Primary",
                   width: Number(cachedHostRes.split("x")[0]) || 1920,
                   height: Number(cachedHostRes.split("x")[1]) || 1080,
+                  ...(cachedHostHz > 0 ? { refreshHz: cachedHostHz } : {}),
                   x: 0,
                   y: 0,
                   isPrimary: true,
@@ -1311,6 +1354,7 @@ export class StreamSessionManager {
         selectedDisplayId: active.selectedDisplayId,
         availableApps: active.availableApps,
         currentStreamApp: active.preset.streamApp,
+        targetFps: current.fps,
       });
       return this.updateOptions({
         resolutionMode: "follow_client",

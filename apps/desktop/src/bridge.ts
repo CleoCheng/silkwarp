@@ -125,6 +125,7 @@ function buildPreviewSession(device: DeviceInfo): ActiveSessionState {
     resolvedApp: "Virtual Display",
     availableApps: ["Desktop", "Virtual Display"],
     clientDisplayResolution: "2560x1440",
+    clientDisplayRefreshHz: 144,
     hostDisplayResolution: "3840x2160",
     windowRect: null,
     reconnecting: false,
@@ -234,7 +235,7 @@ function previewPasswordGate(
 }
 
 let previewState: AppRuntimeState = {
-  appVersion: "3.3.0",
+  appVersion: "3.4.0",
   authenticated: false,
   user: null,
   bootstrap: null,

@@ -121,6 +121,11 @@ function buildMonitorInfo(
 
   const width = sanitizeDimension(source.width);
   const height = sanitizeDimension(source.height);
+  const rawRefreshHz = toFiniteNumber(source.refreshHz ?? source.refresh_hz);
+  const refreshHz =
+    rawRefreshHz !== null && rawRefreshHz > 0 && rawRefreshHz <= 1000
+      ? Math.round(rawRefreshHz)
+      : undefined;
   const x = sanitizeCoordinate(source.x);
   const y = sanitizeCoordinate(source.y);
   const rawIndex = toFiniteNumber(source.index);
@@ -144,6 +149,7 @@ function buildMonitorInfo(
     friendlyName,
     width,
     height,
+    ...(refreshHz !== undefined ? { refreshHz } : {}),
     x,
     y,
     isPrimary: Boolean(source.isPrimary ?? source.is_primary),
@@ -520,12 +526,17 @@ public static class SilkWarpDisplays
 
             int width = info.rcMonitor.Right - info.rcMonitor.Left;
             int height = info.rcMonitor.Bottom - info.rcMonitor.Top;
+            int refreshHz = 0;
             DEVMODEW devMode = new DEVMODEW();
             devMode.dmSize = (ushort)Marshal.SizeOf(typeof(DEVMODEW));
             if (EnumDisplaySettingsW(info.szDevice, -1, ref devMode) && devMode.dmPelsWidth > 0 && devMode.dmPelsHeight > 0)
             {
                 width = (int)devMode.dmPelsWidth;
                 height = (int)devMode.dmPelsHeight;
+                if (devMode.dmDisplayFrequency > 0 && devMode.dmDisplayFrequency <= 1000)
+                {
+                    refreshHz = (int)devMode.dmDisplayFrequency;
+                }
             }
             bool primary = (info.dwFlags & 1) == 1;
             bool virtualMonitor = IsVirtual(friendly, deviceId, driver);
@@ -540,6 +551,7 @@ public static class SilkWarpDisplays
             sb.Append("\"driver\":\"").Append(Escape(driver)).Append("\",");
             sb.Append("\"width\":").Append(width).Append(",");
             sb.Append("\"height\":").Append(height).Append(",");
+            sb.Append("\"refreshHz\":").Append(refreshHz).Append(",");
             sb.Append("\"x\":").Append(info.rcMonitor.Left).Append(",");
             sb.Append("\"y\":").Append(info.rcMonitor.Top).Append(",");
             sb.Append("\"isPrimary\":").Append(primary ? "true" : "false").Append(",");

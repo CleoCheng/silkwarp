@@ -77,6 +77,7 @@ const QUICK_PRESETS: Array<{ label: string; preset: Pick<StreamPreset, "resoluti
   { label: "流畅 · 1080P60", preset: { resolution: "1920x1080", fps: 60, bitrateMbps: 15 } },
   { label: "均衡 · 2K60", preset: { resolution: "2560x1440", fps: 60, bitrateMbps: 20 } },
   { label: "高刷 · 2K120", preset: { resolution: "2560x1440", fps: 120, bitrateMbps: 35 } },
+  { label: "丝滑 · 2K144", preset: { resolution: "2560x1440", fps: 144, bitrateMbps: 40 } },
   { label: "原画 · 4K60", preset: { resolution: "3840x2160", fps: 60, bitrateMbps: 60 } },
 ];
 
@@ -651,6 +652,32 @@ export function DevicesView({
                   onClick={() => updatePresetSafe({ ...preset, streamApp: m.value })}
                   className={`rounded-md px-2 py-0.5 font-semibold transition-colors ${
                     preset.streamApp === m.value
+                      ? "bg-sky-500/20 text-sky-300"
+                      : "text-slate-400 hover:text-slate-100"
+                  }`}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div
+            className="flex items-center gap-1.5"
+            title="桌面绝对适合自由跨窗办公；1000Hz+ 电竞鼠标若拖动微卡，切换「极速原生」可批量传输原始输入（按 Ctrl+Alt+Shift+Z 释放指针）"
+          >
+            <span className="text-slate-500">鼠标模式</span>
+            <div className="flex rounded-lg border border-edge bg-obsidian/70 p-0.5">
+              {([
+                { value: true, label: "桌面绝对" },
+                { value: false, label: "极速原生" },
+              ] as const).map((m) => (
+                <button
+                  key={String(m.value)}
+                  type="button"
+                  onClick={() => updatePresetSafe({ ...preset, absoluteMouse: m.value })}
+                  className={`rounded-md px-2 py-0.5 font-semibold transition-colors ${
+                    preset.absoluteMouse === m.value
                       ? "bg-sky-500/20 text-sky-300"
                       : "text-slate-400 hover:text-slate-100"
                   }`}

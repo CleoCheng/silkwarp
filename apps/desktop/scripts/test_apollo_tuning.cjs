@@ -35,9 +35,12 @@ test("buildOptimalApolloConfigPatch: strips readonly metadata (including vdispla
   assert.deepEqual(patch.changedKeys.sort(), [
     "amd_rc",
     "amd_usage",
+    "double_refreshrate",
     "fec_percentage",
     "hevc_mode",
+    "high_resolution_scrolling",
     "lan_encryption_mode",
+    "limit_framerate",
     "minimum_fps_target",
     "nvenc_intra_refresh",
     "nvenc_latency_over_power",
@@ -55,7 +58,10 @@ test("buildOptimalApolloConfigPatch: strips readonly metadata (including vdispla
   assert.equal(patch.nextConfig.fec_percentage, 20);
   assert.equal(patch.nextConfig.lan_encryption_mode, "0");
   assert.equal(patch.nextConfig.qsv_preset, "medium");
-  assert.equal(patch.nextConfig.minimum_fps_target, 0);
+  assert.equal(patch.nextConfig.minimum_fps_target, 60);
+  assert.equal(patch.nextConfig.double_refreshrate, "enabled");
+  assert.equal(patch.nextConfig.limit_framerate, "enabled");
+  assert.equal(patch.nextConfig.high_resolution_scrolling, "enabled");
   assert.equal(patch.nextConfig.hevc_mode, 0);
   assert.equal(patch.nextConfig.ping_timeout, "20000");
   assert.equal(patch.nextConfig.nvenc_intra_refresh, "enabled");
@@ -69,7 +75,10 @@ test("buildOptimalApolloConfigPatch: is idempotent even when Apollo returns stri
     fec_percentage: "20",
     lan_encryption_mode: "0",
     qsv_preset: SILKWARP_APOLLO_TUNING.qsv_preset,
-    minimum_fps_target: "0",
+    minimum_fps_target: "60",
+    double_refreshrate: "enabled",
+    limit_framerate: "enabled",
+    high_resolution_scrolling: "enabled",
     hevc_mode: "0",
     ping_timeout: "20000",
     nvenc_intra_refresh: "enabled",

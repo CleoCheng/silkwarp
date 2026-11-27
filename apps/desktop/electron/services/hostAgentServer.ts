@@ -23,6 +23,7 @@ export interface DisplayMonitorInfo {
   friendlyName: string;
   width: number;
   height: number;
+  refreshHz?: number;
   x: number;
   y: number;
   isPrimary: boolean;

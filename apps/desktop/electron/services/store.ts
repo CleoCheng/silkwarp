@@ -31,6 +31,7 @@ export interface PersistedState {
   autoLockOnDisconnect: boolean;
   savedDevicePasswords: Record<string, string>;
   hostDisplayResolutions: Record<string, string>;
+  hostDisplayRefreshRates: Record<string, number>;
 }
 
 function normalizeApiUrl(raw: unknown): string {
@@ -110,6 +111,7 @@ export class StateStore {
       autoLockOnDisconnect: false,
       savedDevicePasswords: {},
       hostDisplayResolutions: {},
+      hostDisplayRefreshRates: {},
     };
     try {
       if (!fs.existsSync(this.filePath)) {
@@ -141,6 +143,12 @@ export class StateStore {
           typeof parsed.hostDisplayResolutions === "object" &&
           !Array.isArray(parsed.hostDisplayResolutions)
             ? parsed.hostDisplayResolutions
+            : {},
+        hostDisplayRefreshRates:
+          parsed.hostDisplayRefreshRates &&
+          typeof parsed.hostDisplayRefreshRates === "object" &&
+          !Array.isArray(parsed.hostDisplayRefreshRates)
+            ? parsed.hostDisplayRefreshRates
             : {},
       };
       let needsSync = false;
@@ -257,6 +265,23 @@ export class StateStore {
       hostDisplayResolutions: {
         ...this.state.hostDisplayResolutions,
         [deviceId]: resolution,
+      },
+    });
+  }
+
+  getHostDisplayRefreshHz(deviceId: string): number {
+    const val = this.state.hostDisplayRefreshRates[deviceId];
+    return typeof val === "number" && Number.isFinite(val) && val > 0 ? val : 0;
+  }
+
+  setHostDisplayRefreshHz(deviceId: string, refreshHz: number): void {
+    if (!deviceId || !Number.isFinite(refreshHz) || refreshHz <= 0 || refreshHz > 1000) return;
+    const rounded = Math.round(refreshHz);
+    if (this.state.hostDisplayRefreshRates[deviceId] === rounded) return;
+    this.update({
+      hostDisplayRefreshRates: {
+        ...this.state.hostDisplayRefreshRates,
+        [deviceId]: rounded,
       },
     });
   }

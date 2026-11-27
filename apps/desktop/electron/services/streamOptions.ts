@@ -20,7 +20,7 @@ import type {
 export const DEFAULT_STREAM_PRESET: StreamPreset = {
   resolution: "2560x1440",
   resolutionMode: "follow_client",
-  fps: 60,
+  fps: 120,
   bitrateMbps: 20,
   codec: "hevc",
   displayMode: "windowed",
@@ -34,6 +34,44 @@ export const DEFAULT_STREAM_PRESET: StreamPreset = {
   captureSystemKeys: "fullscreen",
   packetSize: "auto",
 };
+
+/**
+ * Picks the cadence-matched FPS tier for a client display refresh rate so
+ * presentation avoids fractional pulldown judder (e.g. 144Hz -> 144fps).
+ */
+export function pickOptimalFpsForDisplay(
+  displayHz?: number | null,
+  fallback: StreamPreset["fps"] = 120,
+): StreamPreset["fps"] {
+  if (typeof displayHz !== "number" || !Number.isFinite(displayHz) || displayHz <= 0) {
+    return fallback;
+  }
+  if (displayHz <= 65) return 60;
+  if (displayHz >= 138 && displayHz <= 155) return 144;
+  if (displayHz >= 115) return 120;
+  return 60;
+}
+
+/**
+ * Determines whether Moonlight's VSync + frame-pacing pipeline should be active.
+ * In moonlight-qt (`session.cpp`), `enableFramePacing = enableVsync && framePacing`,
+ * so emitting `--no-vsync --frame-pacing` silently disables frame pacing. We keep
+ * zero-queue `--no-vsync --no-frame-pacing` for sub-25ms direct links and enable
+ * paired `--vsync --frame-pacing` on >=25ms WAN, degraded/relay links, or buffered mode.
+ */
+export function shouldUseVSyncPacing(
+  effective: StreamPreset,
+  routeType: string,
+  link?: StreamLinkQuality | null,
+): boolean {
+  if (!effective.lowLatency) return true;
+  if (isDegradedLink(routeType, link)) return true;
+  return (
+    typeof link?.latencyMs === "number" &&
+    Number.isFinite(link.latencyMs) &&
+    link.latencyMs >= 25
+  );
+}
 
 export interface StreamLinkQuality {
   tunnel?: string | null;
@@ -216,6 +254,7 @@ export function resolveTargetResolution(
     windowRect?: WindowRect | null;
     availableApps?: string[];
     currentStreamApp?: StreamAppTarget;
+    targetFps?: number;
   },
 ): { resolution: string; streamApp: StreamAppTarget } {
   const preferVirtual = (): StreamAppTarget => {
@@ -234,9 +273,12 @@ export function resolveTargetResolution(
       const native = pickHostNativeDisplay(ctx.hostDisplays ?? [], ctx.selectedDisplayId);
       const hostMatchesClient =
         native !== null && normalizeWindowResolution(native.width, native.height) === normalizedClient;
+      const hostRefreshSufficient =
+        native !== null &&
+        (!native.refreshHz || !ctx.targetFps || native.refreshHz + 5 >= ctx.targetFps);
       return {
         resolution: normalizedClient,
-        streamApp: hostMatchesClient ? "Desktop" : preferVirtual(),
+        streamApp: hostMatchesClient && hostRefreshSufficient ? "Desktop" : preferVirtual(),
       };
     }
     return { resolution: fallbackResolution, streamApp: preferVirtual() };
@@ -271,13 +313,16 @@ export function resolveTargetResolution(
 
 /**
  * Configures SDL3/SDL2 environment variables so the local client IME does not
- * hijack text input on the viewport window with a corner candidate box at (0,0).
+ * hijack text input and relative mouse scaling/clickthrough remain 1:1 on Windows DPI.
  */
 export function buildMoonlightSpawnEnv(baseEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return {
     ...(baseEnv ?? process.env),
     SDL_IME_SHOW_UI: "0",
     SDL_IME_IMPLEMENTED_UI: "composition,candidates",
+    SDL_MOUSE_RELATIVE_SCALING: "0",
+    SDL_MOUSE_RELATIVE_SYSTEM_SCALE: "0",
+    SDL_MOUSE_FOCUS_CLICKTHROUGH: "1",
   };
 }
 
@@ -387,7 +432,7 @@ export function buildMoonlightStreamArgs(
 ): string[] {
   const effective = computeEffectivePreset(preset, routeType, link);
   const packetSize = resolvePacketSize(effective, routeType, link);
-  const localLan = isLocalLanLink(routeType, link);
+  const useVSyncPacing = shouldUseVSyncPacing(effective, routeType, link);
   const codecMap: Record<StreamPreset["codec"], string> = {
     hevc: "HEVC",
     av1: "AV1",
@@ -419,16 +464,20 @@ export function buildMoonlightStreamArgs(
     effective.showPerfOverlay ? "--performance-overlay" : "--no-performance-overlay",
   ];
 
-  if (effective.lowLatency) {
+  if (useVSyncPacing) {
+    args.push("--vsync", "--frame-pacing");
+    if (effective.lowLatency) {
+      args.push("--no-game-optimization");
+    }
+    args.push("--video-decoder", "auto");
+  } else {
     args.push(
       "--no-vsync",
-      localLan ? "--no-frame-pacing" : "--frame-pacing",
+      "--no-frame-pacing",
       "--no-game-optimization",
       "--video-decoder",
       "auto",
     );
-  } else {
-    args.push("--vsync", "--frame-pacing", "--video-decoder", "auto");
   }
 
   args.push("stream", meshIp, resolvedApp);

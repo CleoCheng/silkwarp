@@ -252,6 +252,9 @@ test("listHostDisplays: enumerates at least one real display on Windows", { skip
     assert.equal(typeof display.index, "number");
     assert.equal(typeof display.id, "string");
     assert.ok(display.width >= 0 && display.height >= 0);
+    if (display.refreshHz !== undefined) {
+      assert.ok(Number.isInteger(display.refreshHz) && display.refreshHz > 0 && display.refreshHz <= 1000);
+    }
     assert.equal(typeof display.isPrimary, "boolean");
     assert.equal(typeof display.isVirtual, "boolean");
     assert.equal(typeof display.active, "boolean");

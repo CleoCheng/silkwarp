@@ -18,7 +18,7 @@ import { buildWindowTrackerHelperArgs, resolveWinHelperExe } from "./winHelper";
  *   builds and runs.
  */
 
-const POLL_INTERVAL_MS = 150;
+const POLL_INTERVAL_MS = 200;
 
 const VK_CONTROL = 0x11;
 const VK_MENU = 0x12;
@@ -222,7 +222,10 @@ function Send-Hotkey([int]$vk) {
 $lastSig = ''
 $exited = $false
 $eofSince = [DateTime]::MinValue
-$imeAppliedOnce = $false
+$lastTitleHwnd = [IntPtr]::Zero
+$lastTitleSyncUtc = [DateTime]::MinValue
+$lastImeHwnd = [IntPtr]::Zero
+$wasForeground = $false
 
 while (-not $exited) {
     $hwnd = [IntPtr]::Zero
@@ -269,9 +272,6 @@ while (-not $exited) {
     }
 
     if ($hwnd -ne [IntPtr]::Zero) {
-        if ($desiredTitle -ne '') {
-            [SwWin32]::EnsureWindowTitle($hwnd, $desiredTitle)
-        }
         $wr = New-Object SwWin32+RECT
         $cr = New-Object SwWin32+RECT
         if ([SwWin32]::GetWindowRect($hwnd, [ref]$wr) -and [SwWin32]::GetClientRect($hwnd, [ref]$cr)) {
@@ -281,10 +281,19 @@ while (-not $exited) {
                 $visible = [SwWin32]::IsWindowVisible($hwnd)
                 $minimized = [SwWin32]::IsIconic($hwnd)
                 $foreground = ([SwWin32]::GetForegroundWindow() -eq $hwnd)
-                if ($suppressLocalIme -and (-not $imeAppliedOnce -or $foreground)) {
-                    [SwWin32]::SuppressLocalIme($hwnd)
-                    $imeAppliedOnce = $true
+                if ($desiredTitle -ne '') {
+                    $nowUtc = [DateTime]::UtcNow
+                    if (($hwnd -ne $lastTitleHwnd) -or ((-not $foreground) -and ($nowUtc - $lastTitleSyncUtc).TotalSeconds -ge 10)) {
+                        [SwWin32]::EnsureWindowTitle($hwnd, $desiredTitle)
+                        $lastTitleHwnd = $hwnd
+                        $lastTitleSyncUtc = $nowUtc
+                    }
                 }
+                if ($suppressLocalIme -and (($hwnd -ne $lastImeHwnd) -or ((-not $wasForeground) -and $foreground))) {
+                    [SwWin32]::SuppressLocalIme($hwnd)
+                    $lastImeHwnd = $hwnd
+                }
+                $wasForeground = $foreground
                 $sig = "$($wr.Left),$($wr.Top),$width,$height,$($cr.Right),$($cr.Bottom),$visible,$minimized,$foreground"
                 if ($sig -ne $lastSig) {
                     $lastSig = $sig

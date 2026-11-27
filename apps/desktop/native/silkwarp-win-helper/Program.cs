@@ -403,12 +403,17 @@ namespace SilkWarpWinHelper
 
                 int width = info.rcMonitor.Right - info.rcMonitor.Left;
                 int height = info.rcMonitor.Bottom - info.rcMonitor.Top;
+                int refreshHz = 0;
                 Win32Native.DEVMODEW devMode = new Win32Native.DEVMODEW();
                 devMode.dmSize = (ushort)Marshal.SizeOf(typeof(Win32Native.DEVMODEW));
                 if (Win32Native.EnumDisplaySettingsW(info.szDevice, -1, ref devMode) && devMode.dmPelsWidth > 0 && devMode.dmPelsHeight > 0)
                 {
                     width = (int)devMode.dmPelsWidth;
                     height = (int)devMode.dmPelsHeight;
+                    if (devMode.dmDisplayFrequency > 0 && devMode.dmDisplayFrequency <= 1000)
+                    {
+                        refreshHz = (int)devMode.dmDisplayFrequency;
+                    }
                 }
 
                 bool primary = (info.dwFlags & 1) == 1;
@@ -424,6 +429,7 @@ namespace SilkWarpWinHelper
                 sb.Append("\"driver\":\"").Append(EscapeJson(driver)).Append("\",");
                 sb.Append("\"width\":").Append(width).Append(",");
                 sb.Append("\"height\":").Append(height).Append(",");
+                sb.Append("\"refreshHz\":").Append(refreshHz).Append(",");
                 sb.Append("\"x\":").Append(info.rcMonitor.Left).Append(",");
                 sb.Append("\"y\":").Append(info.rcMonitor.Top).Append(",");
                 sb.Append("\"isPrimary\":").Append(primary ? "true" : "false").Append(",");
@@ -561,7 +567,7 @@ namespace SilkWarpWinHelper
 
     internal static class WindowTrackerHelper
     {
-        private const int PollIntervalMs = 150;
+        private const int PollIntervalMs = 200;
         private const byte VkControl = 0x11;
         private const byte VkMenu = 0x12;
         private const byte VkShift = 0x10;
@@ -742,129 +748,160 @@ namespace SilkWarpWinHelper
             string lastSig = "";
             bool exited = false;
             DateTime eofSince = DateTime.MinValue;
-            bool imeAppliedOnce = false;
+            IntPtr lastTitleHwnd = IntPtr.Zero;
+            DateTime lastTitleSyncUtc = DateTime.MinValue;
+            IntPtr lastImeHwnd = IntPtr.Zero;
+            bool wasForeground = false;
 
-            while (!exited)
+            Process targetProc = null;
+            try
             {
-                IntPtr hwnd = IntPtr.Zero;
-                try
+                targetProc = Process.GetProcessById(targetPid);
+            }
+            catch
+            {
+                EmitJson("{\"type\":\"exit\"}");
+                return 0;
+            }
+
+            try
+            {
+                while (!exited)
                 {
-                    using (Process proc = Process.GetProcessById(targetPid))
+                    IntPtr hwnd = IntPtr.Zero;
+                    try
                     {
-                        if (proc.HasExited)
+                        targetProc.Refresh();
+                        if (targetProc.HasExited)
                         {
                             EmitJson("{\"type\":\"exit\"}");
                             break;
                         }
-                        hwnd = proc.MainWindowHandle;
+                        hwnd = targetProc.MainWindowHandle;
                     }
-                }
-                catch
-                {
-                    EmitJson("{\"type\":\"exit\"}");
-                    break;
-                }
-
-                string cmd;
-                while (InputQueue.TryDequeue(out cmd))
-                {
-                    string upper = (cmd ?? "").Trim().ToUpperInvariant();
-                    if (upper == "QUIT")
+                    catch
                     {
-                        exited = true;
+                        EmitJson("{\"type\":\"exit\"}");
                         break;
                     }
-                    if (upper == "FOCUS")
-                    {
-                        if (hwnd != IntPtr.Zero)
-                        {
-                            Win32Native.SetForegroundWindow(hwnd);
-                        }
-                        continue;
-                    }
-                    if (upper.StartsWith("HOTKEY:"))
-                    {
-                        string action = upper.Substring(7).Trim();
-                        if (hwnd != IntPtr.Zero)
-                        {
-                            Win32Native.SetForegroundWindow(hwnd);
-                            Thread.Sleep(60);
-                        }
-                        int vk = ResolveHotkeyVk(action);
-                        if (vk > 0)
-                        {
-                            SendHotkey(vk);
-                        }
-                    }
-                }
-                if (exited) break;
 
-                if (InputEof && InputQueue.IsEmpty)
-                {
-                    if (eofSince == DateTime.MinValue) eofSince = DateTime.UtcNow;
-                    if ((DateTime.UtcNow - eofSince).TotalSeconds >= 5.0) break;
-                }
-                else
-                {
-                    eofSince = DateTime.MinValue;
-                }
-
-                if (hwnd != IntPtr.Zero)
-                {
-                    if (!string.IsNullOrEmpty(desiredTitle))
+                    string cmd;
+                    while (InputQueue.TryDequeue(out cmd))
                     {
-                        EnsureWindowTitle(hwnd, desiredTitle);
-                    }
-                    Win32Native.RECT wr;
-                    Win32Native.RECT cr;
-                    if (Win32Native.GetWindowRect(hwnd, out wr) && Win32Native.GetClientRect(hwnd, out cr))
-                    {
-                        int width = wr.Right - wr.Left;
-                        int height = wr.Bottom - wr.Top;
-                        if (width > 0 && height > 0)
+                        string upper = (cmd ?? "").Trim().ToUpperInvariant();
+                        if (upper == "QUIT")
                         {
-                            bool visible = Win32Native.IsWindowVisible(hwnd);
-                            bool minimized = Win32Native.IsIconic(hwnd);
-                            bool foreground = (Win32Native.GetForegroundWindow() == hwnd);
-                            if (suppressLocalIme && (!imeAppliedOnce || foreground))
+                            exited = true;
+                            break;
+                        }
+                        if (upper == "FOCUS")
+                        {
+                            if (hwnd != IntPtr.Zero)
                             {
-                                SuppressLocalIme(hwnd);
-                                imeAppliedOnce = true;
+                                Win32Native.SetForegroundWindow(hwnd);
                             }
-
-                            string sig = string.Concat(
-                                wr.Left.ToString(), ",",
-                                wr.Top.ToString(), ",",
-                                width.ToString(), ",",
-                                height.ToString(), ",",
-                                cr.Right.ToString(), ",",
-                                cr.Bottom.ToString(), ",",
-                                visible ? "1" : "0", ",",
-                                minimized ? "1" : "0", ",",
-                                foreground ? "1" : "0"
-                            );
-                            if (!string.Equals(sig, lastSig, StringComparison.Ordinal))
+                            continue;
+                        }
+                        if (upper.StartsWith("HOTKEY:"))
+                        {
+                            string action = upper.Substring(7).Trim();
+                            if (hwnd != IntPtr.Zero)
                             {
-                                lastSig = sig;
-                                StringBuilder json = new StringBuilder();
-                                json.Append("{\"type\":\"rect\",");
-                                json.Append("\"x\":").Append(wr.Left).Append(",");
-                                json.Append("\"y\":").Append(wr.Top).Append(",");
-                                json.Append("\"width\":").Append(width).Append(",");
-                                json.Append("\"height\":").Append(height).Append(",");
-                                json.Append("\"clientWidth\":").Append(cr.Right).Append(",");
-                                json.Append("\"clientHeight\":").Append(cr.Bottom).Append(",");
-                                json.Append("\"visible\":").Append(visible ? "true" : "false").Append(",");
-                                json.Append("\"minimized\":").Append(minimized ? "true" : "false").Append(",");
-                                json.Append("\"foreground\":").Append(foreground ? "true" : "false");
-                                json.Append("}");
-                                EmitJson(json.ToString());
+                                Win32Native.SetForegroundWindow(hwnd);
+                                Thread.Sleep(60);
+                            }
+                            int vk = ResolveHotkeyVk(action);
+                            if (vk > 0)
+                            {
+                                SendHotkey(vk);
                             }
                         }
                     }
-                }
+                    if (exited) break;
 
-                Thread.Sleep(PollIntervalMs);
+                    if (InputEof && InputQueue.IsEmpty)
+                    {
+                        if (eofSince == DateTime.MinValue) eofSince = DateTime.UtcNow;
+                        if ((DateTime.UtcNow - eofSince).TotalSeconds >= 5.0) break;
+                    }
+                    else
+                    {
+                        eofSince = DateTime.MinValue;
+                    }
+
+                    if (hwnd != IntPtr.Zero)
+                    {
+                        Win32Native.RECT wr;
+                        Win32Native.RECT cr;
+                        if (Win32Native.GetWindowRect(hwnd, out wr) && Win32Native.GetClientRect(hwnd, out cr))
+                        {
+                            int width = wr.Right - wr.Left;
+                            int height = wr.Bottom - wr.Top;
+                            if (width > 0 && height > 0)
+                            {
+                                bool visible = Win32Native.IsWindowVisible(hwnd);
+                                bool minimized = Win32Native.IsIconic(hwnd);
+                                bool foreground = (Win32Native.GetForegroundWindow() == hwnd);
+
+                                if (!string.IsNullOrEmpty(desiredTitle))
+                                {
+                                    DateTime nowUtc = DateTime.UtcNow;
+                                    if (hwnd != lastTitleHwnd || (!foreground && (nowUtc - lastTitleSyncUtc).TotalSeconds >= 10.0))
+                                    {
+                                        EnsureWindowTitle(hwnd, desiredTitle);
+                                        lastTitleHwnd = hwnd;
+                                        lastTitleSyncUtc = nowUtc;
+                                    }
+                                }
+
+                                if (suppressLocalIme && (hwnd != lastImeHwnd || (!wasForeground && foreground)))
+                                {
+                                    SuppressLocalIme(hwnd);
+                                    lastImeHwnd = hwnd;
+                                }
+                                wasForeground = foreground;
+
+                                string sig = string.Concat(
+                                    wr.Left.ToString(), ",",
+                                    wr.Top.ToString(), ",",
+                                    width.ToString(), ",",
+                                    height.ToString(), ",",
+                                    cr.Right.ToString(), ",",
+                                    cr.Bottom.ToString(), ",",
+                                    visible ? "1" : "0", ",",
+                                    minimized ? "1" : "0", ",",
+                                    foreground ? "1" : "0"
+                                );
+                                if (!string.Equals(sig, lastSig, StringComparison.Ordinal))
+                                {
+                                    lastSig = sig;
+                                    StringBuilder json = new StringBuilder();
+                                    json.Append("{\"type\":\"rect\",");
+                                    json.Append("\"x\":").Append(wr.Left).Append(",");
+                                    json.Append("\"y\":").Append(wr.Top).Append(",");
+                                    json.Append("\"width\":").Append(width).Append(",");
+                                    json.Append("\"height\":").Append(height).Append(",");
+                                    json.Append("\"clientWidth\":").Append(cr.Right).Append(",");
+                                    json.Append("\"clientHeight\":").Append(cr.Bottom).Append(",");
+                                    json.Append("\"visible\":").Append(visible ? "true" : "false").Append(",");
+                                    json.Append("\"minimized\":").Append(minimized ? "true" : "false").Append(",");
+                                    json.Append("\"foreground\":").Append(foreground ? "true" : "false");
+                                    json.Append("}");
+                                    EmitJson(json.ToString());
+                                }
+                            }
+                        }
+                    }
+
+                    Thread.Sleep(PollIntervalMs);
+                }
+            }
+            finally
+            {
+                if (targetProc != null)
+                {
+                    targetProc.Dispose();
+                }
             }
 
             return 0;
