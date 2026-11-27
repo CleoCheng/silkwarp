@@ -24,8 +24,10 @@ import {
 import { getBridge } from "../bridge";
 import type {
   ConnectDeviceResult,
+  ConnectProgressEvent,
   DeviceInfo,
   RemoteFileListing,
+  ResolutionMode,
   StreamPreset,
   TransferTaskItem,
 } from "../../electron/types";
@@ -41,11 +43,18 @@ interface PasswordPrompt {
 }
 
 const MODE_LABELS: Record<ConnectMode, string> = {
-  connect: "高清串流",
-  stream: "高清串流",
-  rustdesk: "RustDesk 办公",
-  transfer: "Mesh 文件快传",
+  connect: "高清远控",
+  stream: "高清远控",
+  rustdesk: "轻办公模式",
+  transfer: "极速文件传输",
 };
+
+function formatConnectRoute(routeType?: string, latencyMs?: number | null): string {
+  const r = (routeType || "").toLowerCase();
+  const base = r.startsWith("relay") ? "私有中继" : r === "p2p" ? "极速直连" : r === "local" ? "局域网" : "";
+  if (!base) return "";
+  return latencyMs != null ? `${base} · ${Math.round(latencyMs)}ms` : base;
+}
 
 interface DevicesViewProps {
   devices: DeviceInfo[];
@@ -108,6 +117,9 @@ export function DevicesView({
   const [submittingPassword, setSubmittingPassword] = useState(false);
 
   const bridge = useMemo(() => getBridge(), []);
+  const [localDisplayRes, setLocalDisplayRes] = useState("");
+  const [connectProgress, setConnectProgress] = useState<ConnectProgressEvent | null>(null);
+  const [connectOverlayHidden, setConnectOverlayHidden] = useState(false);
   const [transferDevice, setTransferDevice] = useState<DeviceInfo | null>(null);
   const [transferToken, setTransferToken] = useState("");
   const [transferPort, setTransferPort] = useState(19580);
@@ -117,6 +129,16 @@ export function DevicesView({
   const [transferTasks, setTransferTasks] = useState<TransferTaskItem[]>([]);
   const [transferDragActive, setTransferDragActive] = useState(false);
   const transferDragDepth = useRef(0);
+
+  useEffect(() => {
+    void bridge.getLocalDisplayResolution().then(setLocalDisplayRes).catch(() => {});
+    return bridge.onConnectProgress((ev) => {
+      if (ev && ev.step <= 1) {
+        setConnectOverlayHidden(false);
+      }
+      setConnectProgress(ev);
+    });
+  }, [bridge]);
 
   useEffect(() => {
     if (retryCountdown <= 0) return;
@@ -148,13 +170,28 @@ export function DevicesView({
     const invoke =
       mode === "rustdesk" ? onRustDesk : mode === "stream" ? onStream : onConnect;
     setConnectingId(d.id);
+    if (mode === "connect" || mode === "stream") {
+      setConnectOverlayHidden(false);
+      setConnectProgress({
+        deviceId: d.id,
+        deviceName: d.name,
+        stage: "connecting",
+        step: 1,
+        totalSteps: 3,
+        title: `正在连接 ${d.name}`,
+        detail: "正在并行建立高速加密通道…",
+        routeType: d.route_type,
+        latencyMs: d.latency_ms,
+      });
+    }
     try {
       const res = await invoke(d, opts);
       if (res?.needsPassword) {
+        setConnectProgress(null);
         setPasswordPrompt({
           device: d,
           mode,
-          message: res.message || "此主机需要访问密码",
+          message: res.message || "此电脑需要访问密码",
           retryAfterSec: res.retryAfterSec,
         });
         setPasswordDraft(opts?.password ?? "");
@@ -165,8 +202,20 @@ export function DevicesView({
         return;
       }
       if (res?.message) notify(res.message);
-      if (res?.ok) closePasswordPrompt();
+      if (res?.ok) {
+        closePasswordPrompt();
+        if (mode !== "connect" && mode !== "stream") {
+          setConnectProgress(null);
+        } else {
+          window.setTimeout(() => {
+            setConnectProgress((cur) => (cur?.deviceId === d.id ? null : cur));
+          }, 2600);
+        }
+      } else {
+        setConnectProgress(null);
+      }
     } catch (err) {
+      setConnectProgress(null);
       notify(err instanceof Error ? err.message : String(err));
     } finally {
       setConnectingId("");
@@ -424,6 +473,7 @@ export function DevicesView({
           <div className="flex flex-wrap items-center gap-2">
             {QUICK_PRESETS.map((q) => {
               const active =
+                preset.resolutionMode === "fixed" &&
                 preset.resolution === q.preset.resolution &&
                 preset.fps === q.preset.fps &&
                 preset.bitrateMbps === q.preset.bitrateMbps;
@@ -431,7 +481,7 @@ export function DevicesView({
                 <button
                   key={q.label}
                   type="button"
-                  onClick={() => void onUpdatePreset({ ...preset, ...q.preset })}
+                  onClick={() => void onUpdatePreset({ ...preset, ...q.preset, resolutionMode: "fixed" })}
                   className={`rounded-xl px-3 py-1.5 text-xs font-semibold border transition-colors ${
                     active
                       ? "bg-sky-500/15 text-sky-300 border-sky-500/40"
@@ -453,21 +503,91 @@ export function DevicesView({
               <option value="av1">AV1 (新显卡)</option>
               <option value="h264">H.264 (兼容)</option>
             </select>
+
+            <label className="inline-flex items-center gap-1.5 ml-1 text-xs text-slate-300 cursor-pointer whitespace-nowrap">
+              <input
+                type="checkbox"
+                checked={preset.muteHostAudio}
+                onChange={(e) => void onUpdatePreset({ ...preset, muteHostAudio: e.target.checked })}
+                className="rounded border-edge bg-panelHover text-sky-400"
+              />
+              被控端静音
+            </label>
+
+            <label className="inline-flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer whitespace-nowrap">
+              <input
+                type="checkbox"
+                checked={preset.lowLatency}
+                onChange={(e) => void onUpdatePreset({ ...preset, lowLatency: e.target.checked })}
+                className="rounded border-edge bg-panelHover text-sky-400"
+              />
+              极速低延迟
+            </label>
           </div>
 
           <button
             type="button"
             onClick={() => void onRefresh()}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-edge bg-panelHover px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-sky-500/50 transition-colors"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-edge bg-panelHover px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-sky-500/50 transition-colors shrink-0 whitespace-nowrap"
           >
             <RefreshCw className="w-3.5 h-3.5" />
             刷新设备
           </button>
         </div>
 
-        {/* Stage 1 quick switches */}
-        <div className="flex flex-wrap items-center gap-x-5 gap-y-2 pt-3 border-t border-edge/60 text-[11px]">
+        {/* Stage 1 + UU-style quick switches */}
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-3 border-t border-edge/60 text-[11px]">
           <div className="flex items-center gap-1.5">
+            <span className="text-slate-500">分辨率策略</span>
+            <div className="flex rounded-lg border border-edge bg-obsidian/70 p-0.5">
+              {([
+                {
+                  value: "follow_client" as ResolutionMode,
+                  label: localDisplayRes ? `跟随主控端 (${localDisplayRes.replace("x", "×")})` : "跟随主控端",
+                },
+                { value: "follow_host" as ResolutionMode, label: "跟随被控端" },
+                { value: "fixed" as ResolutionMode, label: "固定分辨率" },
+              ]).map((m) => {
+                const selected =
+                  m.value === "fixed"
+                    ? preset.resolutionMode === "fixed" || preset.resolutionMode === "fit_window"
+                    : preset.resolutionMode === m.value;
+                return (
+                  <button
+                    key={m.value}
+                    type="button"
+                    onClick={() => {
+                      if (m.value === "follow_client") {
+                        void onUpdatePreset({
+                          ...preset,
+                          resolutionMode: "follow_client",
+                          resolution: localDisplayRes || preset.resolution,
+                          streamApp: "Virtual Display",
+                        });
+                      } else if (m.value === "follow_host") {
+                        void onUpdatePreset({
+                          ...preset,
+                          resolutionMode: "follow_host",
+                          streamApp: "Desktop",
+                        });
+                      } else {
+                        void onUpdatePreset({ ...preset, resolutionMode: "fixed" });
+                      }
+                    }}
+                    className={`rounded-md px-2 py-0.5 font-semibold transition-colors ${
+                      selected
+                        ? "bg-sky-500/20 text-sky-300"
+                        : "text-slate-400 hover:text-slate-100"
+                    }`}
+                  >
+                    {m.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1.5" title="连接后按 Ctrl+Alt+F 或 Ctrl+Alt+Enter 快速切换全屏/窗口">
             <span className="text-slate-500">显示模式</span>
             <div className="flex rounded-lg border border-edge bg-obsidian/70 p-0.5">
               {([
@@ -492,11 +612,11 @@ export function DevicesView({
           </div>
 
           <div className="flex items-center gap-1.5">
-            <span className="text-slate-500">画面源</span>
+            <span className="text-slate-500">屏幕模式</span>
             <div className="flex rounded-lg border border-edge bg-obsidian/70 p-0.5">
               {([
-                { value: "Virtual Display", label: "虚拟屏" },
-                { value: "Desktop", label: "桌面" },
+                { value: "Virtual Display", label: "隐私扩展屏" },
+                { value: "Desktop", label: "同步物理屏" },
               ] as const).map((m) => (
                 <button
                   key={m.value}
@@ -513,26 +633,6 @@ export function DevicesView({
               ))}
             </div>
           </div>
-
-          <label className="inline-flex items-center gap-1.5 text-slate-300 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={preset.muteHostAudio}
-              onChange={(e) => void onUpdatePreset({ ...preset, muteHostAudio: e.target.checked })}
-              className="rounded border-edge bg-panelHover text-sky-400"
-            />
-            被控端静音
-          </label>
-
-          <label className="inline-flex items-center gap-1.5 text-slate-300 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={preset.lowLatency}
-              onChange={(e) => void onUpdatePreset({ ...preset, lowLatency: e.target.checked })}
-              className="rounded border-edge bg-panelHover text-sky-400"
-            />
-            低延迟抗分片
-          </label>
         </div>
       </div>
 
@@ -542,7 +642,7 @@ export function DevicesView({
           暂无可见设备。在另一台电脑安装 SilkWarp 并登录同一个账号，即可自动出现在此处。
         </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-4">
           {devices.map((d) => {
             const isSelf = d.id === selfDeviceId;
             const isBusy = connectingId === d.id;
@@ -570,16 +670,16 @@ export function DevicesView({
                       <div className="flex items-center gap-2">
                         <h3 className="font-bold text-base text-slate-50 truncate">{d.name}</h3>
                         {isSelf && (
-                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-edge">
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-edge shrink-0 whitespace-nowrap">
                             本机
                           </span>
                         )}
                         {d.has_access_password && (
                           <span
                             title="该主机已启用访问密码保护，连接时需输入密码或临时码"
-                            className="inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-200 border border-amber-500/35"
+                            className="inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-200 border border-amber-500/35 shrink-0 whitespace-nowrap"
                           >
-                            <Lock className="w-2.5 h-2.5" />
+                            <Lock className="w-2.5 h-2.5 shrink-0" />
                             需密码
                           </span>
                         )}
@@ -606,17 +706,17 @@ export function DevicesView({
                     )}
 
                   <div className="rounded-xl bg-obsidian/70 border border-edge/70 p-3 space-y-1.5 text-xs">
-                    <div className="flex items-center justify-between text-slate-300">
-                      <span className="text-slate-400 flex items-center gap-1.5">
+                    <div className="flex items-center justify-between gap-2 text-slate-300">
+                      <span className="text-slate-400 flex items-center gap-1.5 shrink-0 whitespace-nowrap">
                         <Cpu className="w-3.5 h-3.5 text-sky-400" /> 显卡
                       </span>
-                      <span className="truncate max-w-[195px] font-medium">{d.gpu || "检测中"}</span>
+                      <span className="truncate min-w-0 text-right font-medium">{d.gpu || "检测中"}</span>
                     </div>
                     <div className="flex items-center justify-between text-slate-300">
                       <span className="text-slate-400">网络链路</span>
                       <span className="font-medium">
                         {d.route_type === "p2p" ? (
-                          <span className="text-emerald-300">P2P 直连</span>
+                          <span className="text-emerald-300">极速直连</span>
                         ) : d.route_type?.startsWith("relay") ? (
                           <span className="text-amber-300">私有中继</span>
                         ) : (
@@ -636,7 +736,7 @@ export function DevicesView({
                     className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-sky-400 to-blue-500 px-4 py-2.5 text-sm font-bold text-slate-950 hover:opacity-95 transition-opacity disabled:opacity-40"
                   >
                     {isBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <MonitorPlay className="w-4 h-4" />}
-                    {isSelf ? "当前本机" : isBusy ? "正在静默握手并连接..." : "立即远程"}
+                    {isSelf ? "当前本机" : isBusy ? "正在极速连接..." : "立即远程"}
                   </button>
 
                   <div className="flex items-center justify-between gap-1.5">
@@ -649,9 +749,9 @@ export function DevicesView({
                               .then(() => notify(`已向 ${d.name} 发送远程开机指令`))
                               .catch((e) => notify(e.message))
                           }
-                          className="inline-flex items-center gap-1 rounded-lg border border-edge bg-panelHover px-2.5 py-1 text-[11px] text-slate-200 hover:border-emerald-500/40"
+                          className="inline-flex items-center gap-1 rounded-lg border border-edge bg-panelHover px-2.5 py-1 text-[11px] text-slate-200 hover:border-emerald-500/40 whitespace-nowrap shrink-0"
                         >
-                          <Power className="w-3 h-3 text-emerald-400" />
+                          <Power className="w-3 h-3 text-emerald-400 shrink-0" />
                           远程开机
                         </button>
                       )}
@@ -660,11 +760,11 @@ export function DevicesView({
                           type="button"
                           disabled={isBusy}
                           onClick={() => void runConnectAction("rustdesk", d)}
-                          className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-40"
-                          title="停止高刷串流并以本地 0ms 硬件光标接管，适合文字办公与锁屏/UAC 运维"
+                          className="inline-flex items-center gap-1 rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-40 whitespace-nowrap shrink-0"
+                          title="使用轻量办公模式操控桌面（0ms 本地光标，支持锁屏与系统弹窗）"
                         >
-                          <MousePointer2 className="w-3 h-3" />
-                          办公模式 (0ms光标)
+                          <MousePointer2 className="w-3 h-3 shrink-0" />
+                          轻办公模式
                         </button>
                       )}
                       {d.online && !isSelf && (
@@ -672,10 +772,10 @@ export function DevicesView({
                           type="button"
                           disabled={isBusy}
                           onClick={() => void openTransferModal(d)}
-                          className="inline-flex items-center gap-1 rounded-lg border border-sky-500/35 bg-sky-500/10 px-2.5 py-1 text-[11px] font-semibold text-sky-200 hover:bg-sky-500/20 disabled:opacity-40"
-                          title="无需启动视频串流，直接通过 Mesh 浏览、上传、下载文件"
+                          className="inline-flex items-center gap-1 rounded-lg border border-sky-500/35 bg-sky-500/10 px-2.5 py-1 text-[11px] font-semibold text-sky-200 hover:bg-sky-500/20 disabled:opacity-40 whitespace-nowrap shrink-0"
+                          title="无需打开远程桌面，直接浏览、上传、下载对方电脑文件"
                         >
-                          <Upload className="w-3 h-3" />
+                          <Upload className="w-3 h-3 shrink-0" />
                           传文件
                         </button>
                       )}
@@ -707,7 +807,74 @@ export function DevicesView({
         </div>
       )}
 
-      {/* Mesh File Quick Transfer Modal */}
+      {/* Friendly Connecting Progress Overlay */}
+      {connectProgress && !connectOverlayHidden && (
+        <div className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-md rounded-2xl border border-edge bg-panel/95 p-6 shadow-2xl space-y-5">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="h-10 w-10 rounded-xl bg-sky-500/15 border border-sky-500/35 flex items-center justify-center shrink-0">
+                  <Loader2 className="w-5 h-5 text-sky-300 animate-spin motion-reduce:animate-none" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-bold text-sm text-slate-100 truncate">
+                      {connectProgress.deviceName}
+                    </span>
+                    {formatConnectRoute(connectProgress.routeType, connectProgress.latencyMs) && (
+                      <span className="rounded-full border border-emerald-500/35 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-200">
+                        {formatConnectRoute(connectProgress.routeType, connectProgress.latencyMs)}
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[11px] text-slate-400 mt-0.5">SilkWarp 极速远控通道</div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setConnectOverlayHidden(true)}
+                className="rounded-lg border border-edge bg-panelHover px-2.5 py-1 text-[11px] text-slate-300 hover:text-white transition-colors"
+              >
+                隐藏
+              </button>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2">
+              {[
+                { step: 1, label: "建立通道" },
+                { step: 2, label: "安全校验" },
+                { step: 3, label: "进入桌面" },
+              ].map((s) => {
+                const done = connectProgress.step > s.step;
+                const active = connectProgress.step === s.step;
+                return (
+                  <div key={s.step} className="space-y-1.5">
+                    <div
+                      className={`h-1.5 rounded-full transition-colors duration-200 motion-reduce:transition-none ${
+                        done ? "bg-emerald-400" : active ? "bg-sky-400" : "bg-slate-700"
+                      }`}
+                    />
+                    <div
+                      className={`text-[11px] font-medium text-center ${
+                        done ? "text-emerald-300" : active ? "text-sky-200" : "text-slate-500"
+                      }`}
+                    >
+                      {s.label}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="rounded-xl border border-edge/80 bg-obsidian/70 px-4 py-3 space-y-1">
+              <div className="text-sm font-semibold text-slate-100">{connectProgress.title}</div>
+              <div className="text-xs text-slate-400 leading-relaxed">{connectProgress.detail}</div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Quick File Transfer Modal */}
       {transferDevice && (
         <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="w-full max-w-2xl rounded-2xl border border-edge bg-panel p-5 space-y-4">
@@ -715,10 +882,10 @@ export function DevicesView({
               <div className="space-y-1">
                 <div className="flex items-center gap-2">
                   <FolderOpen className="w-4 h-4 text-sky-300" />
-                  <h3 className="font-bold text-slate-100">Mesh 文件快传 · {transferDevice.name}</h3>
+                  <h3 className="font-bold text-slate-100">极速文件传输 · {transferDevice.name}</h3>
                 </div>
                 <p className="text-[11px] text-slate-400">
-                  不启动视频串流，直接经 Mesh 内网与目标主机交换文件（{transferDevice.mesh_ip}:{transferPort}）。
+                  无需打开远程桌面，直接与「{transferDevice.name}」高速互传文件。
                 </p>
               </div>
               <button
@@ -924,10 +1091,7 @@ export function DevicesView({
               <span className="rounded-full border border-edge bg-obsidian/70 px-2 py-0.5 text-slate-300">
                 {MODE_LABELS[passwordPrompt.mode]}
               </span>
-              <span className="font-mono text-slate-500">{passwordPrompt.device.mesh_ip}</span>
-              {passwordPrompt.device.agent_port ? (
-                <span className="text-slate-500">Agent :{passwordPrompt.device.agent_port}</span>
-              ) : null}
+              <span className="text-slate-500">加密直连通道</span>
             </div>
 
             <form onSubmit={submitPassword} className="space-y-3 text-xs">

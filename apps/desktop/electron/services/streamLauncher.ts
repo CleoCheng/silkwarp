@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import type { BootstrapConfig, DeviceInfo, StreamAppTarget, StreamPreset } from "../types";
 import { parseApolloServerInfoPermission, parseMoonlightIniCredentials } from "./apolloPermissions";
 import { configureRustDeskClient, findRustDeskExe } from "./hostManager";
-import { buildMoonlightStreamArgs } from "./streamOptions";
+import { buildMoonlightSpawnEnv, buildMoonlightStreamArgs } from "./streamOptions";
 
 const execFileAsync = promisify(execFile);
 
@@ -147,7 +147,7 @@ export function spawnSilentMoonlightPair(
   const exe = resolveMoonlightExe();
   if (!exe) {
     return {
-      promise: Promise.resolve({ ok: false, output: "未找到内置 Moonlight.exe" }),
+      promise: Promise.resolve({ ok: false, output: "未找到远程连接引擎，请重新安装 SilkWarp。" }),
       cancel: () => {},
     };
   }
@@ -170,7 +170,7 @@ export function spawnSilentMoonlightPair(
       } catch {
         // ignore
       }
-      resolve({ ok: false, output: `Moonlight 静默配对超时\n${chunks.join("")}` });
+      resolve({ ok: false, output: `首次安全配对超时\n${chunks.join("")}` });
     }, 20_000);
 
     child.on("error", (err) => {
@@ -278,11 +278,12 @@ export function spawnMoonlightStreamProcess(
 ): ChildProcess {
   const exe = resolveMoonlightExe();
   if (!exe) {
-    throw new Error("未找到内置 Moonlight.exe，请先执行资源打包准备。");
+    throw new Error("未找到远程画面引擎，请重新安装 SilkWarp。");
   }
   const args = buildMoonlightStreamArgs(meshIp, preset, routeType, resolvedApp);
   return spawn(exe, args, {
     cwd: path.dirname(exe),
+    env: buildMoonlightSpawnEnv(),
     detached: false,
     windowsHide: false,
     stdio: "ignore",
@@ -297,11 +298,12 @@ export function launchMoonlightStream(
 ): void {
   const exe = resolveMoonlightExe();
   if (!exe) {
-    throw new Error("未找到内置 Moonlight.exe，请先执行资源打包准备。");
+    throw new Error("未找到远程画面引擎，请重新安装 SilkWarp。");
   }
   const args = buildMoonlightStreamArgs(device.mesh_ip, preset, routeType, resolvedApp);
   const child = spawn(exe, args, {
     cwd: path.dirname(exe),
+    env: buildMoonlightSpawnEnv(),
     detached: true,
     stdio: "ignore",
   });
@@ -311,7 +313,7 @@ export function launchMoonlightStream(
 export function launchMoonlightGui(): void {
   const exe = resolveMoonlightExe();
   if (!exe) {
-    throw new Error("未找到内置 Moonlight.exe。");
+    throw new Error("未找到远程画面引擎。");
   }
   const child = spawn(exe, [], {
     cwd: path.dirname(exe),
@@ -325,7 +327,7 @@ export function launchRustDeskConnect(device: DeviceInfo, cfg: BootstrapConfig):
   configureRustDeskClient(cfg);
   const exe = findRustDeskExe();
   if (!exe) {
-    throw new Error("本机尚未安装 RustDesk 客户端，请在【被控模式】页一键下载安装。");
+    throw new Error("本机尚未安装轻办公组件，请在【本机受控 -> 高级与运维设置】中一键安装。");
   }
   const args = device.rustdesk_id ? ["--connect", device.rustdesk_id] : [];
   const child = spawn(exe, args, {

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AppSettings, StreamPreset, UserInfo } from "../types";
 import { DEFAULT_AGENT_PORT } from "./hostAgentAuth";
+import { serializeStateIfChanged } from "./hostMaintenance";
 import { DEFAULT_STREAM_PRESET, normalizeStreamPreset } from "./streamOptions";
 
 export interface ExternalAppConfig {
@@ -75,6 +76,7 @@ export class StateStore {
   private readonly filePath: string;
   private readonly externalConfig: ExternalAppConfig;
   private state: PersistedState;
+  private lastSavedJson = "";
 
   constructor() {
     const dir = app.getPath("userData");
@@ -112,7 +114,8 @@ export class StateStore {
         this.saveRaw(fallback);
         return fallback;
       }
-      const parsed = JSON.parse(fs.readFileSync(this.filePath, "utf-8")) as Partial<PersistedState>;
+      const rawText = fs.readFileSync(this.filePath, "utf-8");
+      const parsed = JSON.parse(rawText) as Partial<PersistedState>;
       const merged: PersistedState = {
         ...fallback,
         ...parsed,
@@ -132,11 +135,19 @@ export class StateStore {
             ? parsed.savedDevicePasswords
             : {},
       };
+      let needsSync = false;
       if (!merged.apiUrl && this.externalConfig.apiUrl) {
         merged.apiUrl = this.externalConfig.apiUrl;
+        needsSync = true;
       }
       if (!merged.deviceId) {
         merged.deviceId = crypto.randomUUID();
+        needsSync = true;
+      }
+      if (needsSync) {
+        this.saveRaw(merged);
+      } else {
+        this.lastSavedJson = rawText;
       }
       return merged;
     } catch {
@@ -144,8 +155,10 @@ export class StateStore {
     }
   }
 
-  private saveRaw(data: PersistedState): void {
-    fs.writeFileSync(this.filePath, JSON.stringify(data, null, 2), { encoding: "utf-8", mode: 0o600 });
+  private saveRaw(data: PersistedState, preSerialized?: string): void {
+    const json = preSerialized ?? JSON.stringify(data, null, 2);
+    fs.writeFileSync(this.filePath, json, { encoding: "utf-8", mode: 0o600 });
+    this.lastSavedJson = json;
   }
 
   get(): PersistedState {
@@ -225,14 +238,18 @@ export class StateStore {
   }
 
   update(patch: Partial<PersistedState>): PersistedState {
-    this.state = {
+    const nextState: PersistedState = {
       ...this.state,
       ...patch,
       preset: normalizeStreamPreset(
         patch.preset ? { ...this.state.preset, ...patch.preset } : this.state.preset,
       ),
     };
-    this.saveRaw(this.state);
+    this.state = nextState;
+    const nextJson = serializeStateIfChanged(this.lastSavedJson, nextState);
+    if (nextJson !== null) {
+      this.saveRaw(nextState, nextJson);
+    }
     return this.state;
   }
 }

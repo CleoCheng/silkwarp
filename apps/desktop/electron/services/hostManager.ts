@@ -9,7 +9,17 @@ import path from "node:path";
 import { promisify } from "node:util";
 import type { BootstrapConfig, HostHardwareInfo, ProvisionStage } from "../types";
 import { APOLLO_PERM_ALL, needsApolloPermissionUpgrade } from "./apolloPermissions";
+import { ensureProgramDataEasyTierBinaries, renderEasyTierConfig, resolveEasyTierDir } from "./easytierManager";
 import { DEFAULT_AGENT_PORT } from "./hostAgentAuth";
+import {
+  BOOT_TUNNEL_CONFIG_PATH,
+  BOOT_TUNNEL_PROGRAM_DATA_DIR,
+  BOOT_TUNNEL_TASK_NAME,
+  REQUIRED_FIREWALL_RULES,
+  buildEasyTierBootTaskXml,
+  parseFirewallRulesFromRegQuery,
+  parseUuRemoteFromTasklist,
+} from "./hostMaintenance";
 
 const execFileAsync = promisify(execFile);
 
@@ -21,13 +31,25 @@ const APOLLO_PATHS = [
   "C:\\Program Files\\Sunshine\\sunshine.exe",
 ];
 
-interface CachedHardware {
+const FIREWALL_CACHE_TTL_MS = 10 * 60_000;
+const STATIC_HW_RETRY_MS = 10 * 60_000;
+const UU_CHECK_TTL_MS = 10 * 60_000;
+const BOOT_TUNNEL_CACHE_TTL_MS = 10 * 60_000;
+
+interface StaticHardwareCache {
   cpu: string;
   gpu: string;
-  uuRemoteDetected: boolean;
+  uuGpuDetected: boolean;
+  resolved: boolean;
   updatedAt: number;
 }
-let hwCache: CachedHardware | null = null;
+
+let staticHwCache: StaticHardwareCache | null = null;
+let staticHwInFlight: Promise<{ cpu: string; gpu: string; uuGpuDetected: boolean }> | null = null;
+let elevationPromise: Promise<boolean> | null = null;
+let firewallCache: { configured: boolean; checkedAt: number } | null = null;
+let uuCheckCache: { detected: boolean; checkedAt: number } | null = null;
+let bootTunnelCache: { configured: boolean; checkedAt: number } | null = null;
 
 const RUSTDESK_EXE_PATHS = [
   "C:\\Program Files\\RustDesk\\rustdesk.exe",
@@ -41,12 +63,12 @@ const RUSTDESK_CFG_PATHS = [
 
 export async function checkIsElevated(): Promise<boolean> {
   if (process.platform !== "win32") return true;
-  try {
-    await execFileAsync("net", ["session"], { timeout: 2500, windowsHide: true });
-    return true;
-  } catch {
-    return false;
+  if (!elevationPromise) {
+    elevationPromise = execFileAsync("net", ["session"], { timeout: 2500, windowsHide: true })
+      .then(() => true)
+      .catch(() => false);
   }
+  return elevationPromise;
 }
 
 async function probeApolloHttps(port: number): Promise<boolean> {
@@ -131,57 +153,253 @@ function detectPrimaryLanNic(): { macAddress: string; broadcastIp: string } {
   return best;
 }
 
-async function checkFirewallConfigured(): Promise<boolean> {
+export function invalidateFirewallCache(): void {
+  firewallCache = null;
+}
+
+export function invalidateBootTunnelCache(): void {
+  bootTunnelCache = null;
+}
+
+async function checkFirewallConfigured(forceRefresh = false): Promise<boolean> {
   if (process.platform !== "win32") return true;
-  const requiredRules = ["SilkWarp-Apollo-TCP", "SilkWarp-Agent-TCP"];
+  if (!forceRefresh && firewallCache && Date.now() - firewallCache.checkedAt < FIREWALL_CACHE_TTL_MS) {
+    return firewallCache.configured;
+  }
+
+  let regStdout = "";
   try {
-    for (const rule of requiredRules) {
+    const res = await execFileAsync(
+      "reg",
+      [
+        "query",
+        "HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules",
+        "/f",
+        "SilkWarp-",
+        "/d",
+      ],
+      { timeout: 4000, windowsHide: true },
+    );
+    regStdout = res.stdout;
+  } catch (err) {
+    regStdout =
+      err && typeof err === "object" && typeof (err as { stdout?: unknown }).stdout === "string"
+        ? (err as { stdout: string }).stdout
+        : "";
+  }
+
+  const regParsed = parseFirewallRulesFromRegQuery(regStdout, REQUIRED_FIREWALL_RULES);
+  if (regParsed.parsed) {
+    firewallCache = { configured: regParsed.configured, checkedAt: Date.now() };
+    return regParsed.configured;
+  }
+
+  try {
+    for (const rule of REQUIRED_FIREWALL_RULES) {
       await execFileAsync(
         "netsh",
-        ["advfirewall", "firewall", "show", "rule", "name=" + rule],
+        ["advfirewall", "firewall", "show", "rule", `name=${rule}`],
         { timeout: 4000, windowsHide: true },
       );
     }
+    firewallCache = { configured: true, checkedAt: Date.now() };
     return true;
   } catch {
+    firewallCache = { configured: false, checkedAt: Date.now() };
     return false;
   }
 }
 
-async function fetchHardwareSummary(): Promise<{ cpu: string; gpu: string; uuRemoteDetected: boolean }> {
+async function fetchStaticHardware(
+  forceRefresh = false,
+): Promise<{ cpu: string; gpu: string; uuGpuDetected: boolean }> {
   const fallbackCpu = os.cpus()[0]?.model?.trim() || "";
   if (process.platform !== "win32") {
-    return { cpu: fallbackCpu, gpu: "", uuRemoteDetected: false };
+    return { cpu: fallbackCpu, gpu: "", uuGpuDetected: false };
   }
-  if (hwCache && Date.now() - hwCache.updatedAt < 120_000) {
-    return { cpu: hwCache.cpu, gpu: hwCache.gpu, uuRemoteDetected: hwCache.uuRemoteDetected };
+  if (!forceRefresh && staticHwCache) {
+    if (staticHwCache.resolved || Date.now() - staticHwCache.updatedAt < STATIC_HW_RETRY_MS) {
+      return {
+        cpu: staticHwCache.cpu,
+        gpu: staticHwCache.gpu,
+        uuGpuDetected: staticHwCache.uuGpuDetected,
+      };
+    }
   }
+  if (staticHwInFlight) return staticHwInFlight;
 
   const psCmd = `
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $ErrorActionPreference = 'SilentlyContinue'
 $gpus = (Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name) -join ' / '
 $cpuName = (Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)
-$uuProc = [bool](Get-Process -Name 'GameViewer','GameViewerServer','GameViewerService' -ErrorAction SilentlyContinue)
-$uu = $uuProc -or ($gpus -match 'GameViewer')
-[PSCustomObject]@{ cpu=$cpuName; gpu=$gpus; uu=$uu } | ConvertTo-Json -Compress
+[PSCustomObject]@{ cpu=$cpuName; gpu=$gpus; uuGpu=($gpus -match 'GameViewer') } | ConvertTo-Json -Compress
 `;
+  staticHwInFlight = (async () => {
+    try {
+      const { stdout } = await execFileAsync(
+        "powershell",
+        ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCmd],
+        { timeout: 15000, windowsHide: true },
+      );
+      const parsed = JSON.parse(stdout.trim()) as { cpu?: string; gpu?: string; uuGpu?: boolean };
+      const result = {
+        cpu: parsed.cpu?.trim() || fallbackCpu,
+        gpu: parsed.gpu?.trim() || "",
+        uuGpuDetected: Boolean(parsed.uuGpu),
+      };
+      staticHwCache = { ...result, resolved: Boolean(result.gpu || parsed.cpu), updatedAt: Date.now() };
+      return result;
+    } catch {
+      const fallback = {
+        cpu: staticHwCache?.cpu || fallbackCpu,
+        gpu: staticHwCache?.gpu || "",
+        uuGpuDetected: staticHwCache?.uuGpuDetected || false,
+      };
+      staticHwCache = { ...fallback, resolved: false, updatedAt: Date.now() };
+      return fallback;
+    }
+  })().finally(() => {
+    staticHwInFlight = null;
+  });
+
+  return staticHwInFlight;
+}
+
+async function checkUuRemoteRunning(forceRefresh = false): Promise<boolean> {
+  if (process.platform !== "win32") return false;
+  if (!forceRefresh && uuCheckCache && Date.now() - uuCheckCache.checkedAt < UU_CHECK_TTL_MS) {
+    return uuCheckCache.detected;
+  }
   try {
     const { stdout } = await execFileAsync(
-      "powershell",
-      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCmd],
-      { timeout: 15000, windowsHide: true },
+      "tasklist",
+      ["/NH", "/FO", "CSV", "/FI", "IMAGENAME eq GameViewer*"],
+      { timeout: 3000, windowsHide: true },
     );
-    const parsed = JSON.parse(stdout.trim()) as { cpu?: string; gpu?: string; uu?: boolean };
-    const result = {
-      cpu: parsed.cpu?.trim() || fallbackCpu,
-      gpu: parsed.gpu?.trim() || "",
-      uuRemoteDetected: Boolean(parsed.uu),
-    };
-    hwCache = { ...result, updatedAt: Date.now() };
-    return result;
+    const detected = parseUuRemoteFromTasklist(stdout);
+    uuCheckCache = { detected, checkedAt: Date.now() };
+    return detected;
   } catch {
-    return { cpu: fallbackCpu, gpu: hwCache?.gpu || "", uuRemoteDetected: hwCache?.uuRemoteDetected || false };
+    return uuCheckCache?.detected ?? false;
+  }
+}
+
+export async function checkBootTunnelConfigured(forceRefresh = false): Promise<boolean> {
+  if (process.platform !== "win32") return false;
+  if (!forceRefresh && bootTunnelCache && Date.now() - bootTunnelCache.checkedAt < BOOT_TUNNEL_CACHE_TTL_MS) {
+    return bootTunnelCache.configured;
+  }
+  try {
+    await execFileAsync("schtasks", ["/Query", "/TN", BOOT_TUNNEL_TASK_NAME], {
+      timeout: 4000,
+      windowsHide: true,
+    });
+    bootTunnelCache = { configured: true, checkedAt: Date.now() };
+    return true;
+  } catch {
+    bootTunnelCache = { configured: false, checkedAt: Date.now() };
+    return false;
+  }
+}
+
+export async function configureBootTunnelTask(
+  enable: boolean,
+  isElevated: boolean,
+  cfg?: BootstrapConfig | null,
+): Promise<boolean> {
+  if (process.platform !== "win32" || !isElevated) {
+    return false;
+  }
+  if (!enable) {
+    try {
+      await execFileAsync("schtasks", ["/End", "/TN", BOOT_TUNNEL_TASK_NAME], {
+        timeout: 5000,
+        windowsHide: true,
+      });
+    } catch {
+      // ignore if task was not running
+    }
+    try {
+      await execFileAsync("schtasks", ["/Delete", "/TN", BOOT_TUNNEL_TASK_NAME, "/F"], {
+        timeout: 6000,
+        windowsHide: true,
+      });
+    } catch {
+      // ignore if task did not exist
+    }
+    invalidateBootTunnelCache();
+    return false;
+  }
+
+  const sourceDir = resolveEasyTierDir();
+  const sourceCore = path.join(sourceDir, "easytier-core.exe");
+  if (!fs.existsSync(sourceCore)) {
+    return false;
+  }
+
+  const binDir = ensureProgramDataEasyTierBinaries(sourceDir);
+  const bootCore = path.join(binDir, "easytier-core.exe");
+  if (!fs.existsSync(bootCore)) {
+    return false;
+  }
+
+  fs.mkdirSync(BOOT_TUNNEL_PROGRAM_DATA_DIR, { recursive: true });
+  if (cfg) {
+    fs.writeFileSync(BOOT_TUNNEL_CONFIG_PATH, renderEasyTierConfig(cfg), {
+      encoding: "utf-8",
+      mode: 0o600,
+    });
+  } else {
+    const userCfgPath = path.join(app.getPath("userData"), "easytier.toml");
+    if (!fs.existsSync(BOOT_TUNNEL_CONFIG_PATH) && fs.existsSync(userCfgPath)) {
+      fs.copyFileSync(userCfgPath, BOOT_TUNNEL_CONFIG_PATH);
+    }
+  }
+  if (!fs.existsSync(BOOT_TUNNEL_CONFIG_PATH)) {
+    return false;
+  }
+
+  const xml = buildEasyTierBootTaskXml(bootCore, BOOT_TUNNEL_CONFIG_PATH, binDir);
+  const tmpXmlPath = path.join(os.tmpdir(), `silkwarp-boot-${process.pid}-${Date.now()}.xml`);
+  try {
+    const utf16Bom = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(xml, "utf16le")]);
+    fs.writeFileSync(tmpXmlPath, utf16Bom);
+    await execFileAsync(
+      "schtasks",
+      ["/Create", "/TN", BOOT_TUNNEL_TASK_NAME, "/XML", tmpXmlPath, "/F"],
+      { timeout: 8000, windowsHide: true },
+    );
+    bootTunnelCache = { configured: true, checkedAt: Date.now() };
+    return true;
+  } finally {
+    try {
+      if (fs.existsSync(tmpXmlPath)) fs.unlinkSync(tmpXmlPath);
+    } catch {
+      // ignore temp cleanup errors
+    }
+  }
+}
+
+export async function restartBootTunnelTask(isElevated: boolean): Promise<void> {
+  if (process.platform !== "win32" || !isElevated) return;
+  if (!(await checkBootTunnelConfigured())) return;
+  try {
+    await execFileAsync("schtasks", ["/End", "/TN", BOOT_TUNNEL_TASK_NAME], {
+      timeout: 5000,
+      windowsHide: true,
+    });
+  } catch {
+    // ignore if not currently active
+  }
+  await new Promise((r) => setTimeout(r, 400));
+  try {
+    await execFileAsync("schtasks", ["/Run", "/TN", BOOT_TUNNEL_TASK_NAME], {
+      timeout: 5000,
+      windowsHide: true,
+    });
+  } catch {
+    // ignore if task launch is rejected
   }
 }
 
@@ -213,11 +431,29 @@ export function findApolloExe(): string | null {
   return null;
 }
 
-export async function collectHostInfo(): Promise<HostHardwareInfo> {
-  const [isElevated, hw, firewallConfigured, apollo47990, apollo47989, apollo47984] = await Promise.all([
+export interface CollectHostInfoOptions {
+  forceFirewallCheck?: boolean;
+  forceHardwareRefresh?: boolean;
+  forceUuCheck?: boolean;
+  forceBootTunnelCheck?: boolean;
+}
+
+export async function collectHostInfo(opts: CollectHostInfoOptions = {}): Promise<HostHardwareInfo> {
+  const [
+    isElevated,
+    staticHw,
+    uuProcRunning,
+    firewallConfigured,
+    bootTunnelConfigured,
+    apollo47990,
+    apollo47989,
+    apollo47984,
+  ] = await Promise.all([
     checkIsElevated(),
-    fetchHardwareSummary(),
-    checkFirewallConfigured(),
+    fetchStaticHardware(Boolean(opts.forceHardwareRefresh)),
+    checkUuRemoteRunning(Boolean(opts.forceUuCheck)),
+    checkFirewallConfigured(Boolean(opts.forceFirewallCheck)),
+    checkBootTunnelConfigured(Boolean(opts.forceBootTunnelCheck)),
     probeApolloHttps(47990),
     probeTcpLocal(47989),
     probeTcpLocal(47984),
@@ -230,8 +466,8 @@ export async function collectHostInfo(): Promise<HostHardwareInfo> {
 
   return {
     hostname: os.hostname(),
-    cpu: hw.cpu,
-    gpu: hw.gpu,
+    cpu: staticHw.cpu,
+    gpu: staticHw.gpu,
     macAddress,
     broadcastIp,
     isElevated,
@@ -241,7 +477,8 @@ export async function collectHostInfo(): Promise<HostHardwareInfo> {
     rustdeskInstalled,
     rustdeskId,
     firewallConfigured,
-    uuRemoteDetected: hw.uuRemoteDetected,
+    bootTunnelConfigured,
+    uuRemoteDetected: staticHw.uuGpuDetected || uuProcRunning,
     provisionStage: "idle",
     provisionMessage: "",
     apolloAuthReady: false,
@@ -264,25 +501,36 @@ New-NetFirewallRule -DisplayName 'SilkWarp-Apollo-UDP' -Direction Inbound -Actio
 New-NetFirewallRule -DisplayName 'SilkWarp-Mesh-ICMP' -Direction Inbound -Action Allow -Protocol ICMPv4 -RemoteAddress '${safeCidr}' -Profile Any | Out-Null
 New-NetFirewallRule -DisplayName 'SilkWarp-Agent-TCP' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 19580 -RemoteAddress '${safeCidr}' -Profile Any | Out-Null
 `;
-  if (isElevated) {
+  try {
+    if (isElevated) {
+      await execFileAsync(
+        "powershell",
+        ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+        { timeout: 15000, windowsHide: true },
+      );
+      return;
+    }
     await execFileAsync(
       "powershell",
-      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
-      { timeout: 15000, windowsHide: true },
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", `Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command "${script.replace(/"/g, '\\"')}"'`],
+      { timeout: 45000, windowsHide: true },
     );
-    return;
+  } finally {
+    invalidateFirewallCache();
   }
-  await execFileAsync(
-    "powershell",
-    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", `Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command "${script.replace(/"/g, '\\"')}"'`],
-    { timeout: 45000, windowsHide: true },
-  );
 }
 
-export async function configureAutoStartTask(enable: boolean, isElevated: boolean): Promise<void> {
+export async function configureAutoStartTask(
+  enable: boolean,
+  isElevated: boolean,
+  cfg?: BootstrapConfig | null,
+): Promise<void> {
   if (process.platform !== "win32" || !app.isPackaged) {
     app.setLoginItemSettings({ openAtLogin: enable });
     return;
+  }
+  if (isElevated) {
+    await configureBootTunnelTask(enable, true, cfg).catch(() => {});
   }
   const taskName = "SilkWarpAutoStart";
   if (isElevated) {

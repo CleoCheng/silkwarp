@@ -217,6 +217,14 @@ test("buildSystemActionScript: reboot and shutdown call shutdown.exe with a 2s d
   assert.deepEqual(shutdown.args, ["/s", "/t", "2", "/c", "SilkWarp 远程关机"]);
 });
 
+test("buildSystemActionScript: repair_ime restarts TextInputHost and ctfmon safely", () => {
+  const spec = buildSystemActionScript("repair_ime");
+  assert.equal(typeof spec.powershell, "string");
+  assert.match(spec.powershell, /TextInputHost/);
+  assert.match(spec.powershell, /ctfmon\.exe/);
+  assert.match(spec.powershell, /<<<SILKWARP_ACTION:OK>>>/);
+});
+
 // ---------------------------------------------------------------------------
 // 4. Windows-only read-only live checks (never mutates host state)
 // ---------------------------------------------------------------------------

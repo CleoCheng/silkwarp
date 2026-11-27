@@ -30,13 +30,14 @@ export interface DisplayMonitorInfo {
   active: boolean;
 }
 
-export type SystemActionType = "lock" | "taskmgr" | "show_desktop" | "sas" | "reboot" | "shutdown";
+export type SystemActionType = "lock" | "taskmgr" | "show_desktop" | "sas" | "repair_ime" | "reboot" | "shutdown";
 
 export const SYSTEM_ACTION_TYPES: readonly SystemActionType[] = [
   "lock",
   "taskmgr",
   "show_desktop",
   "sas",
+  "repair_ime",
   "reboot",
   "shutdown",
 ];

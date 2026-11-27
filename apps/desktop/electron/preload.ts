@@ -3,9 +3,11 @@ import type {
   ActiveSessionState,
   AppRuntimeState,
   ConnectDeviceResult,
+  ConnectProgressEvent,
   DeviceAgentSessionResult,
   DeviceInfo,
   RemoteFileListing,
+  ResolutionMode,
   SessionHotkeyAction,
   StreamPreset,
   SystemActionType,
@@ -76,9 +78,12 @@ const api = {
     patch: { display_name?: string; role?: "admin" | "member"; enabled?: boolean; password?: string };
   }): Promise<UserInfo> => ipcRenderer.invoke("admin:updateUser", args),
   adminDeleteUser: (userId: string): Promise<boolean> => ipcRenderer.invoke("admin:deleteUser", userId),
+  getLocalDisplayResolution: (): Promise<string> => ipcRenderer.invoke("app:getLocalDisplayResolution"),
   getSessionState: (): Promise<ActiveSessionState | null> => ipcRenderer.invoke("session:getState"),
   updateSessionOptions: (patch: Partial<StreamPreset>): Promise<ActiveSessionState | null> =>
     ipcRenderer.invoke("session:updateOptions", patch),
+  setSessionResolutionMode: (mode: ResolutionMode, fixedResolution?: string): Promise<ActiveSessionState | null> =>
+    ipcRenderer.invoke("session:setResolutionMode", { mode, fixedResolution }),
   fitSessionWindow: (): Promise<ActiveSessionState | null> => ipcRenderer.invoke("session:fitWindow"),
   toggleSessionFullscreen: (): Promise<ActiveSessionState | null> =>
     ipcRenderer.invoke("session:toggleFullscreen"),
@@ -156,6 +161,11 @@ const api = {
     const listener = (_evt: Electron.IpcRendererEvent, state: ActiveSessionState | null) => cb(state);
     ipcRenderer.on("session:stateChanged", listener);
     return () => ipcRenderer.removeListener("session:stateChanged", listener);
+  },
+  onConnectProgress: (cb: (event: ConnectProgressEvent | null) => void): (() => void) => {
+    const listener = (_evt: Electron.IpcRendererEvent, event: ConnectProgressEvent | null) => cb(event);
+    ipcRenderer.on("connect:progress", listener);
+    return () => ipcRenderer.removeListener("connect:progress", listener);
   },
   onStateChanged: (cb: (state: AppRuntimeState) => void): (() => void) => {
     const listener = (_evt: Electron.IpcRendererEvent, state: AppRuntimeState) => cb(state);

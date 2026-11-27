@@ -36,6 +36,7 @@ import type {
   ClipboardKind,
   DisplayMode,
   RemoteFileListing,
+  ResolutionMode,
   StreamAppTarget,
   StreamPreset,
   SystemActionType,
@@ -52,12 +53,20 @@ const RESOLUTION_PRESETS: Array<{ label: string; value: string }> = [
 
 const FPS_PRESETS: Array<StreamPreset["fps"]> = [30, 60, 120, 144];
 
+function resolutionBadgeLabel(preset: StreamPreset): string {
+  if (preset.resolutionMode === "follow_client") return "跟随主控端";
+  if (preset.resolutionMode === "follow_host") return "跟随被控端";
+  if (preset.resolutionMode === "fit_window") return "适应窗口";
+  const matched = RESOLUTION_PRESETS.find((r) => r.value === preset.resolution);
+  return matched ? matched.label : preset.resolution.replace("x", "×");
+}
+
 function routeLabel(routeType: string): string {
   const r = routeType.toLowerCase();
-  if (r.startsWith("relay")) return "中继";
-  if (r === "p2p") return "直连";
-  if (r === "local") return "本地";
-  return routeType || "未知";
+  if (r.startsWith("relay")) return "私有中继";
+  if (r === "p2p") return "极速直连";
+  if (r === "local") return "局域网";
+  return routeType || "连接中";
 }
 
 function Segmented<T extends string>({
@@ -143,6 +152,7 @@ const SYSTEM_ACTION_LABELS: Record<SystemActionType, string> = {
   show_desktop: "显示桌面",
   taskmgr: "任务管理器",
   sas: "Ctrl+Alt+Del",
+  repair_ime: "修复输入法",
   reboot: "重启",
   shutdown: "关机",
 };
@@ -657,7 +667,7 @@ export function SessionBar() {
     return (
       <div className="flex h-full w-full items-center justify-center bg-transparent">
         <div className="rounded-full border border-white/10 bg-[#101522]/90 px-4 py-1.5 text-[11px] text-slate-400 backdrop-blur-xl">
-          正在等待远程会话…
+          正在连接远程桌面…
         </div>
       </div>
     );
@@ -690,7 +700,7 @@ export function SessionBar() {
         >
           {dragActive && (
             <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center gap-1.5 rounded-full bg-[#0b1220]/95 text-[11px] font-bold text-sky-200">
-              <Upload className="h-3.5 w-3.5" /> 拖放即传至主机 SilkWarpRecv
+              <Upload className="h-3.5 w-3.5" /> 拖放文件即发送到对方电脑
             </div>
           )}
           <button
@@ -710,6 +720,15 @@ export function SessionBar() {
               · {state.reconnecting ? "重连中" : route} {latency}
             </span>
           </span>
+
+          <button
+            type="button"
+            onClick={toggleExpanded}
+            title="点击展开调整分辨率、画面与键鼠设置"
+            className="shrink-0 rounded-full border border-white/10 bg-white/5 px-1.5 py-0.5 text-[9px] font-medium text-slate-300 hover:border-sky-400/50 hover:text-sky-200"
+          >
+            {resolutionBadgeLabel(preset)}
+          </button>
 
           {cappedByRelay && (
             <span className="rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[9px] font-bold text-amber-200">
@@ -734,9 +753,9 @@ export function SessionBar() {
 
           <button
             type="button"
-            aria-label={isFullscreen ? "切换为窗口" : "切换为全屏"}
-            title={isFullscreen ? "切换为窗口" : "切换为全屏"}
-            onClick={() => void bridge.toggleSessionFullscreen().then((next) => next && setState(next))}
+            aria-label={isFullscreen ? "退出全屏" : "进入全屏"}
+            title={isFullscreen ? "退出全屏 (Ctrl+Alt+F)" : "进入全屏 (Ctrl+Alt+F)"}
+            onClick={() => void bridge.toggleSessionFullscreen().then(applySession)}
             className="rounded-full p-1 text-slate-400 hover:bg-white/10 hover:text-white"
           >
             {isFullscreen ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
@@ -767,17 +786,17 @@ export function SessionBar() {
   }
 
   return (
-    <div className="flex h-full w-full bg-transparent p-1" {...dragProps}>
+    <div className="flex h-full w-full justify-center bg-transparent p-1" {...dragProps}>
       <div
-        className={`relative flex h-full w-full flex-col overflow-hidden rounded-2xl border shadow-[0_16px_50px_rgba(0,0,0,0.6)] backdrop-blur-2xl transition-colors ${
+        className={`relative flex h-full w-full max-w-[610px] flex-col overflow-hidden rounded-2xl border shadow-[0_16px_50px_rgba(0,0,0,0.6)] backdrop-blur-2xl transition-colors ${
           dragActive ? "border-sky-400/80 bg-[#0d1220]/98 ring-2 ring-sky-400/50" : "border-white/10 bg-[#0d1220]/92"
         }`}
       >
         {dragActive && (
           <div className="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-sky-400/70 bg-[#0b1220]/92 text-center">
             <Upload className="h-8 w-8 text-sky-300" />
-            <div className="text-sm font-bold text-sky-100">拖放即传至主机 SilkWarpRecv</div>
-            <div className="text-[10px] text-slate-400">松开鼠标后立即开始 Mesh 直连上传</div>
+            <div className="text-sm font-bold text-sky-100">拖放文件即发送到对方电脑</div>
+            <div className="text-[10px] text-slate-400">松开鼠标后立即高速直连上传</div>
           </div>
         )}
         {/* Title bar */}
@@ -792,7 +811,7 @@ export function SessionBar() {
           </span>
           {state.reconnecting && (
             <span className="flex items-center gap-1 rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[9px] font-semibold text-amber-200">
-              <RefreshCw className="h-2.5 w-2.5 animate-spin" /> 应用参数并重连…
+              <RefreshCw className="h-2.5 w-2.5 animate-spin" /> 正在切换画面设置…
             </span>
           )}
           <div className="ml-auto flex items-center gap-1">
@@ -815,6 +834,20 @@ export function SessionBar() {
           </div>
         </div>
 
+        {actionBanner && (
+          <div className="px-3 pt-2">
+            <div
+              className={`rounded-lg border px-2.5 py-1.5 text-[10px] font-medium ${
+                actionBanner.ok
+                  ? "border-emerald-400/35 bg-emerald-500/15 text-emerald-100"
+                  : "border-red-400/35 bg-red-500/15 text-red-100"
+              }`}
+            >
+              {actionBanner.text}
+            </div>
+          </div>
+        )}
+
         <div className="flex-1 space-y-3 overflow-y-auto px-3 py-2.5 text-slate-200">
           {/* Section 1: display */}
           <div className="space-y-1.5">
@@ -822,7 +855,15 @@ export function SessionBar() {
 
             <div className="grid grid-cols-2 gap-1.5">
               <div>
-                <div className="mb-0.5 text-[9px] text-slate-500">显示模式</div>
+                <div className="mb-0.5 flex items-center justify-between text-[9px] text-slate-500">
+                  <span>显示模式</span>
+                  <kbd
+                    title="全屏切换快捷键：Ctrl+Alt+F 或 Ctrl+Alt+Enter"
+                    className="rounded border border-white/15 bg-black/30 px-1 font-mono text-[8px] text-slate-400"
+                  >
+                    Ctrl+Alt+F
+                  </kbd>
+                </div>
                 <Segmented<DisplayMode>
                   value={preset.displayMode}
                   options={[
@@ -830,15 +871,22 @@ export function SessionBar() {
                     { value: "borderless", label: "无边框" },
                     { value: "fullscreen", label: "全屏" },
                   ]}
-                  onChange={(displayMode) => patchOptions({ displayMode })}
+                  onChange={(displayMode) => {
+                    if (displayMode === preset.displayMode) return;
+                    if (displayMode !== "borderless" && preset.displayMode !== "borderless") {
+                      void bridge.toggleSessionFullscreen().then(applySession);
+                    } else {
+                      patchOptions({ displayMode });
+                    }
+                  }}
                 />
               </div>
               <div>
-                <div className="mb-0.5 text-[9px] text-slate-500">画面源</div>
+                <div className="mb-0.5 text-[9px] text-slate-500">屏幕模式</div>
                 <Segmented<StreamAppTarget>
                   value={preset.streamApp}
                   options={[
-                    { value: "Virtual Display", label: "虚拟屏" },
+                    { value: "Virtual Display", label: "扩展虚拟屏" },
                     { value: "Desktop", label: "物理桌面" },
                   ]}
                   onChange={(streamApp) => patchOptions({ streamApp })}
@@ -848,13 +896,37 @@ export function SessionBar() {
 
             <div>
               <div className="mb-0.5 flex items-center justify-between text-[9px] text-slate-500">
-                <span>分辨率 {preset.resolution}</span>
+                <span>分辨率策略</span>
+                <span className="font-mono text-slate-400">
+                  当前 {preset.resolution.replace("x", "×")}
+                  {preset.resolutionMode === "follow_client" && state.clientDisplayResolution
+                    ? ` · 本机 ${state.clientDisplayResolution.replace("x", "×")}`
+                    : preset.resolutionMode === "follow_host" && state.hostDisplayResolution
+                      ? ` · 对方 ${state.hostDisplayResolution.replace("x", "×")}`
+                      : ""}
+                </span>
+              </div>
+              <Segmented<ResolutionMode>
+                value={preset.resolutionMode}
+                options={[
+                  { value: "follow_client", label: "跟随主控端" },
+                  { value: "follow_host", label: "跟随被控端" },
+                  { value: "fit_window", label: "适应窗口" },
+                  { value: "fixed", label: "固定" },
+                ]}
+                onChange={(mode) => void bridge.setSessionResolutionMode(mode).then(applySession)}
+              />
+            </div>
+
+            <div>
+              <div className="mb-0.5 flex items-center justify-between text-[9px] text-slate-500">
+                <span>固定分辨率快速选择</span>
                 <button
                   type="button"
-                  onClick={() => void bridge.fitSessionWindow().then((next) => next && setState(next))}
+                  onClick={() => void bridge.fitSessionWindow().then(applySession)}
                   className="rounded border border-sky-400/40 bg-sky-400/10 px-1.5 py-0.5 text-[9px] font-semibold text-sky-200 hover:bg-sky-400/20"
                 >
-                  适应窗口
+                  自适应当前窗口
                 </button>
               </div>
               <div className="flex gap-1">
@@ -862,9 +934,9 @@ export function SessionBar() {
                   <button
                     key={r.value}
                     type="button"
-                    onClick={() => patchOptions({ resolution: r.value })}
+                    onClick={() => void bridge.setSessionResolutionMode("fixed", r.value).then(applySession)}
                     className={`flex-1 rounded-md border px-1 py-1 text-[10px] font-semibold ${
-                      preset.resolution === r.value
+                      preset.resolutionMode === "fixed" && preset.resolution === r.value
                         ? "border-sky-400/60 bg-sky-400/15 text-sky-200"
                         : "border-white/10 bg-black/20 text-slate-300 hover:text-white"
                     }`}
@@ -944,8 +1016,8 @@ export function SessionBar() {
               <Toggle
                 checked={preset.lowLatency}
                 onChange={(lowLatency) => patchOptions({ lowLatency })}
-                label="低延迟零缓冲"
-                hint="去 V-Sync + 抗分片"
+                label="极速低延迟"
+                hint="减少画面延迟与拖影"
               />
               <Toggle
                 checked={preset.muteHostAudio}
@@ -988,7 +1060,7 @@ export function SessionBar() {
               className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-emerald-400/40 bg-gradient-to-r from-emerald-500/25 to-teal-500/20 px-2 py-1.5 text-[11px] font-bold text-emerald-100 hover:from-emerald-500/35 hover:to-teal-500/30"
             >
               <MousePointer2 className="h-3.5 w-3.5" />
-              切办公模式（0ms 本地光标）
+              切换轻办公模式
             </button>
           </div>
 
@@ -996,6 +1068,24 @@ export function SessionBar() {
           <div className="space-y-1.5">
             <SectionTitle icon={<Gauge className="h-3 w-3 text-slate-400" />}>快捷操作</SectionTitle>
             <div className="flex flex-wrap gap-1">
+              <button
+                type="button"
+                onClick={() => void bridge.toggleSessionFullscreen().then(applySession)}
+                className="inline-flex items-center gap-1 rounded-md border border-sky-400/35 bg-sky-500/10 px-2 py-1 text-[10px] font-semibold text-sky-200 hover:bg-sky-500/20"
+                title="快捷切换全屏/窗口（支持 Ctrl+Alt+F 或 Ctrl+Alt+Enter）"
+              >
+                {isFullscreen ? <Minimize2 className="h-3 w-3" /> : <Maximize2 className="h-3 w-3" />}
+                {isFullscreen ? "退出全屏" : "切换全屏"} (Ctrl+Alt+F)
+              </button>
+              <button
+                type="button"
+                disabled={busy || !state.agentConnected}
+                onClick={() => void handleSystemAction("repair_ime")}
+                title="已自动禁止本机输入法弹窗左上角漂移；如对方电脑中文输入法卡死，可点此一键重置远端输入法服务"
+                className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-black/20 px-2 py-1 text-[10px] text-slate-300 hover:text-white disabled:opacity-40"
+              >
+                <Keyboard className="h-3 w-3 text-emerald-300" /> 修复输入法
+              </button>
               <button
                 type="button"
                 onClick={() => void bridge.sendSessionHotkey("mouse")}
@@ -1043,7 +1133,7 @@ export function SessionBar() {
 
             {!state.agentConnected ? (
               <div className="rounded-lg border border-dashed border-white/10 bg-black/10 px-2 py-1.5 text-[10px] text-slate-500">
-                Host Companion Agent 未连接，无法切换被控端显示器
+                远控增强服务未就绪，暂不支持切换被控端显示器
               </div>
             ) : state.displays.length === 0 ? (
               <div className="rounded-lg border border-dashed border-white/10 bg-black/10 px-2 py-1.5 text-[10px] text-slate-500">
@@ -1087,19 +1177,19 @@ export function SessionBar() {
                 checked={state.hostMuted}
                 onChange={(next) => void handleHostMute(next)}
                 label="被控静音"
-                hint={state.agentConnected ? "被控端扬声器主静音" : "本机静音（Agent 未连接）"}
+                hint={state.agentConnected ? "被控端扬声器主静音" : "本机静音（增强服务未就绪）"}
               />
               <Toggle
                 checked={state.privacyActive}
                 onChange={(next) => void handlePrivacy(next)}
                 disabled={!state.agentConnected || !state.privacySupported}
-                title="被控端物理屏全黑，采集侧仍可见真实桌面；在被控端按 Ctrl+Alt+Shift+P 可立即恢复显示"
+                title="被控端物理屏全黑，仅远程可见真实桌面；在被控端按 Ctrl+Alt+Shift+P 可立即恢复显示"
                 label="防窥隐私屏"
                 hint={
                   !state.agentConnected
-                    ? "需要被控端 Host Companion Agent"
+                    ? "需要被控端增强服务就绪"
                     : state.privacySupported
-                      ? "被控端物理屏黑屏，本机 Ctrl+Alt+Shift+P 可救援"
+                      ? "对方物理屏黑屏，本机 Ctrl+Alt+Shift+P 可救援"
                       : "仅支持 Windows 被控端"
                 }
               />
@@ -1140,18 +1230,6 @@ export function SessionBar() {
                 );
               })}
             </div>
-
-            {actionBanner && (
-              <div
-                className={`rounded-lg border px-2 py-1 text-[10px] ${
-                  actionBanner.ok
-                    ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-100"
-                    : "border-red-400/30 bg-red-500/10 text-red-100"
-                }`}
-              >
-                {actionBanner.text}
-              </div>
-            )}
           </div>
 
           {/* Stage 3: clipboard sync + file transfer */}
@@ -1170,7 +1248,7 @@ export function SessionBar() {
 
             {!state.agentConnected ? (
               <div className="rounded-lg border border-dashed border-white/10 bg-black/10 px-2 py-1.5 text-[10px] text-slate-500">
-                Host Companion Agent 未连接，文件与剪贴板通道不可用
+                远控增强服务未就绪，暂不支持文件与剪贴板通道
               </div>
             ) : (
               <>
@@ -1258,8 +1336,8 @@ export function SessionBar() {
 
         <div className="flex items-center justify-between border-t border-white/10 px-3 py-1.5 text-[9px] text-slate-500">
           <span className="inline-flex items-center gap-1">
-            <Radio className="h-2.5 w-2.5" /> {state.resolvedApp}
-            {state.availableApps.length > 0 ? ` · ${state.availableApps.length} 个应用` : ""}
+            <Radio className="h-2.5 w-2.5" /> {state.resolvedApp === "Virtual Display" ? "扩展虚拟屏" : "物理桌面"}
+            {state.availableApps.length > 0 ? ` · ${state.availableApps.length} 个桌面模式` : ""}
           </span>
           <span className="inline-flex items-center gap-1">
             {preset.lowLatency ? <Zap className="h-2.5 w-2.5 text-amber-300" /> : <MonitorOff className="h-2.5 w-2.5" />}

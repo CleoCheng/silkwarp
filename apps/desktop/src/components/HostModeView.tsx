@@ -180,14 +180,28 @@ export function HostModeView({
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
-            <label className="inline-flex items-center gap-2 text-xs text-slate-200 cursor-pointer">
+            <label
+              className="inline-flex items-center gap-2 text-xs text-slate-200 cursor-pointer"
+              title="开启后将同时启用开机底层网络隧道，机器重启停在 Windows 登录界面也能直接远程解锁"
+            >
               <input
                 type="checkbox"
                 checked={settings.autoStart}
                 onChange={(e) => void onUpdateHostSettings({ autoStart: e.target.checked })}
                 className="rounded border-edge bg-panelHover text-sky-400"
               />
-              开机自启 SilkWarp
+              <span>开机自启 SilkWarp</span>
+              {settings.autoStart && (
+                <span
+                  className={`rounded-full border px-2 py-0.5 text-[10px] font-medium ${
+                    host.bootTunnelConfigured
+                      ? "border-emerald-500/35 bg-emerald-500/15 text-emerald-300"
+                      : "border-amber-500/35 bg-amber-500/15 text-amber-200"
+                  }`}
+                >
+                  {host.bootTunnelConfigured ? "锁屏可达" : "仅登录后启动"}
+                </span>
+              )}
             </label>
             <button
               type="button"
@@ -252,7 +266,7 @@ export function HostModeView({
                     : "bg-slate-800 text-slate-400 border-edge"
                 }`}
               >
-                Companion Agent · {host.agentRunning ? `${host.agentPort} 运行中` : "未启动"}
+                安全与传输服务 · {host.agentRunning ? "运行中" : "未启动"}
               </span>
             </div>
             <p className="text-xs text-slate-400 leading-relaxed max-w-2xl">
@@ -447,7 +461,7 @@ export function HostModeView({
           <div className="space-y-1">
             <div className="flex items-center gap-2">
               <MousePointer2 className="w-4 h-4 text-emerald-300" />
-              <h3 className="text-sm font-bold text-slate-50">办公极速光标通道（自建 RustDesk）</h3>
+              <h3 className="text-sm font-bold text-slate-50">轻办公通道（0ms 本地光标）</h3>
               <span
                 className={`text-[11px] px-2 py-0.5 rounded-full font-medium border ${
                   host.rustdeskInstalled
@@ -459,14 +473,14 @@ export function HostModeView({
               </span>
             </div>
             <p className="text-xs text-slate-400 leading-relaxed max-w-2xl">
-              高刷看视频、设计渲染请使用上面的 Apollo 低延迟串流；文字办公、精细点击、操作锁屏 / UAC 弹窗时，
-              其他设备可一键切入 RustDesk，获得 <strong className="text-emerald-200">0ms 本地硬件光标</strong>。
-              本机只需配齐自建中继与公钥，其他设备即可随时切入。
+              高刷看视频、设计渲染请使用上面的极速高清远控；文字办公、精细点击、操作锁屏 / UAC 弹窗时，
+              其他设备可一键切入轻办公模式，获得 <strong className="text-emerald-200">0ms 本地硬件光标</strong>。
+              本机只需配齐自建服务器参数，其他设备即可随时切入。
             </p>
           </div>
 
           <div className="rounded-xl border border-edge bg-obsidian/70 px-4 py-2.5 text-xs min-w-[170px]">
-            <div className="text-slate-500">当前 RustDesk ID</div>
+            <div className="text-slate-500">当前轻办公识别码</div>
             <div className="mt-0.5 font-mono text-base font-bold text-emerald-200">
               {host.rustdeskId || "未读取到"}
             </div>
@@ -475,13 +489,13 @@ export function HostModeView({
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-[11px]">
           <div className="rounded-xl border border-edge bg-obsidian/60 px-3 py-2 flex items-center justify-between">
-            <span className="text-slate-400">RustDesk 客户端</span>
+            <span className="text-slate-400">轻办公引擎组件</span>
             <span className={host.rustdeskInstalled ? "text-emerald-300 font-semibold" : "text-amber-300 font-semibold"}>
               {host.rustdeskInstalled ? "已安装" : "待安装"}
             </span>
           </div>
           <div className="rounded-xl border border-edge bg-obsidian/60 px-3 py-2 flex items-center justify-between">
-            <span className="text-slate-400">本机 ID 上报</span>
+            <span className="text-slate-400">本机识别码同步</span>
             <span className={host.rustdeskId ? "text-emerald-300 font-semibold" : "text-amber-300 font-semibold"}>
               {host.rustdeskId ? "已就绪" : "待同步"}
             </span>
@@ -498,7 +512,7 @@ export function HostModeView({
           {!host.rustdeskInstalled ? (
             <button
               type="button"
-              onClick={() => void onInstallRustDesk().then(() => notify("已下载并启动 RustDesk 安装，完成后将自动接入自建中继")).catch((e) => notify(e.message))}
+              onClick={() => void onInstallRustDesk().then(() => notify("已下载并启动轻办公组件安装，完成后将自动接入中继")).catch((e) => notify(e.message))}
               className="inline-flex items-center gap-1.5 rounded-xl bg-gradient-to-r from-emerald-400 to-teal-500 px-4 py-2 text-xs font-bold text-slate-950 hover:opacity-95"
             >
               <Download className="w-3.5 h-3.5" /> 一键安装并接入自建中继
@@ -506,7 +520,7 @@ export function HostModeView({
           ) : (
             <button
               type="button"
-              onClick={() => void onConfigureRustDesk().then(() => notify("已同步自建 RustDesk 中继配置")).catch((e) => notify(e.message))}
+              onClick={() => void onConfigureRustDesk().then(() => notify("已同步轻办公通道中继配置")).catch((e) => notify(e.message))}
               className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-xs font-bold text-emerald-200 hover:bg-emerald-500/25"
             >
               <Wrench className="w-3.5 h-3.5" /> 同步自建服务器配置
@@ -521,7 +535,7 @@ export function HostModeView({
           </button>
           {host.rustdeskInstalled && (
             <span className="text-[11px] text-slate-500">
-              配置写入后会重启 RustDesk 使 ID / 中继立即生效。
+              配置写入后会重启轻办公服务使识别码与中继立即生效。
             </span>
           )}
         </div>

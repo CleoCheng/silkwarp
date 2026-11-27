@@ -5,18 +5,22 @@ const assert = require("node:assert/strict");
 
 const {
   DEFAULT_STREAM_PRESET,
+  buildMoonlightSpawnEnv,
   buildMoonlightStreamArgs,
   computeEffectivePreset,
   normalizeStreamPreset,
   normalizeWindowResolution,
+  pickHostNativeDisplay,
   resolvePacketSize,
   resolveStreamAppTarget,
+  resolveTargetResolution,
 } = require("../dist-electron/services/streamOptions.js");
 
 test("normalizeStreamPreset: undefined returns the full default preset", () => {
   assert.deepEqual(normalizeStreamPreset(undefined), DEFAULT_STREAM_PRESET);
   assert.deepEqual(normalizeStreamPreset(null), DEFAULT_STREAM_PRESET);
   assert.equal(DEFAULT_STREAM_PRESET.displayMode, "windowed");
+  assert.equal(DEFAULT_STREAM_PRESET.resolutionMode, "follow_client");
   assert.equal(DEFAULT_STREAM_PRESET.muteHostAudio, true);
   assert.equal(DEFAULT_STREAM_PRESET.lowLatency, true);
   assert.equal(DEFAULT_STREAM_PRESET.streamApp, "Virtual Display");
@@ -188,4 +192,87 @@ test("buildMoonlightStreamArgs: h264 codec maps to H.264", () => {
   const preset = normalizeStreamPreset({ codec: "h264" });
   const args = buildMoonlightStreamArgs("10.144.0.11", preset, "p2p", "Desktop");
   assert.equal(args[args.indexOf("--video-codec") + 1], "H.264");
+});
+
+test("normalizeStreamPreset: resolutionMode validates and preserves allowed modes", () => {
+  for (const mode of ["follow_client", "follow_host", "fit_window", "fixed"]) {
+    assert.equal(normalizeStreamPreset({ resolutionMode: mode }).resolutionMode, mode);
+  }
+  assert.equal(normalizeStreamPreset({ resolutionMode: "bogus" }).resolutionMode, "follow_client");
+});
+
+test("pickHostNativeDisplay and resolveTargetResolution cover all 4 resolution modes", () => {
+  const displays = [
+    {
+      index: 0,
+      id: "\\\\.\\DISPLAY1",
+      deviceName: "\\\\.\\DISPLAY1",
+      friendlyName: "Primary 4K",
+      width: 3840,
+      height: 2160,
+      x: 0,
+      y: 0,
+      isPrimary: true,
+      isVirtual: false,
+      active: true,
+    },
+    {
+      index: 1,
+      id: "\\\\.\\DISPLAY2",
+      deviceName: "\\\\.\\DISPLAY2",
+      friendlyName: "Apollo Virtual Display",
+      width: 2560,
+      height: 1440,
+      x: 3840,
+      y: 0,
+      isPrimary: false,
+      isVirtual: true,
+      active: true,
+    },
+  ];
+
+  assert.equal(pickHostNativeDisplay(displays).id, "\\\\.\\DISPLAY1");
+
+  const fc = resolveTargetResolution("follow_client", "1920x1080", {
+    clientSize: { width: 2561, height: 1601 },
+    availableApps: ["Desktop", "Virtual Display"],
+  });
+  assert.deepEqual(fc, { resolution: "2560x1600", streamApp: "Virtual Display" });
+
+  const fh = resolveTargetResolution("follow_host", "1920x1080", {
+    hostDisplays: displays,
+    selectedDisplayId: "\\\\.\\DISPLAY2",
+    availableApps: ["Desktop", "Virtual Display"],
+  });
+  assert.deepEqual(fh, { resolution: "3840x2160", streamApp: "Desktop" });
+
+  const fw = resolveTargetResolution("fit_window", "1920x1080", {
+    windowRect: {
+      x: 0,
+      y: 0,
+      width: 1400,
+      height: 900,
+      clientWidth: 1367,
+      clientHeight: 769,
+      visible: true,
+      minimized: false,
+      foreground: true,
+    },
+    availableApps: ["Desktop", "Virtual Display"],
+  });
+  assert.deepEqual(fw, { resolution: "1366x768", streamApp: "Virtual Display" });
+
+  const fx = resolveTargetResolution("fixed", "2560x1440", {
+    clientSize: { width: 1280, height: 720 },
+    hostDisplays: displays,
+    currentStreamApp: "Desktop",
+  });
+  assert.deepEqual(fx, { resolution: "2560x1440", streamApp: "Desktop" });
+});
+
+test("buildMoonlightSpawnEnv injects SDL3/SDL2 IME UI suppression hints", () => {
+  const env = buildMoonlightSpawnEnv({ PATH: "C:\\Windows" });
+  assert.equal(env.PATH, "C:\\Windows");
+  assert.equal(env.SDL_IME_SHOW_UI, "0");
+  assert.equal(env.SDL_IME_IMPLEMENTED_UI, "composition,candidates");
 });

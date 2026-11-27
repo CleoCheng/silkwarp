@@ -1,3 +1,4 @@
+import { screen } from "electron";
 import type { ChildProcess } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -6,13 +7,16 @@ import type {
   ActiveSessionState,
   BootstrapConfig,
   DeviceInfo,
+  DisplayMode,
   DisplayMonitorInfo,
   PeerStatus,
   RemoteFileListing,
+  ResolutionMode,
   SessionHotkeyAction,
   StreamPreset,
   SystemActionType,
   TransferTaskItem,
+  WindowRect,
 } from "../types";
 import {
   ClipboardSyncManager,
@@ -28,7 +32,9 @@ import {
   computeEffectivePreset,
   normalizeStreamPreset,
   normalizeWindowResolution,
+  pickHostNativeDisplay,
   resolveStreamAppTarget,
+  resolveTargetResolution,
 } from "./streamOptions";
 import {
   fetchAvailableApolloApps,
@@ -39,6 +45,7 @@ import { WindowTracker } from "./windowTracker";
 
 const RELOAD_DEBOUNCE_MS = 250;
 const PROCESS_EXIT_TIMEOUT_MS = 2000;
+const APPLIST_CACHE_TTL_MS = 60_000;
 /** How many finished/running transfers stay visible in the session bar. */
 const MAX_TRANSFER_TASKS = 12;
 /** Progress IPC updates are coalesced to ~10 Hz per transfer. */
@@ -88,6 +95,8 @@ export class StreamSessionManager {
   private transfers: TransferTaskItem[] = [];
   private transferEmitTimers = new Map<string, NodeJS.Timeout>();
   private transferLastEmit = new Map<string, number>();
+  private availableAppsCache = new Map<string, { apps: string[]; expiresAt: number }>();
+  private hostNativeResolutionCache = new Map<string, string>();
 
   constructor(
     store: StateStore,
@@ -173,7 +182,52 @@ export class StreamSessionManager {
     });
   }
 
-  private spawnFor(active: ActiveSessionState): void {
+  getLocalDisplayResolution(): string {
+    const size = this.getClientDisplaySize(this.active?.windowRect ?? null);
+    return normalizeWindowResolution(size.width, size.height);
+  }
+
+  private getClientDisplaySize(winRect: WindowRect | null): { width: number; height: number } {
+    try {
+      let disp: Electron.Display;
+      if (winRect && winRect.width > 0 && winRect.height > 0) {
+        const dip = screen.screenToDipRect(null, {
+          x: winRect.x,
+          y: winRect.y,
+          width: winRect.width,
+          height: winRect.height,
+        });
+        disp = screen.getDisplayMatching(dip);
+      } else {
+        disp = screen.getPrimaryDisplay();
+      }
+      const scale = disp.scaleFactor || 1;
+      return {
+        width: Math.round(disp.size.width * scale),
+        height: Math.round(disp.size.height * scale),
+      };
+    } catch {
+      return { width: 1920, height: 1080 };
+    }
+  }
+
+  isSessionFocused(): boolean {
+    return Boolean(this.active && (this.active.windowRect?.foreground || this.floatingBar?.isFocused()));
+  }
+
+  private async getOrFetchAvailableApps(meshIp: string, apolloPort: number): Promise<string[]> {
+    const cached = this.availableAppsCache.get(meshIp);
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.apps;
+    }
+    const apps = await fetchAvailableApolloApps(meshIp, apolloPort, 1500);
+    if (apps.length > 0) {
+      this.availableAppsCache.set(meshIp, { apps, expiresAt: Date.now() + APPLIST_CACHE_TTL_MS });
+    }
+    return apps;
+  }
+
+  private spawnFor(active: ActiveSessionState, onFirstWindow?: () => void): void {
     const child = spawnMoonlightStreamProcess(
       active.device.mesh_ip,
       active.preset,
@@ -182,20 +236,32 @@ export class StreamSessionManager {
     );
     this.moonlight = child;
 
+    let firstWindowFired = false;
     const pid = child.pid;
     if (pid) {
-      this.tracker = new WindowTracker(pid, {
-        onRect: (rect) => {
-          if (this.active !== active) return;
-          active.windowRect = rect;
-          this.floatingBar?.updateAnchor(rect);
-          this.broadcast();
+      this.tracker = new WindowTracker(
+        pid,
+        {
+          onRect: (rect) => {
+            if (this.active !== active) return;
+            if (!firstWindowFired) {
+              firstWindowFired = true;
+              onFirstWindow?.();
+            }
+            active.windowRect = rect;
+            this.floatingBar?.updateAnchor(rect);
+            this.broadcast();
+          },
+          onExit: () => {
+            if (this.closing || this.active !== active || active.reconnecting) return;
+            void this.disconnect();
+          },
         },
-        onExit: () => {
-          if (this.closing || this.active !== active || active.reconnecting) return;
-          void this.disconnect();
+        {
+          windowTitle: `SilkWarp - ${active.device.name}`,
+          suppressLocalIme: true,
         },
-      });
+      );
     }
 
     const handleUnexpectedExit = () => {
@@ -214,9 +280,10 @@ export class StreamSessionManager {
     routeType: string,
     latencyMs: number | null,
     agentContext?: { agentConnected: boolean; agentPort: number; agentToken: string },
+    options?: { prefetchedApps?: string[]; onFirstWindow?: () => void },
   ): Promise<ActiveSessionState> {
     return this.runLifecycle(() =>
-      this.startSessionInternal(device, routeType, latencyMs, agentContext),
+      this.startSessionInternal(device, routeType, latencyMs, agentContext, options),
     );
   }
 
@@ -225,6 +292,7 @@ export class StreamSessionManager {
     routeType: string,
     latencyMs: number | null,
     agentContext?: { agentConnected: boolean; agentPort: number; agentToken: string },
+    options?: { prefetchedApps?: string[]; onFirstWindow?: () => void },
   ): Promise<ActiveSessionState> {
     const generation = ++this.generation;
 
@@ -254,10 +322,55 @@ export class StreamSessionManager {
       throw new Error("连接请求已被更新的会话取代。");
     }
 
-    const preset = normalizeStreamPreset(this.store.get().preset);
-    const availableApps = await fetchAvailableApolloApps(device.mesh_ip, device.apollo_port || 47984);
+    const basePreset = normalizeStreamPreset(this.store.get().preset);
+    let availableApps = options?.prefetchedApps ?? [];
+    if (availableApps.length > 0) {
+      this.availableAppsCache.set(device.mesh_ip, {
+        apps: availableApps,
+        expiresAt: Date.now() + APPLIST_CACHE_TTL_MS,
+      });
+    } else {
+      availableApps = await this.getOrFetchAvailableApps(device.mesh_ip, device.apollo_port || 47984);
+    }
     if (generation !== this.generation) {
       throw new Error("连接请求已被更新的会话取代。");
+    }
+
+    const clientSize = this.getClientDisplaySize(null);
+    const clientDisplayResolution = normalizeWindowResolution(clientSize.width, clientSize.height);
+    const cachedHostRes = this.hostNativeResolutionCache.get(device.id) || "";
+    const cachedHostDisplays: DisplayMonitorInfo[] = cachedHostRes
+      ? [
+          {
+            index: 0,
+            id: "cached-host",
+            deviceName: "cached-host",
+            friendlyName: "Host Primary",
+            width: Number(cachedHostRes.split("x")[0]) || 1920,
+            height: Number(cachedHostRes.split("x")[1]) || 1080,
+            x: 0,
+            y: 0,
+            isPrimary: true,
+            isVirtual: false,
+            active: true,
+          },
+        ]
+      : [];
+
+    const resolvedTarget = resolveTargetResolution(basePreset.resolutionMode, basePreset.resolution, {
+      clientSize,
+      hostDisplays: cachedHostDisplays,
+      availableApps,
+      currentStreamApp: basePreset.streamApp,
+    });
+
+    const preset = normalizeStreamPreset({
+      ...basePreset,
+      resolution: resolvedTarget.resolution,
+      streamApp: resolvedTarget.streamApp,
+    });
+    if (preset.resolution !== basePreset.resolution || preset.streamApp !== basePreset.streamApp) {
+      this.store.update({ preset });
     }
     const resolvedApp = resolveStreamAppTarget(preset.streamApp, availableApps);
 
@@ -270,6 +383,8 @@ export class StreamSessionManager {
       latencyMs,
       resolvedApp,
       availableApps,
+      clientDisplayResolution,
+      hostDisplayResolution: cachedHostRes || undefined,
       windowRect: null,
       reconnecting: false,
       startedAt: Date.now(),
@@ -293,7 +408,7 @@ export class StreamSessionManager {
     bar.updateAnchor(null);
 
     try {
-      this.spawnFor(active);
+      this.spawnFor(active, options?.onFirstWindow);
     } catch (err) {
       this.active = null;
       this.agentConnected = false;
@@ -303,15 +418,17 @@ export class StreamSessionManager {
       throw err;
     }
 
+    // Launch stream & floating bar immediately, then hydrate host displays/audio/privacy asynchronously.
+    this.broadcast();
     if (this.agentConnected) {
-      await this.hydrateAgentState(active, generation);
+      void this.hydrateAgentState(active, generation).then(() => {
+        if (generation === this.generation && this.active === active) {
+          this.broadcast();
+        }
+      });
       this.startClipboardSync();
     }
 
-    if (generation !== this.generation || this.active !== active) {
-      return active;
-    }
-    this.broadcast();
     return active;
   }
 
@@ -349,6 +466,29 @@ export class StreamSessionManager {
 
     if (!active.selectedDisplayId && active.displays.length > 0) {
       active.selectedDisplayId = this.inferSelectedDisplay(active.displays, active.preset.streamApp);
+    }
+
+    if (active.displays.length > 0) {
+      const native = pickHostNativeDisplay(active.displays, active.selectedDisplayId);
+      if (native) {
+        const hostRes = normalizeWindowResolution(native.width, native.height);
+        active.hostDisplayResolution = hostRes;
+        this.hostNativeResolutionCache.set(active.device.id, hostRes);
+        if (
+          active.preset.resolutionMode === "follow_host" &&
+          (hostRes !== active.preset.resolution || active.preset.streamApp !== "Desktop")
+        ) {
+          const updated = normalizeStreamPreset({
+            ...active.preset,
+            resolution: hostRes,
+            streamApp: "Desktop",
+          });
+          this.store.update({ preset: updated });
+          active.preset = updated;
+          active.effectivePreset = computeEffectivePreset(updated, active.routeType);
+          this.scheduleReload();
+        }
+      }
     }
 
     if (active.effectivePreset.muteHostAudio) {
@@ -424,10 +564,10 @@ export class StreamSessionManager {
     await this.stopCurrentProcess();
     if (generation !== this.generation || this.active !== active) return;
 
-    const availableApps = await fetchAvailableApolloApps(
-      active.device.mesh_ip,
-      active.device.apollo_port || 47984,
-    );
+    const availableApps =
+      active.availableApps.length > 0
+        ? active.availableApps
+        : await this.getOrFetchAvailableApps(active.device.mesh_ip, active.device.apollo_port || 47984);
     if (generation !== this.generation || this.active !== active) return;
 
     active.availableApps = availableApps;
@@ -573,7 +713,7 @@ export class StreamSessionManager {
 
   async listRemoteFiles(dirPath?: string): Promise<RemoteFileListing> {
     if (!this.agentConnected || !this.agentToken) {
-      throw new Error("Host Companion Agent 未连接，无法浏览远端文件。");
+      throw new Error("远控增强服务未连接，无法浏览对方文件。");
     }
     return this.agentClient.listRemoteFiles(this.agentHost, this.agentPort, this.agentToken, dirPath);
   }
@@ -585,7 +725,7 @@ export class StreamSessionManager {
    */
   async uploadFiles(localPaths: string[], targetDir?: string): Promise<TransferTaskItem[]> {
     if (!this.agentConnected || !this.agentToken) {
-      throw new Error("Host Companion Agent 未连接，无法上传文件。");
+      throw new Error("远控增强服务未连接，无法上传文件。");
     }
     const paths = (Array.isArray(localPaths) ? localPaths : [])
       .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
@@ -649,7 +789,7 @@ export class StreamSessionManager {
 
   async downloadRemoteFile(remotePath: string, localSavePath: string): Promise<TransferTaskItem> {
     if (!this.agentConnected || !this.agentToken) {
-      throw new Error("Host Companion Agent 未连接，无法下载文件。");
+      throw new Error("远控增强服务未连接，无法下载文件。");
     }
     const task: TransferTaskItem = {
       id: crypto.randomUUID(),
@@ -813,7 +953,7 @@ export class StreamSessionManager {
       return { ok: false, message: "当前没有活跃的远程会话。" };
     }
     if (!this.agentConnected || !this.agentToken) {
-      return { ok: false, message: "目标主机的 Host Companion Agent 未连接，无法执行远程系统操作。" };
+      return { ok: false, message: "目标电脑的远控增强服务未连接，无法执行远程系统操作。" };
     }
     return this.agentClient.runSystemAction(this.agentHost, this.agentPort, this.agentToken, action);
   }
@@ -824,6 +964,73 @@ export class StreamSessionManager {
     active.autoLockOnDisconnect = enabled;
     this.broadcast();
     return active;
+  }
+
+  async setResolutionMode(
+    mode: ResolutionMode,
+    fixedResolution?: string,
+  ): Promise<ActiveSessionState | null> {
+    const current = this.store.get().preset;
+    const active = this.active;
+    if (!active) {
+      if (mode === "fixed" && fixedResolution) {
+        this.store.update({ preset: normalizeStreamPreset({ ...current, resolutionMode: "fixed", resolution: fixedResolution }) });
+      } else if (mode === "follow_client") {
+        const res = this.getLocalDisplayResolution();
+        this.store.update({ preset: normalizeStreamPreset({ ...current, resolutionMode: "follow_client", resolution: res }) });
+      } else {
+        this.store.update({ preset: normalizeStreamPreset({ ...current, resolutionMode: mode }) });
+      }
+      return null;
+    }
+
+    if (mode === "fit_window") {
+      return this.fitToWindow();
+    }
+
+    if (mode === "follow_client") {
+      const clientSize = this.getClientDisplaySize(active.windowRect);
+      const clientRes = normalizeWindowResolution(clientSize.width, clientSize.height);
+      active.clientDisplayResolution = clientRes;
+      const target = resolveTargetResolution("follow_client", current.resolution, {
+        clientSize,
+        availableApps: active.availableApps,
+        currentStreamApp: active.preset.streamApp,
+      });
+      return this.updateOptions({
+        resolutionMode: "follow_client",
+        resolution: target.resolution,
+        streamApp: target.streamApp,
+      });
+    }
+
+    if (mode === "follow_host") {
+      if (active.displays.length === 0 && this.agentConnected && this.agentToken) {
+        await this.refreshDisplays().catch(() => null);
+      }
+      const native = pickHostNativeDisplay(active.displays, active.selectedDisplayId);
+      if (native) {
+        const hostRes = normalizeWindowResolution(native.width, native.height);
+        active.hostDisplayResolution = hostRes;
+        this.hostNativeResolutionCache.set(active.device.id, hostRes);
+      }
+      const target = resolveTargetResolution("follow_host", active.hostDisplayResolution || current.resolution, {
+        hostDisplays: active.displays,
+        selectedDisplayId: active.selectedDisplayId,
+        availableApps: active.availableApps,
+        currentStreamApp: active.preset.streamApp,
+      });
+      return this.updateOptions({
+        resolutionMode: "follow_host",
+        resolution: target.resolution,
+        streamApp: target.streamApp,
+      });
+    }
+
+    return this.updateOptions({
+      resolutionMode: "fixed",
+      resolution: fixedResolution || active.preset.resolution,
+    });
   }
 
   async fitToWindow(): Promise<ActiveSessionState | null> {
@@ -850,27 +1057,32 @@ export class StreamSessionManager {
 
     return this.updateOptions({
       resolution,
+      resolutionMode: "fit_window",
       streamApp: hasVirtualDisplay ? "Virtual Display" : cur.streamApp,
     });
   }
 
-  async toggleFullscreen(): Promise<ActiveSessionState | null> {
+  async toggleFullscreen(opts?: { fromHotkey?: boolean }): Promise<ActiveSessionState | null> {
     const active = this.active;
     if (!active) return null;
 
     const cur = active.preset.displayMode;
-    if ((cur === "windowed" || cur === "fullscreen") && this.tracker && active.windowRect) {
-      const nextMode = cur === "fullscreen" ? "windowed" : "fullscreen";
+    const nextMode: DisplayMode = cur === "windowed" ? "fullscreen" : "windowed";
+    if (this.tracker && active.windowRect) {
       const preset: StreamPreset = { ...active.preset, displayMode: nextMode };
       this.store.update({ preset });
       active.preset = preset;
       active.effectivePreset = computeEffectivePreset(preset, active.routeType);
-      this.tracker.sendHotkey("fullscreen");
       this.broadcast();
+      if (opts?.fromHotkey) {
+        await new Promise((r) => setTimeout(r, 140));
+        if (this.active !== active) return active;
+      }
+      this.tracker.sendHotkey("fullscreen");
       return active;
     }
 
-    return this.updateOptions({ displayMode: cur === "windowed" ? "fullscreen" : "windowed" });
+    return this.updateOptions({ displayMode: nextMode });
   }
 
   sendHotkey(action: SessionHotkeyAction): void {
@@ -916,7 +1128,7 @@ export class StreamSessionManager {
     }
     if (!active.device.rustdesk_id) {
       throw new Error(
-        `目标主机「${active.device.name}」尚未启用 RustDesk。请对方在【本机受控】页点击「一键安装并接入自建中继」后重试。`,
+        `目标电脑「${active.device.name}」尚未就绪轻办公模式。请对方在【本机受控 -> 高级与运维设置】中完成初始化后重试。`,
       );
     }
     const device = active.device;

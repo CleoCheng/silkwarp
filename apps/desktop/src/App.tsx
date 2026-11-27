@@ -131,7 +131,7 @@ export default function App() {
 
       {/* Main Content */}
       <main className="flex-1 p-6 overflow-y-auto space-y-5">
-        {state.easytier.needsElevation && (
+        {(state.easytier.needsElevation || (state.settings.isHost && state.host.provisionStage === "needs_admin")) && (
           <div className="rounded-2xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2 text-xs text-amber-100">
               <ShieldAlert className="w-4 h-4 text-amber-300 shrink-0" />

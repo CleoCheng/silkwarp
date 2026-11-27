@@ -66,12 +66,14 @@ export interface BootstrapConfig {
 }
 
 export type DisplayMode = "windowed" | "borderless" | "fullscreen";
+export type ResolutionMode = "follow_client" | "follow_host" | "fit_window" | "fixed";
 export type StreamAppTarget = "Virtual Display" | "Desktop";
 export type SystemKeyCaptureMode = "always" | "fullscreen" | "never";
 export type SessionHotkeyAction = "fullscreen" | "perf" | "mouse";
 
 export interface StreamPreset {
   resolution: string;
+  resolutionMode: ResolutionMode;
   fps: 30 | 60 | 120 | 144;
   bitrateMbps: number;
   codec: "hevc" | "av1" | "h264";
@@ -84,6 +86,18 @@ export interface StreamPreset {
   showPerfOverlay: boolean;
   captureSystemKeys: SystemKeyCaptureMode;
   packetSize: "auto" | number;
+}
+
+export interface ConnectProgressEvent {
+  deviceId: string;
+  deviceName: string;
+  stage: "connecting" | "verifying" | "pairing" | "launching" | "ready" | "error";
+  step: number;
+  totalSteps: number;
+  title: string;
+  detail: string;
+  routeType?: string;
+  latencyMs?: number | null;
 }
 
 export interface WindowRect {
@@ -107,6 +121,8 @@ export interface ActiveSessionState {
   latencyMs: number | null;
   resolvedApp: StreamAppTarget;
   availableApps: string[];
+  clientDisplayResolution?: string;
+  hostDisplayResolution?: string;
   windowRect: WindowRect | null;
   reconnecting: boolean;
   startedAt: number;
@@ -208,6 +224,7 @@ export interface HostHardwareInfo {
   rustdeskInstalled: boolean;
   rustdeskId: string;
   firewallConfigured: boolean;
+  bootTunnelConfigured?: boolean;
   uuRemoteDetected: boolean;
   provisionStage: ProvisionStage;
   provisionMessage: string;

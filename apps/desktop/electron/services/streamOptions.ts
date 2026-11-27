@@ -1,8 +1,11 @@
 import type {
   DisplayMode,
+  DisplayMonitorInfo,
+  ResolutionMode,
   StreamAppTarget,
   StreamPreset,
   SystemKeyCaptureMode,
+  WindowRect,
 } from "../types";
 
 /**
@@ -16,6 +19,7 @@ import type {
 
 export const DEFAULT_STREAM_PRESET: StreamPreset = {
   resolution: "2560x1440",
+  resolutionMode: "follow_client",
   fps: 120,
   bitrateMbps: 35,
   codec: "hevc",
@@ -34,6 +38,7 @@ const RESOLUTION_RE = /^\d{3,4}x\d{3,4}$/;
 const ALLOWED_FPS = [30, 60, 120, 144] as const;
 const ALLOWED_CODECS = ["hevc", "av1", "h264"] as const;
 const ALLOWED_DISPLAY_MODES: DisplayMode[] = ["windowed", "borderless", "fullscreen"];
+const ALLOWED_RESOLUTION_MODES: ResolutionMode[] = ["follow_client", "follow_host", "fit_window", "fixed"];
 const ALLOWED_STREAM_APPS: StreamAppTarget[] = ["Virtual Display", "Desktop"];
 const ALLOWED_SYSTEM_KEY_MODES: SystemKeyCaptureMode[] = ["always", "fullscreen", "never"];
 
@@ -78,6 +83,10 @@ export function normalizeStreamPreset(raw?: Partial<StreamPreset> | null): Strea
     ? (src.codec as StreamPreset["codec"])
     : d.codec;
 
+  const resolutionMode = ALLOWED_RESOLUTION_MODES.includes(src.resolutionMode as ResolutionMode)
+    ? (src.resolutionMode as ResolutionMode)
+    : d.resolutionMode;
+
   const displayMode = ALLOWED_DISPLAY_MODES.includes(src.displayMode as DisplayMode)
     ? (src.displayMode as DisplayMode)
     : d.displayMode;
@@ -92,6 +101,7 @@ export function normalizeStreamPreset(raw?: Partial<StreamPreset> | null): Strea
 
   return {
     resolution,
+    resolutionMode,
     fps,
     bitrateMbps: clampBitrate(src.bitrateMbps),
     codec,
@@ -117,6 +127,105 @@ export function normalizeWindowResolution(width: number, height: number): string
   const w = Math.floor(Math.min(3840, Math.max(800, safeWidth))) & ~1;
   const h = Math.floor(Math.min(2160, Math.max(600, safeHeight))) & ~1;
   return `${w}x${h}`;
+}
+
+/**
+ * Picks the best host display for "follow host native resolution": prefers
+ * the selected physical monitor, then primary physical monitor, then any valid monitor.
+ */
+export function pickHostNativeDisplay(
+  displays: DisplayMonitorInfo[],
+  selectedDisplayId?: string,
+): DisplayMonitorInfo | null {
+  const valid = displays.filter((d) => d && d.width > 0 && d.height > 0);
+  if (valid.length === 0) return null;
+
+  if (selectedDisplayId) {
+    const selected = valid.find((d) => d.id === selectedDisplayId && !d.isVirtual);
+    if (selected) return selected;
+  }
+
+  return (
+    valid.find((d) => d.isPrimary && !d.isVirtual) ??
+    valid.find((d) => !d.isVirtual) ??
+    valid.find((d) => d.isPrimary) ??
+    valid[0]
+  );
+}
+
+/**
+ * Resolves effective stream resolution and stream source based on UU-Remote-style
+ * resolution mode (`follow_client`, `follow_host`, `fit_window`, `fixed`).
+ */
+export function resolveTargetResolution(
+  mode: ResolutionMode,
+  fallbackResolution: string,
+  ctx: {
+    clientSize?: { width: number; height: number } | null;
+    hostDisplays?: DisplayMonitorInfo[];
+    selectedDisplayId?: string;
+    windowRect?: WindowRect | null;
+    availableApps?: string[];
+    currentStreamApp?: StreamAppTarget;
+  },
+): { resolution: string; streamApp: StreamAppTarget } {
+  const preferVirtual = (): StreamAppTarget => {
+    if (ctx.availableApps && ctx.availableApps.length > 0) {
+      return ctx.availableApps.some((a) => a.trim().toLowerCase() === "virtual display")
+        ? "Virtual Display"
+        : "Desktop";
+    }
+    return ctx.currentStreamApp ?? "Virtual Display";
+  };
+
+  if (mode === "follow_client") {
+    const cs = ctx.clientSize;
+    if (cs && Number.isFinite(cs.width) && cs.width > 0 && Number.isFinite(cs.height) && cs.height > 0) {
+      return {
+        resolution: normalizeWindowResolution(cs.width, cs.height),
+        streamApp: preferVirtual(),
+      };
+    }
+    return { resolution: fallbackResolution, streamApp: preferVirtual() };
+  }
+
+  if (mode === "follow_host") {
+    const native = pickHostNativeDisplay(ctx.hostDisplays ?? [], ctx.selectedDisplayId);
+    return {
+      resolution: native ? normalizeWindowResolution(native.width, native.height) : fallbackResolution,
+      streamApp: "Desktop",
+    };
+  }
+
+  if (mode === "fit_window") {
+    const rect = ctx.windowRect;
+    if (rect) {
+      const w = rect.clientWidth > 0 ? rect.clientWidth : rect.width - 16;
+      const h = rect.clientHeight > 0 ? rect.clientHeight : rect.height - 39;
+      return {
+        resolution: normalizeWindowResolution(w, h),
+        streamApp: preferVirtual(),
+      };
+    }
+    return { resolution: fallbackResolution, streamApp: preferVirtual() };
+  }
+
+  return {
+    resolution: fallbackResolution,
+    streamApp: ctx.currentStreamApp ?? "Virtual Display",
+  };
+}
+
+/**
+ * Configures SDL3/SDL2 environment variables so the local client IME does not
+ * hijack text input on the viewport window with a corner candidate box at (0,0).
+ */
+export function buildMoonlightSpawnEnv(baseEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return {
+    ...(baseEnv ?? process.env),
+    SDL_IME_SHOW_UI: "0",
+    SDL_IME_IMPLEMENTED_UI: "composition,candidates",
+  };
 }
 
 /**

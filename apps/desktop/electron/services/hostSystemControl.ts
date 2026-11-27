@@ -41,6 +41,7 @@ const ACTION_SUCCESS_MESSAGES: Record<SystemActionType, string> = {
   taskmgr: "已在被控端打开任务管理器",
   show_desktop: "已显示被控端桌面",
   sas: "已向被控端发送 Ctrl+Alt+Del",
+  repair_ime: "已重置被控端输入法服务",
   reboot: "已下发重启指令，被控端将在 2 秒后重启",
   shutdown: "已下发关机指令，被控端将在 2 秒后关机",
 };
@@ -271,6 +272,21 @@ public static class SilkWarpSas
 } catch {
     Write-Output '${SAS_DENIED_MARKER}'
 }
+`,
+      };
+
+    case "repair_ime":
+      return {
+        powershell: String.raw`
+$ErrorActionPreference = 'SilentlyContinue'
+Get-Process -Name 'TextInputHost','ChsIME' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process -Name 'ctfmon' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 150
+$ctfmon = Join-Path $env:WINDIR 'System32\ctfmon.exe'
+if (Test-Path -LiteralPath $ctfmon) {
+    Start-Process -FilePath $ctfmon -WindowStyle Hidden
+}
+Write-Output '${ACTION_OK_MARKER}'
 `,
       };
 

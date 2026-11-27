@@ -2,8 +2,8 @@ import { BrowserWindow, screen } from "electron";
 import path from "node:path";
 import type { ActiveSessionState, WindowRect } from "../types";
 
-export const COLLAPSED_SIZE = { width: 290, height: 38 };
-export const EXPANDED_SIZE = { width: 600, height: 560 };
+export const COLLAPSED_SIZE = { width: 350, height: 38 };
+export const EXPANDED_SIZE = { width: 610, height: 590 };
 
 const EDGE_MARGIN = 4;
 const TOP_OFFSET = 6;
@@ -142,6 +142,10 @@ export class FloatingBarWindow {
 
   isExpanded(): boolean {
     return this.expanded;
+  }
+
+  isFocused(): boolean {
+    return Boolean(this.win && !this.win.isDestroyed() && this.win.isFocused());
   }
 
   nudgeOffset(deltaX: number): void {

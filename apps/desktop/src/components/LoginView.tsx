@@ -134,7 +134,7 @@ export function LoginView({ initialApiUrl, onLogin }: LoginViewProps) {
 
         <div className="mt-5 pt-4 border-t border-edge/80 flex items-center gap-2 text-[11px] text-slate-400">
           <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-          <span>登录后自动同步专属 Mesh 虚拟网卡与团队主控权限，无需手动填 IP 或密钥。</span>
+          <span>登录后自动同步专属加密虚拟内网与团队主控权限，无需手动填 IP 或密钥。</span>
         </div>
       </div>
     </div>

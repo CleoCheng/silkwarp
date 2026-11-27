@@ -2,12 +2,14 @@ import type { SilkWarpBridge } from "../electron/preload";
 import type {
   ActiveSessionState,
   AppRuntimeState,
+  ConnectProgressEvent,
   DeviceAgentSessionResult,
   DeviceInfo,
   DisplayMonitorInfo,
   RemoteFileEntry,
   RemoteFileListing,
   RemoteRootDir,
+  ResolutionMode,
   StreamPreset,
   TransferTaskItem,
   UserInfo,
@@ -101,6 +103,13 @@ const PREVIEW_DEVICES: DeviceInfo[] = [
 
 let previewAuthed = false;
 let previewSessionState: ActiveSessionState | null = null;
+const previewProgressListeners = new Set<(event: ConnectProgressEvent | null) => void>();
+
+function emitPreviewProgress(event: ConnectProgressEvent | null): void {
+  for (const cb of previewProgressListeners) {
+    cb(event);
+  }
+}
 
 function buildPreviewSession(device: DeviceInfo): ActiveSessionState {
   return {
@@ -112,6 +121,8 @@ function buildPreviewSession(device: DeviceInfo): ActiveSessionState {
     latencyMs: device.latency_ms,
     resolvedApp: "Virtual Display",
     availableApps: ["Desktop", "Virtual Display"],
+    clientDisplayResolution: "2560x1440",
+    hostDisplayResolution: "3840x2160",
     windowRect: null,
     reconnecting: false,
     startedAt: Date.now(),
@@ -233,6 +244,7 @@ let previewState: AppRuntimeState = {
     apolloPass: "",
     preset: {
       resolution: "2560x1440",
+      resolutionMode: "follow_client",
       fps: 120,
       bitrateMbps: 35,
       codec: "hevc",
@@ -298,6 +310,7 @@ let previewState: AppRuntimeState = {
     rustdeskInstalled: true,
     rustdeskId: "391820411",
     firewallConfigured: true,
+    bootTunnelConfigured: true,
     uuRemoteDetected: false,
     provisionStage: "ready",
     provisionMessage: "已就绪，可随时接受远程连接",
@@ -352,8 +365,21 @@ const previewFallback: SilkWarpBridge = {
   connectDevice: async (device, opts) => {
     const denied = previewPasswordGate(device, opts);
     if (denied) return denied;
+    emitPreviewProgress({
+      deviceId: device.id,
+      deviceName: device.name,
+      stage: "connecting",
+      step: 1,
+      totalSteps: 3,
+      title: `正在连接 ${device.name}`,
+      detail: "正在并行建立高速加密通道与安全验证…",
+      routeType: device.route_type,
+      latencyMs: device.latency_ms,
+    });
+    await new Promise((r) => setTimeout(r, 220));
     previewSessionState = buildPreviewSession(device);
-    return { ok: true, stage: "connected", message: `正在远程连接 ${device.name}...` };
+    emitPreviewProgress(null);
+    return { ok: true, stage: "connected", message: `已连接「${device.name}」` };
   },
   retryProvision: async () => previewState,
   streamDevice: async (device, opts) => {
@@ -383,7 +409,13 @@ const previewFallback: SilkWarpBridge = {
   }),
   adminUpdateUser: async () => previewState.user!,
   adminDeleteUser: async () => true,
-  getSessionState: async (): Promise<ActiveSessionState | null> => previewSessionState,
+  getLocalDisplayResolution: async () => "2560x1440",
+  getSessionState: async (): Promise<ActiveSessionState | null> => {
+    if (!previewSessionState && typeof window !== "undefined" && window.location.hash === "#session-bar") {
+      previewSessionState = buildPreviewSession(PREVIEW_DEVICES[0]);
+    }
+    return previewSessionState;
+  },
   updateSessionOptions: async (patch: Partial<StreamPreset>) => {
     previewState = {
       ...previewState,
@@ -397,6 +429,33 @@ const previewFallback: SilkWarpBridge = {
         ...previewSessionState,
         preset: previewState.settings.preset,
         effectivePreset: previewState.settings.preset,
+      };
+    }
+    return previewSessionState;
+  },
+  setSessionResolutionMode: async (mode: ResolutionMode, fixedResolution?: string) => {
+    const nextRes =
+      mode === "follow_client"
+        ? "2560x1440"
+        : mode === "follow_host"
+          ? "3840x2160"
+          : mode === "fit_window"
+            ? "1920x1080"
+            : fixedResolution || previewState.settings.preset.resolution;
+    const nextApp = mode === "follow_host" ? "Desktop" : "Virtual Display";
+    const nextPreset: StreamPreset = {
+      ...previewState.settings.preset,
+      resolutionMode: mode,
+      resolution: nextRes,
+      streamApp: nextApp,
+    };
+    previewState = { ...previewState, settings: { ...previewState.settings, preset: nextPreset } };
+    if (previewSessionState) {
+      previewSessionState = {
+        ...previewSessionState,
+        preset: nextPreset,
+        effectivePreset: nextPreset,
+        resolvedApp: nextApp,
       };
     }
     return previewSessionState;
@@ -585,6 +644,12 @@ const previewFallback: SilkWarpBridge = {
     return previewState;
   },
   onSessionChanged: () => () => {},
+  onConnectProgress: (cb: (event: ConnectProgressEvent | null) => void) => {
+    previewProgressListeners.add(cb);
+    return () => {
+      previewProgressListeners.delete(cb);
+    };
+  },
   onStateChanged: () => () => {},
 };
 

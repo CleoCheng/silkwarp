@@ -217,8 +217,9 @@ export class HostAgentClient {
     host: string,
     port: number,
     payload: { password?: string; clientUserId?: string; deviceId?: string },
+    timeoutMs = DEFAULT_TIMEOUT_MS,
   ): Promise<{ ok: boolean; token: string; expiresAt: number }> {
-    return this.requestJson(host, port, "POST", "/api/agent/auth", { body: payload });
+    return this.requestJson(host, port, "POST", "/api/agent/auth", { body: payload, timeoutMs });
   }
 
   async listDisplays(host: string, port: number, token: string): Promise<DisplayMonitorInfo[]> {
