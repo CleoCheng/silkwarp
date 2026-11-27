@@ -39,15 +39,18 @@ import {
   type StreamLinkQuality,
 } from "./streamOptions";
 import {
-  fetchAvailableApolloApps,
+  type ApolloAppEntry,
+  cancelRemoteApolloApp,
+  fetchAvailableApolloAppEntries,
   launchRustDeskConnect,
+  probeRemoteApolloPermission,
   spawnMoonlightStreamProcess,
 } from "./streamLauncher";
 import { WindowTracker } from "./windowTracker";
 
 const RELOAD_DEBOUNCE_MS = 250;
 const PROCESS_EXIT_TIMEOUT_MS = 2000;
-const APPLIST_CACHE_TTL_MS = 60_000;
+const APPLIST_CACHE_TTL_MS = 5 * 60_000;
 /** How many finished/running transfers stay visible in the session bar. */
 const MAX_TRANSFER_TASKS = 12;
 /** Progress IPC updates are coalesced to ~10 Hz per transfer. */
@@ -101,8 +104,9 @@ export class StreamSessionManager {
   private transfers: TransferTaskItem[] = [];
   private transferEmitTimers = new Map<string, NodeJS.Timeout>();
   private transferLastEmit = new Map<string, number>();
-  private availableAppsCache = new Map<string, { apps: string[]; expiresAt: number }>();
+  private availableAppEntriesCache = new Map<string, { entries: ApolloAppEntry[]; expiresAt: number }>();
   private hostNativeResolutionCache = new Map<string, string>();
+  private recoveryBitrateCapMbps: number | null = null;
 
   constructor(
     store: StateStore,
@@ -234,6 +238,7 @@ export class StreamSessionManager {
       latencyMs: active.latencyMs,
       lossPercent: active.lossPercent,
       clientRefreshHz: this.getClientDisplayRefreshHz(active.windowRect),
+      recoveryBitrateCapMbps: this.recoveryBitrateCapMbps,
     };
   }
 
@@ -241,19 +246,46 @@ export class StreamSessionManager {
     return Boolean(this.active && (this.active.windowRect?.foreground || this.floatingBar?.isFocused()));
   }
 
-  private async getOrFetchAvailableApps(meshIp: string, apolloPort: number): Promise<string[]> {
-    const cached = this.availableAppsCache.get(meshIp);
+  private async getOrFetchAvailableAppEntries(meshIp: string, apolloPort: number): Promise<ApolloAppEntry[]> {
+    const cached = this.availableAppEntriesCache.get(meshIp);
     if (cached && Date.now() < cached.expiresAt) {
-      return cached.apps;
+      return cached.entries;
     }
-    const apps = await fetchAvailableApolloApps(meshIp, apolloPort, 1500);
-    if (apps.length > 0) {
-      this.availableAppsCache.set(meshIp, { apps, expiresAt: Date.now() + APPLIST_CACHE_TTL_MS });
+    const entries = await fetchAvailableApolloAppEntries(meshIp, apolloPort, 1500);
+    if (entries.length > 0) {
+      this.availableAppEntriesCache.set(meshIp, { entries, expiresAt: Date.now() + APPLIST_CACHE_TTL_MS });
     }
-    return apps;
+    return entries;
   }
 
-  private async performAutoReconnect(active: ActiveSessionState): Promise<void> {
+  private async cancelConflictingApolloAppIfNeeded(
+    meshIp: string,
+    apolloPort: number,
+    resolvedApp: string,
+    knownCurrentGameId?: number,
+    entries?: ApolloAppEntry[],
+    forceCancel = false,
+  ): Promise<void> {
+    if (forceCancel) {
+      await cancelRemoteApolloApp(meshIp, apolloPort, 1500).catch(() => false);
+      return;
+    }
+    let currentGameId = knownCurrentGameId;
+    if (currentGameId === undefined) {
+      const perm = await probeRemoteApolloPermission(meshIp, apolloPort, 900).catch(() => null);
+      currentGameId = perm?.currentGameId ?? 0;
+    }
+    if (!currentGameId || currentGameId <= 0) return;
+
+    const appEntries = entries ?? this.availableAppEntriesCache.get(meshIp)?.entries ?? [];
+    const targetLower = resolvedApp.trim().toLowerCase();
+    const targetEntry = appEntries.find((entry) => entry.title.trim().toLowerCase() === targetLower);
+    if (targetEntry && targetEntry.id > 0 && targetEntry.id !== currentGameId) {
+      await cancelRemoteApolloApp(meshIp, apolloPort, 1500).catch(() => false);
+    }
+  }
+
+  private async performAutoReconnect(active: ActiveSessionState, forceCancelRemote = false): Promise<void> {
     if (this.closing || this.active !== active) return;
     if (this.refreshPeersFn) {
       const peers = await this.refreshPeersFn().catch(() => []);
@@ -266,7 +298,7 @@ export class StreamSessionManager {
         active.lossPercent = parseLossPercent(peer.loss);
       }
     }
-    this.reloadChain = this.reloadChain.then(() => this.reloadCurrentStream()).catch(() => {});
+    this.reloadChain = this.reloadChain.then(() => this.reloadCurrentStream(forceCancelRemote)).catch(() => {});
     await this.reloadChain;
   }
 
@@ -282,6 +314,30 @@ export class StreamSessionManager {
     this.moonlight = child;
     this.stderrTail = [];
 
+    const streamStartedAt = Date.now();
+    let sawWindow = false;
+    let firstReadyFired = false;
+    let sawFirstVideoPacket = false;
+    let fatalVideoError = false;
+    let stabilityTimer: NodeJS.Timeout | null = null;
+
+    const fireFirstReady = () => {
+      if (firstReadyFired || this.active !== active) return;
+      firstReadyFired = true;
+      onFirstWindow?.();
+      stabilityTimer = setTimeout(() => {
+        if (this.moonlight === child && this.active === active) {
+          this.autoReconnectCount = 0;
+          if (active.reconnectAttempt || active.reconnectStatus) {
+            active.reconnectAttempt = undefined;
+            active.reconnectStatus = "";
+            this.broadcast();
+          }
+        }
+      }, 10_000);
+      stabilityTimer.unref?.();
+    };
+
     child.stderr?.on("error", () => {});
     child.stderr?.on("data", (chunk: Buffer) => {
       const lines = chunk
@@ -290,16 +346,20 @@ export class StreamSessionManager {
         .map((l) => l.trim())
         .filter(Boolean);
       if (lines.length === 0) return;
+      for (const line of lines) {
+        if (/Received first video packet|Decoded frame with POC 0\/0/i.test(line)) {
+          sawFirstVideoPacket = true;
+          fireFirstReady();
+        }
+        if (/No video received from host|fatal video encoding error|Connection terminated|The connection was terminated/i.test(line)) {
+          fatalVideoError = true;
+        }
+      }
       this.stderrTail.push(...lines);
       if (this.stderrTail.length > 10) {
         this.stderrTail.splice(0, this.stderrTail.length - 10);
       }
     });
-
-    const streamStartedAt = Date.now();
-    let sawWindow = false;
-    let firstWindowFired = false;
-    let stabilityTimer: NodeJS.Timeout | null = null;
 
     const pid = child.pid;
     if (pid) {
@@ -309,21 +369,7 @@ export class StreamSessionManager {
           onRect: (rect) => {
             if (this.active !== active) return;
             sawWindow = true;
-            if (!firstWindowFired) {
-              firstWindowFired = true;
-              onFirstWindow?.();
-              stabilityTimer = setTimeout(() => {
-                if (this.moonlight === child && this.active === active) {
-                  this.autoReconnectCount = 0;
-                  if (active.reconnectAttempt || active.reconnectStatus) {
-                    active.reconnectAttempt = undefined;
-                    active.reconnectStatus = "";
-                    this.broadcast();
-                  }
-                }
-              }, 10_000);
-              stabilityTimer.unref?.();
-            }
+            fireFirstReady();
             active.windowRect = rect;
             this.floatingBar?.updateAnchor(rect);
             this.broadcast();
@@ -351,26 +397,60 @@ export class StreamSessionManager {
       if (this.moonlight !== child) return;
       if (this.closing || this.active !== active || active.reconnecting) return;
 
-      if (code === 0 && sawWindow && Date.now() - streamStartedAt >= 4000) {
+      if (
+        code === 0 &&
+        sawWindow &&
+        sawFirstVideoPacket &&
+        !fatalVideoError &&
+        Date.now() - streamStartedAt >= 4000
+      ) {
         void this.disconnect();
         return;
       }
 
       if (this.autoReconnectCount < 3) {
         const attempt = ++this.autoReconnectCount;
+        const needVideoRecovery = !sawFirstVideoPacket || fatalVideoError;
+        let needCancelRemote = fatalVideoError;
+        if (needVideoRecovery) {
+          const currentBitrate = active.effectivePreset.bitrateMbps;
+          const stepCap = [10, 8, 6][attempt - 1] ?? 6;
+          this.recoveryBitrateCapMbps = Math.max(
+            4,
+            Math.min(stepCap, Math.max(4, currentBitrate - 2)),
+          );
+          if (
+            active.resolvedApp === "Virtual Display" &&
+            active.availableApps.some((a) => a.trim().toLowerCase() === "desktop")
+          ) {
+            const switched = normalizeStreamPreset({ ...active.preset, streamApp: "Desktop" });
+            active.preset = switched;
+            active.resolvedApp = "Desktop";
+            this.store.update({ preset: switched });
+            needCancelRemote = true;
+          }
+          active.effectivePreset = computeEffectivePreset(
+            active.preset,
+            active.routeType,
+            this.buildLinkQuality(active),
+          );
+        }
+
         this.moonlight = null;
         this.tracker?.stop();
         this.tracker = null;
         active.reconnecting = true;
         active.reconnectAttempt = attempt;
-        active.reconnectStatus = `网络波动，正在自动重连 (${attempt}/3)…`;
+        active.reconnectStatus = needVideoRecovery
+          ? `检测到画面未送达，正在切换稳定通道自动重连 (${attempt}/3)…`
+          : `网络波动，正在自动重连 (${attempt}/3)…`;
         this.broadcast();
 
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
         this.reconnectTimer = setTimeout(() => {
           this.reconnectTimer = null;
-          void this.performAutoReconnect(active);
-        }, 1000 * attempt);
+          void this.performAutoReconnect(active, needCancelRemote);
+        }, needVideoRecovery ? 400 : 1000 * attempt);
         this.reconnectTimer.unref?.();
         return;
       }
@@ -381,12 +461,38 @@ export class StreamSessionManager {
     child.on("error", () => handleUnexpectedExit(null));
   }
 
+  attachAgentContext(
+    sessionId: string,
+    agentContext: { agentConnected: boolean; agentPort: number; agentToken: string },
+  ): void {
+    const active = this.active;
+    if (this.closing || !active || active.sessionId !== sessionId) return;
+    if (!agentContext.agentConnected || !agentContext.agentToken) return;
+    this.agentPort = agentContext.agentPort || this.agentPort;
+    this.agentToken = agentContext.agentToken;
+    this.agentConnected = true;
+    active.agentConnected = true;
+    this.broadcast();
+    void this.hydrateAgentState(active, this.generation).then(() => {
+      if (this.active === active) {
+        this.broadcast();
+      }
+    });
+    this.startClipboardSync();
+  }
+
   async startSession(
     device: DeviceInfo,
     routeType: string,
     latencyMs: number | null,
     agentContext?: { agentConnected: boolean; agentPort: number; agentToken: string },
-    options?: { prefetchedApps?: string[]; onFirstWindow?: () => void; linkQuality?: StreamLinkQuality },
+    options?: {
+      prefetchedApps?: string[];
+      prefetchedAppEntries?: ApolloAppEntry[];
+      currentGameId?: number;
+      onFirstWindow?: () => void;
+      linkQuality?: StreamLinkQuality;
+    },
   ): Promise<ActiveSessionState> {
     return this.runLifecycle(() =>
       this.startSessionInternal(device, routeType, latencyMs, agentContext, options),
@@ -398,7 +504,13 @@ export class StreamSessionManager {
     routeType: string,
     latencyMs: number | null,
     agentContext?: { agentConnected: boolean; agentPort: number; agentToken: string },
-    options?: { prefetchedApps?: string[]; onFirstWindow?: () => void; linkQuality?: StreamLinkQuality },
+    options?: {
+      prefetchedApps?: string[];
+      prefetchedAppEntries?: ApolloAppEntry[];
+      currentGameId?: number;
+      onFirstWindow?: () => void;
+      linkQuality?: StreamLinkQuality;
+    },
   ): Promise<ActiveSessionState> {
     const generation = ++this.generation;
     if (this.reconnectTimer) {
@@ -406,6 +518,7 @@ export class StreamSessionManager {
       this.reconnectTimer = null;
     }
     this.autoReconnectCount = 0;
+    this.recoveryBitrateCapMbps = null;
 
     // A new session replaces the previous one without going through
     // disconnect(); tell the old host to restore mute/privacy and honour its
@@ -434,15 +547,18 @@ export class StreamSessionManager {
     }
 
     const basePreset = normalizeStreamPreset(this.store.get().preset);
-    let availableApps = options?.prefetchedApps ?? [];
-    if (availableApps.length > 0) {
-      this.availableAppsCache.set(device.mesh_ip, {
-        apps: availableApps,
+    let appEntries: ApolloAppEntry[] = options?.prefetchedAppEntries ?? [];
+    if (appEntries.length > 0) {
+      this.availableAppEntriesCache.set(device.mesh_ip, {
+        entries: appEntries,
         expiresAt: Date.now() + APPLIST_CACHE_TTL_MS,
       });
+    } else if (options?.prefetchedApps && options.prefetchedApps.length > 0) {
+      appEntries = options.prefetchedApps.map((title) => ({ title, id: 0 }));
     } else {
-      availableApps = await this.getOrFetchAvailableApps(device.mesh_ip, device.apollo_port || 47984);
+      appEntries = await this.getOrFetchAvailableAppEntries(device.mesh_ip, device.apollo_port || 47984);
     }
+    const availableApps = appEntries.map((entry) => entry.title);
     if (generation !== this.generation) {
       throw new Error("连接请求已被更新的会话取代。");
     }
@@ -485,6 +601,17 @@ export class StreamSessionManager {
     }
     const resolvedApp = resolveStreamAppTarget(preset.streamApp, availableApps);
 
+    await this.cancelConflictingApolloAppIfNeeded(
+      device.mesh_ip,
+      device.apollo_port || 47984,
+      resolvedApp,
+      options?.currentGameId,
+      appEntries,
+    );
+    if (generation !== this.generation) {
+      throw new Error("连接请求已被更新的会话取代。");
+    }
+
     const tunnelProto =
       options?.linkQuality?.tunnel && options.linkQuality.tunnel !== "-" ? options.linkQuality.tunnel : "";
     const lossPercent = options?.linkQuality?.lossPercent ?? null;
@@ -493,6 +620,7 @@ export class StreamSessionManager {
       latencyMs,
       lossPercent,
       clientRefreshHz: this.getClientDisplayRefreshHz(null),
+      recoveryBitrateCapMbps: this.recoveryBitrateCapMbps,
     };
 
     const active: ActiveSessionState = {
@@ -639,12 +767,22 @@ export class StreamSessionManager {
     const current = this.store.get().preset;
     const merged: Partial<StreamPreset> = { ...current, ...patch };
 
-    // An explicit user override raising fps above 60 disables the automatic
-    // 60fps cap unless the caller re-enables it in the same patch.
+    // An explicit user override raising fps or bitrate disables automatic
+    // WAN/relay stability caps unless the caller re-enables it in the patch.
     const raisesFps =
       typeof patch.fps === "number" && patch.fps > 60 && patch.fps > current.fps;
-    if (raisesFps && patch.adaptiveRelayCap === undefined) {
+    const raisesBitrate =
+      typeof patch.bitrateMbps === "number" && patch.bitrateMbps > current.bitrateMbps;
+    if ((raisesFps || raisesBitrate) && patch.adaptiveRelayCap === undefined) {
       merged.adaptiveRelayCap = false;
+    }
+    if (
+      patch.bitrateMbps !== undefined ||
+      patch.fps !== undefined ||
+      patch.streamApp !== undefined ||
+      patch.codec !== undefined
+    ) {
+      this.recoveryBitrateCapMbps = null;
     }
 
     const preset = normalizeStreamPreset(merged);
@@ -673,7 +811,7 @@ export class StreamSessionManager {
     this.reloadTimer.unref?.();
   }
 
-  private async reloadCurrentStream(): Promise<void> {
+  private async reloadCurrentStream(forceCancelRemote = false): Promise<void> {
     const active = this.active;
     if (!active) return;
     const generation = this.generation;
@@ -684,14 +822,30 @@ export class StreamSessionManager {
     await this.stopCurrentProcess();
     if (generation !== this.generation || this.active !== active) return;
 
-    const availableApps =
+    const appEntries =
       active.availableApps.length > 0
-        ? active.availableApps
-        : await this.getOrFetchAvailableApps(active.device.mesh_ip, active.device.apollo_port || 47984);
+        ? this.availableAppEntriesCache.get(active.device.mesh_ip)?.entries ??
+          active.availableApps.map((title) => ({ title, id: 0 }))
+        : await this.getOrFetchAvailableAppEntries(
+            active.device.mesh_ip,
+            active.device.apollo_port || 47984,
+          );
     if (generation !== this.generation || this.active !== active) return;
 
+    const availableApps = appEntries.map((entry) => entry.title);
     active.availableApps = availableApps;
     active.resolvedApp = resolveStreamAppTarget(active.preset.streamApp, availableApps);
+
+    await this.cancelConflictingApolloAppIfNeeded(
+      active.device.mesh_ip,
+      active.device.apollo_port || 47984,
+      active.resolvedApp,
+      undefined,
+      appEntries,
+      forceCancelRemote,
+    );
+    if (generation !== this.generation || this.active !== active) return;
+
     active.effectivePreset = computeEffectivePreset(active.preset, active.routeType, this.buildLinkQuality(active));
 
     try {
@@ -1012,7 +1166,7 @@ export class StreamSessionManager {
       const preset = normalizeStreamPreset({ ...active.preset, streamApp: nextStreamApp });
       this.store.update({ preset });
       active.preset = preset;
-      active.effectivePreset = computeEffectivePreset(preset, active.routeType);
+      active.effectivePreset = computeEffectivePreset(preset, active.routeType, this.buildLinkQuality(active));
     }
 
     this.broadcast();
@@ -1043,7 +1197,7 @@ export class StreamSessionManager {
       const preset = normalizeStreamPreset({ ...this.store.get().preset, muteHostAudio: active.hostMuted });
       this.store.update({ preset });
       active.preset = preset;
-      active.effectivePreset = computeEffectivePreset(preset, active.routeType);
+      active.effectivePreset = computeEffectivePreset(preset, active.routeType, this.buildLinkQuality(active));
       this.broadcast();
       return active;
     }
@@ -1297,6 +1451,7 @@ export class StreamSessionManager {
         this.reconnectTimer = null;
       }
       this.autoReconnectCount = 0;
+      this.recoveryBitrateCapMbps = null;
       this.stderrTail = [];
 
       const closingSession = this.active;

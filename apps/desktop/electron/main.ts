@@ -49,7 +49,8 @@ import { StateStore } from "./services/store";
 import { StreamSessionManager } from "./services/streamSessionManager";
 import { normalizeStreamPreset, parseLossPercent, type StreamLinkQuality } from "./services/streamOptions";
 import {
-  fetchAvailableApolloApps,
+  type ApolloAppEntry,
+  fetchAvailableApolloAppEntries,
   isMoonlightHostPaired,
   launchMoonlightGui,
   launchRustDeskConnect,
@@ -1609,8 +1610,64 @@ function deniedResult(result: Extract<AgentSessionResult, { ok: false }>): Conne
 }
 
 function clearConnectProgressSoon(): void {
-  const timer = setTimeout(() => emitConnectProgress(null), 2500);
+  const timer = setTimeout(() => emitConnectProgress(null), 4500);
   timer.unref?.();
+}
+
+async function prepareConnectPreflight(
+  device: DeviceInfo,
+  opts?: { password?: string; rememberPassword?: boolean },
+): Promise<{
+  permInfo: { paired: boolean; permission: number | null; hasInput: boolean; currentGameId: number } | null;
+  appEntries: ApolloAppEntry[];
+  settledAgent: AgentSessionResult | null;
+  agentPromise: Promise<AgentSessionResult>;
+}> {
+  const primaryPort = device.apollo_port || 47984;
+  let settledAgent: AgentSessionResult | null = null;
+  const agentPromise = ensureRemoteAgentSession(device, opts).then((res) => {
+    settledAgent = res;
+    return res;
+  });
+
+  const [permInfo, appEntries] = await Promise.all([
+    probeRemoteApolloPermission(device.mesh_ip, primaryPort, 1800),
+    fetchAvailableApolloAppEntries(device.mesh_ip, primaryPort, 1800),
+  ]);
+
+  if (!settledAgent) {
+    if (device.has_access_password) {
+      settledAgent = await agentPromise;
+    } else {
+      // Give fast passwordless agents a 60ms micro-window without blocking stream start.
+      await Promise.race([
+        agentPromise,
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, 60);
+          timer.unref?.();
+        }),
+      ]);
+    }
+  }
+
+  return { permInfo, appEntries, settledAgent, agentPromise };
+}
+
+function wireDeferredAgentAttachment(
+  session: ActiveSessionState,
+  settledAgent: AgentSessionResult | null,
+  agentPromise: Promise<AgentSessionResult>,
+): void {
+  if (settledAgent) return;
+  void agentPromise.then((late) => {
+    if (late.ok && late.agentConnected && late.token) {
+      sessionManager.attachAgentContext(session.sessionId, {
+        agentConnected: true,
+        agentPort: late.port,
+        agentToken: late.token,
+      });
+    }
+  });
 }
 
 ipcMain.handle(
@@ -1635,22 +1692,25 @@ ipcMain.handle(
 
     try {
       const primaryPort = device.apollo_port || 47984;
-      const [agentSession, permInfo, applist] = await Promise.all([
-        ensureRemoteAgentSession(device, opts),
-        probeRemoteApolloPermission(device.mesh_ip, primaryPort, 1800),
-        fetchAvailableApolloApps(device.mesh_ip, primaryPort, 1800),
-      ]);
+      const { permInfo, appEntries, settledAgent, agentPromise } = await prepareConnectPreflight(device, opts);
 
-      if (!agentSession.ok) {
+      if (settledAgent && !settledAgent.ok) {
         emitConnectProgress(null);
-        return deniedResult(agentSession);
+        return deniedResult(settledAgent);
       }
 
-      const agentContext = {
-        agentConnected: agentSession.agentConnected,
-        agentPort: agentSession.port,
-        agentToken: agentSession.token,
-      };
+      const agentContext =
+        settledAgent && settledAgent.ok
+          ? {
+              agentConnected: settledAgent.agentConnected,
+              agentPort: settledAgent.port,
+              agentToken: settledAgent.token,
+            }
+          : {
+              agentConnected: false,
+              agentPort: device.agent_port || DEFAULT_AGENT_PORT,
+              agentToken: "",
+            };
 
       // Fast-path: already paired with local client certificate — start stream right away.
       if (permInfo?.paired) {
@@ -1670,17 +1730,19 @@ ipcMain.handle(
           routeType: liveLink.routeType,
           latencyMs: liveLink.latencyMs,
         });
-        await sessionManager.startSession(
+        const session = await sessionManager.startSession(
           device,
           liveLink.routeType,
           liveLink.latencyMs,
           agentContext,
           {
-            prefetchedApps: applist,
+            prefetchedAppEntries: appEntries,
+            currentGameId: permInfo.currentGameId,
             onFirstWindow: () => emitConnectProgress(null),
             linkQuality: liveLink.linkQuality,
           },
         );
+        wireDeferredAgentAttachment(session, settledAgent, agentPromise);
         clearConnectProgressSoon();
         return { ok: true, stage: "streaming", message: `已连接「${device.name}」` };
       }
@@ -1728,17 +1790,18 @@ ipcMain.handle(
           routeType: liveLink.routeType,
           latencyMs: liveLink.latencyMs,
         });
-        await sessionManager.startSession(
+        const session = await sessionManager.startSession(
           device,
           liveLink.routeType,
           liveLink.latencyMs,
           agentContext,
           {
-            prefetchedApps: applist,
+            prefetchedAppEntries: appEntries,
             onFirstWindow: () => emitConnectProgress(null),
             linkQuality: liveLink.linkQuality,
           },
         );
+        wireDeferredAgentAttachment(session, settledAgent, agentPromise);
         clearConnectProgressSoon();
         return { ok: true, stage: "streaming", message: `已连接「${device.name}」` };
       }
@@ -1798,7 +1861,7 @@ ipcMain.handle(
               routeType: liveLink.routeType,
               latencyMs: liveLink.latencyMs,
             });
-            await sessionManager.startSession(
+            const session = await sessionManager.startSession(
               device,
               liveLink.routeType,
               liveLink.latencyMs,
@@ -1808,6 +1871,7 @@ ipcMain.handle(
                 linkQuality: liveLink.linkQuality,
               },
             );
+            wireDeferredAgentAttachment(session, settledAgent, agentPromise);
             clearConnectProgressSoon();
             return { ok: true, stage: "connected", message: `已成功连接「${device.name}」桌面` };
           }
@@ -1846,15 +1910,11 @@ ipcMain.handle(
 
     try {
       const primaryPort = device.apollo_port || 47984;
-      const [agentSession, permInfo, applist] = await Promise.all([
-        ensureRemoteAgentSession(device, opts),
-        probeRemoteApolloPermission(device.mesh_ip, primaryPort, 1800),
-        fetchAvailableApolloApps(device.mesh_ip, primaryPort, 1800),
-      ]);
+      const { permInfo, appEntries, settledAgent, agentPromise } = await prepareConnectPreflight(device, opts);
 
-      if (!agentSession.ok) {
+      if (settledAgent && !settledAgent.ok) {
         emitConnectProgress(null);
-        return deniedResult(agentSession);
+        return deniedResult(settledAgent);
       }
 
       if (!permInfo?.paired) {
@@ -1887,21 +1947,32 @@ ipcMain.handle(
         latencyMs: liveLink.latencyMs,
       });
 
-      await sessionManager.startSession(
+      const agentContext =
+        settledAgent && settledAgent.ok
+          ? {
+              agentConnected: settledAgent.agentConnected,
+              agentPort: settledAgent.port,
+              agentToken: settledAgent.token,
+            }
+          : {
+              agentConnected: false,
+              agentPort: device.agent_port || DEFAULT_AGENT_PORT,
+              agentToken: "",
+            };
+
+      const session = await sessionManager.startSession(
         device,
         liveLink.routeType,
         liveLink.latencyMs,
+        agentContext,
         {
-          agentConnected: agentSession.agentConnected,
-          agentPort: agentSession.port,
-          agentToken: agentSession.token,
-        },
-        {
-          prefetchedApps: applist,
+          prefetchedAppEntries: appEntries,
+          currentGameId: permInfo?.currentGameId,
           onFirstWindow: () => emitConnectProgress(null),
           linkQuality: liveLink.linkQuality,
         },
       );
+      wireDeferredAgentAttachment(session, settledAgent, agentPromise);
       clearConnectProgressSoon();
       return {
         ok: true,

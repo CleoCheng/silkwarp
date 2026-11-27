@@ -134,10 +134,10 @@ ipv4 = "${SILKWARP_RELAY_MESH_IP}/24"
 dhcp = false
 
 listeners = [
-    "tcp://0.0.0.0:${SILKWARP_EASYTIER_RELAY_PORT}",
     "udp://0.0.0.0:${SILKWARP_EASYTIER_RELAY_PORT}",
-    "tcp://[::]:${SILKWARP_EASYTIER_RELAY_PORT}",
     "udp://[::]:${SILKWARP_EASYTIER_RELAY_PORT}",
+    "tcp://0.0.0.0:${SILKWARP_EASYTIER_RELAY_PORT}",
+    "tcp://[::]:${SILKWARP_EASYTIER_RELAY_PORT}",
 ]
 
 rpc_portal = "127.0.0.1:15888"
@@ -153,12 +153,15 @@ network_name = "${SILKWARP_NETWORK_NAME}"
 network_secret = "${SILKWARP_NETWORK_SECRET}"
 
 [flags]
+default_protocol = "udp"
 relay_network_whitelist = "${SILKWARP_NETWORK_NAME}"
 relay_all_peer_rpc = false
 multi_thread = true
-latency_first = true
+multi_thread_count = 4
+latency_first = false
 enable_ipv6 = true
 enable_encryption = true
+disable_tcp_hole_punching = true
 EOF
 chmod 600 "${ET_DIR}/config.toml"
 

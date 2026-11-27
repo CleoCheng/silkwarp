@@ -75,7 +75,7 @@ export async function checkIsElevated(): Promise<boolean> {
 async function probeApolloHttps(port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const req = https.request(
-      { hostname: "127.0.0.1", port, path: "/", method: "GET", rejectUnauthorized: false, timeout: 1500 },
+      { hostname: "127.0.0.1", port, path: "/", method: "GET", rejectUnauthorized: false, agent: false, timeout: 1500 },
       (res) => {
         res.resume();
         resolve((res.statusCode ?? 0) > 0);
@@ -85,6 +85,43 @@ async function probeApolloHttps(port: number): Promise<boolean> {
     req.on("timeout", () => {
       req.destroy();
       resolve(false);
+    });
+    req.end();
+  });
+}
+
+async function probeLocalApolloBusy(httpsPort = 47984): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (busy: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(busy);
+    };
+    const req = https.request(
+      {
+        hostname: "127.0.0.1",
+        port: httpsPort,
+        path: "/serverinfo",
+        method: "GET",
+        rejectUnauthorized: false,
+        agent: false,
+        timeout: 1500,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf-8");
+          finish(/SUNSHINE_SERVER_BUSY/i.test(text));
+        });
+        res.on("error", () => finish(false));
+      },
+    );
+    req.on("error", () => finish(false));
+    req.on("timeout", () => {
+      req.destroy();
+      finish(false);
     });
     req.end();
   });
@@ -644,6 +681,7 @@ function apolloRequest(
         path: apiPath,
         method,
         rejectUnauthorized: false,
+        agent: false,
         timeout: 4000,
         headers,
       },
@@ -1211,6 +1249,12 @@ export async function ensureApolloStreamingTuning(
 
   const writeRes = await apolloAuthedRequest(port, "POST", "/api/config", apolloUser, apolloPass, patch.nextConfig);
   const ok = writeRes.statusCode >= 200 && writeRes.statusCode < 300;
+  if (ok && patch.changed) {
+    const busy = await probeLocalApolloBusy(47984).catch(() => false);
+    if (!busy) {
+      await apolloAuthedRequest(port, "POST", "/api/restart", apolloUser, apolloPass).catch(() => null);
+    }
+  }
   return {
     ok,
     updated: ok,

@@ -12,24 +12,25 @@ export const APOLLO_READONLY_CONFIG_KEYS = [
   "platform",
   "has_session",
   "login_pin",
+  "vdisplayStatus",
 ] as const;
 
 /**
  * Lossless low-latency WAN streaming defaults applied to SilkWarp Apollo hosts:
- * - `fec_percentage: 10`: halves 20% redundant burst traffic per frame over WAN
+ * - `fec_percentage: 20`: preserves full FEC redundancy to recover WAN UDP burst drops
  * - `lan_encryption_mode: 0`: avoids double AES-GCM encryption over EasyTier's encrypted mesh
- * - `qsv_preset: "veryfast"`: cuts Intel Iris Xe / Arc encode latency at 2K/4K
+ * - `qsv_preset: "medium"`: keeps full visual quality on Intel QuickSync without "veryfast" degradation
  * - `minimum_fps_target: 0`: automatic VFR so static desktop views don't flood uplink
  * - `hevc_mode: 0`: auto-enable hardware HEVC
- * - `ping_timeout: 15000`: tolerates brief WAN jitter without spurious disconnect
+ * - `ping_timeout: 20000`: tolerates WAN jitter without spurious disconnect popups
  */
 export const SILKWARP_APOLLO_TUNING = {
-  fec_percentage: 10,
+  fec_percentage: 20,
   lan_encryption_mode: 0,
-  qsv_preset: "veryfast",
+  qsv_preset: "medium",
   minimum_fps_target: 0,
   hevc_mode: 0,
-  ping_timeout: 15000,
+  ping_timeout: 20000,
 } as const;
 
 export interface ApolloConfigPatchResult {

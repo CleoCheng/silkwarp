@@ -39,6 +39,7 @@ export interface StreamLinkQuality {
   latencyMs?: number | null;
   lossPercent?: number | null;
   clientRefreshHz?: number | null;
+  recoveryBitrateCapMbps?: number | null;
 }
 
 export function parseLossPercent(raw?: string | null): number | null {
@@ -227,9 +228,13 @@ export function resolveTargetResolution(
   if (mode === "follow_client") {
     const cs = ctx.clientSize;
     if (cs && Number.isFinite(cs.width) && cs.width > 0 && Number.isFinite(cs.height) && cs.height > 0) {
+      const normalizedClient = normalizeWindowResolution(cs.width, cs.height);
+      const native = pickHostNativeDisplay(ctx.hostDisplays ?? [], ctx.selectedDisplayId);
+      const hostMatchesClient =
+        native !== null && normalizeWindowResolution(native.width, native.height) === normalizedClient;
       return {
-        resolution: normalizeWindowResolution(cs.width, cs.height),
-        streamApp: preferVirtual(),
+        resolution: normalizedClient,
+        streamApp: hostMatchesClient ? "Desktop" : preferVirtual(),
       };
     }
     return { resolution: fallbackResolution, streamApp: preferVirtual() };
@@ -293,35 +298,58 @@ export function resolvePacketSize(
 }
 
 /**
- * Applies lossless frame-rate matching without ever downgrading resolution or
- * bitrate: only trims wasted >60 FPS when the client display is <=65 Hz or the
- * path runs over a relay / TCP fallback.
+ * Computes effective stream bitrate/FPS while NEVER downgrading resolution:
+ * - Applies emergency `recoveryBitrateCapMbps` if provided after black-screen retry
+ * - Respects `adaptiveRelayCap: false` for all passive WAN/relay caps
+ * - Trims >60 FPS when display <=65 Hz or on relay / TCP fallback
+ * - Caps WAN relay / TCP / lossy bitrate (10/12/18 Mbps for 1080p/2K/4K, scaled
+ *   by 0.75 on >=2% loss) so home upload pipes never drop 2K keyframes.
  */
 export function computeEffectivePreset(
   preset: StreamPreset,
   routeType: string,
   link?: StreamLinkQuality | null,
 ): StreamPreset {
+  let bitrateMbps = preset.bitrateMbps;
+  if (typeof link?.recoveryBitrateCapMbps === "number" && Number.isFinite(link.recoveryBitrateCapMbps)) {
+    const recoveryCap = clampBitrate(link.recoveryBitrateCapMbps);
+    bitrateMbps = Math.min(bitrateMbps, recoveryCap);
+  }
+
   if (!preset.adaptiveRelayCap) {
-    return { ...preset };
+    return {
+      ...preset,
+      bitrateMbps,
+    };
   }
 
   const tcpOnly = isTcpOnlyTunnel(link?.tunnel);
   const isRelay = routeType.trim().toLowerCase().startsWith("relay");
+  const loss = typeof link?.lossPercent === "number" && Number.isFinite(link.lossPercent) ? link.lossPercent : 0;
   const refresh60Only =
     typeof link?.clientRefreshHz === "number" &&
     Number.isFinite(link.clientRefreshHz) &&
     link.clientRefreshHz > 0 &&
     link.clientRefreshHz <= 65;
 
-  if ((refresh60Only || isRelay || tcpOnly) && preset.fps > 60) {
-    return {
-      ...preset,
-      fps: 60,
-    };
+  const fps: StreamPreset["fps"] =
+    (refresh60Only || isRelay || tcpOnly) && preset.fps > 60 ? 60 : preset.fps;
+
+  if (isRelay || tcpOnly || loss >= 2) {
+    const m = /^(\d{3,4})x(\d{3,4})$/.exec(preset.resolution);
+    const pixels = m ? Number(m[1]) * Number(m[2]) : 2560 * 1440;
+    let ceiling = pixels <= 1920 * 1080 ? 10 : pixels <= 2560 * 1440 ? 12 : 18;
+    if (loss >= 2) {
+      ceiling = Math.max(pixels <= 1920 * 1080 ? 6 : 8, Math.round(ceiling * 0.75));
+    }
+    bitrateMbps = Math.min(bitrateMbps, ceiling);
   }
 
-  return { ...preset };
+  return {
+    ...preset,
+    fps,
+    bitrateMbps,
+  };
 }
 
 /**

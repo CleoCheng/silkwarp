@@ -6,9 +6,18 @@ import net from "node:net";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { BootstrapConfig, DeviceInfo, StreamAppTarget, StreamPreset } from "../types";
-import { parseApolloServerInfoPermission, parseMoonlightIniCredentials } from "./apolloPermissions";
+import {
+  type ApolloAppEntry,
+  parseApolloAppEntries,
+  parseApolloCurrentGameId,
+  parseApolloServerInfoPermission,
+  parseMoonlightIniCredentials,
+} from "./apolloPermissions";
 import { configureRustDeskClient, findRustDeskExe } from "./hostManager";
+import { optimizeMoonlightIni } from "./moonlightIni";
 import { buildMoonlightSpawnEnv, buildMoonlightStreamArgs, type StreamLinkQuality } from "./streamOptions";
+
+export type { ApolloAppEntry };
 
 const execFileAsync = promisify(execFile);
 
@@ -42,14 +51,38 @@ export function resolveMoonlightExe(): string | null {
   return null;
 }
 
+function getMoonlightIniPath(): string | null {
+  const exe = resolveMoonlightExe();
+  if (!exe) return null;
+  return path.join(path.dirname(exe), "Moonlight Game Streaming Project", "Moonlight.ini");
+}
+
+/**
+ * Ensures portable `Moonlight.ini` disables slow launch warning delays, STUN
+ * timeouts, and background mDNS scanning without touching certs or hosts.
+ */
+export function ensureOptimizedMoonlightIni(): boolean {
+  const iniPath = getMoonlightIniPath();
+  if (!iniPath) return false;
+  try {
+    if (!fs.existsSync(iniPath)) return false;
+    const raw = fs.readFileSync(iniPath, "utf-8");
+    const next = optimizeMoonlightIni(raw);
+    if (!next.changed) return false;
+    fs.writeFileSync(iniPath, next.content, "utf-8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Reads the local Moonlight client certificate/key pair from the portable
  * Moonlight.ini. Returns `null` when the exe or the ini is missing.
  */
 function readLocalMoonlightCredentials(): ReturnType<typeof parseMoonlightIniCredentials> {
-  const exe = resolveMoonlightExe();
-  if (!exe) return null;
-  const iniPath = path.join(path.dirname(exe), "Moonlight Game Streaming Project", "Moonlight.ini");
+  const iniPath = getMoonlightIniPath();
+  if (!iniPath) return null;
   try {
     if (!fs.existsSync(iniPath)) return null;
     return parseMoonlightIniCredentials(fs.readFileSync(iniPath, "utf-8"));
@@ -58,26 +91,18 @@ function readLocalMoonlightCredentials(): ReturnType<typeof parseMoonlightIniCre
   }
 }
 
-/**
- * Queries the remote Apollo/Sunshine `/serverinfo` endpoint using the local
- * Moonlight client certificate to learn whether this client is paired and
- * whether it has been granted mouse + keyboard input permissions.
- *
- * Fail-open: any timeout, network error, missing credentials or non-200
- * response returns `null` so that a healthy paired stream is never blocked by
- * a flaky probe.
- */
-export async function probeRemoteApolloPermission(
-  meshIp: string,
-  httpsPort = 47984,
-  timeoutMs = 2500,
-): Promise<{ paired: boolean; permission: number | null; hasInput: boolean } | null> {
-  const creds = readLocalMoonlightCredentials();
-  if (!creds) return null;
+type MoonlightCreds = NonNullable<ReturnType<typeof parseMoonlightIniCredentials>>;
 
+function apolloHttpsGet(
+  meshIp: string,
+  httpsPort: number,
+  reqPath: string,
+  creds: MoonlightCreds,
+  timeoutMs: number,
+): Promise<{ statusCode: number; body: string } | null> {
   return new Promise((resolve) => {
     let settled = false;
-    const finish = (result: { paired: boolean; permission: number | null; hasInput: boolean } | null) => {
+    const finish = (result: { statusCode: number; body: string } | null) => {
       if (settled) return;
       settled = true;
       resolve(result);
@@ -87,27 +112,19 @@ export async function probeRemoteApolloPermission(
       {
         hostname: meshIp,
         port: httpsPort,
-        path: `/serverinfo?uniqueid=${encodeURIComponent(creds.uniqueId)}`,
+        path: reqPath,
         method: "GET",
         cert: creds.cert,
         key: creds.key,
         rejectUnauthorized: false,
+        agent: false,
         timeout: timeoutMs,
       },
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (c: Buffer) => chunks.push(c));
         res.on("end", () => {
-          if (res.statusCode !== 200) {
-            finish(null);
-            return;
-          }
-          const body = Buffer.concat(chunks).toString("utf-8");
-          try {
-            finish(parseApolloServerInfoPermission(body));
-          } catch {
-            finish(null);
-          }
+          finish({ statusCode: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf-8") });
         });
         res.on("error", () => finish(null));
       },
@@ -119,6 +136,42 @@ export async function probeRemoteApolloPermission(
     });
     req.end();
   });
+}
+
+/**
+ * Queries the remote Apollo/Sunshine `/serverinfo` endpoint using the local
+ * Moonlight client certificate to learn whether this client is paired, whether
+ * it has been granted input permissions, and any currently running app ID.
+ *
+ * Fail-open: any timeout, network error, missing credentials or non-200
+ * response returns `null` so that a healthy paired stream is never blocked by
+ * a flaky probe.
+ */
+export async function probeRemoteApolloPermission(
+  meshIp: string,
+  httpsPort = 47984,
+  timeoutMs = 2500,
+): Promise<{ paired: boolean; permission: number | null; hasInput: boolean; currentGameId: number } | null> {
+  const creds = readLocalMoonlightCredentials();
+  if (!creds) return null;
+
+  const res = await apolloHttpsGet(
+    meshIp,
+    httpsPort,
+    `/serverinfo?uniqueid=${encodeURIComponent(creds.uniqueId)}`,
+    creds,
+    timeoutMs,
+  );
+  if (!res || res.statusCode !== 200) return null;
+  try {
+    const parsed = parseApolloServerInfoPermission(res.body);
+    return {
+      ...parsed,
+      currentGameId: parseApolloCurrentGameId(res.body),
+    };
+  } catch {
+    return null;
+  }
 }
 
 export async function isMoonlightHostPaired(meshIp: string): Promise<boolean> {
@@ -151,6 +204,7 @@ export function spawnSilentMoonlightPair(
       cancel: () => {},
     };
   }
+  ensureOptimizedMoonlightIni();
   const child = spawn(exe, ["--pin", pin, "pair", meshIp], {
     cwd: path.dirname(exe),
     windowsHide: true,
@@ -204,65 +258,61 @@ export function spawnSilentMoonlightPair(
 }
 
 /**
- * Enumerates the apps advertised by the remote Apollo host. Returns `[]` on any
- * failure (missing exe/ini, timeout, non-200, malformed XML) so callers can
- * fall back to `"Desktop"` without blocking a connection.
+ * Enumerates the app entries (title + numeric ID) advertised by the remote
+ * Apollo host. Returns `[]` on any failure so callers never block connection.
+ */
+export async function fetchAvailableApolloAppEntries(
+  meshIp: string,
+  httpsPort = 47984,
+  timeoutMs = 2000,
+): Promise<ApolloAppEntry[]> {
+  const creds = readLocalMoonlightCredentials();
+  if (!creds) return [];
+
+  const res = await apolloHttpsGet(
+    meshIp,
+    httpsPort,
+    `/applist?uniqueid=${encodeURIComponent(creds.uniqueId)}`,
+    creds,
+    timeoutMs,
+  );
+  if (!res || res.statusCode !== 200) return [];
+  return parseApolloAppEntries(res.body);
+}
+
+/**
+ * Enumerates the app titles advertised by the remote Apollo host. Returns `[]`
+ * on any failure so callers can fall back to `"Desktop"` without blocking.
  */
 export async function fetchAvailableApolloApps(
   meshIp: string,
   httpsPort = 47984,
   timeoutMs = 2000,
 ): Promise<string[]> {
+  const entries = await fetchAvailableApolloAppEntries(meshIp, httpsPort, timeoutMs);
+  return entries.map((e) => e.title);
+}
+
+/**
+ * Sends `/cancel` to clear an existing running Apollo app session cleanly
+ * before switching apps (e.g. `Desktop` <-> `Virtual Display`), preventing
+ * Moonlight's hidden GUI quit-confirmation prompt from stalling CLI launch.
+ */
+export async function cancelRemoteApolloApp(
+  meshIp: string,
+  httpsPort = 47984,
+  timeoutMs = 1500,
+): Promise<boolean> {
   const creds = readLocalMoonlightCredentials();
-  if (!creds) return [];
-
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (apps: string[]) => {
-      if (settled) return;
-      settled = true;
-      resolve(apps);
-    };
-
-    const req = https.request(
-      {
-        hostname: meshIp,
-        port: httpsPort,
-        path: `/applist?uniqueid=${encodeURIComponent(creds.uniqueId)}`,
-        method: "GET",
-        cert: creds.cert,
-        key: creds.key,
-        rejectUnauthorized: false,
-        timeout: timeoutMs,
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (c: Buffer) => chunks.push(c));
-        res.on("end", () => {
-          if (res.statusCode !== 200) {
-            finish([]);
-            return;
-          }
-          const body = Buffer.concat(chunks).toString("utf-8");
-          const apps: string[] = [];
-          const re = /<AppTitle>\s*([^<]+?)\s*<\/AppTitle>/gi;
-          let match: RegExpExecArray | null;
-          while ((match = re.exec(body)) !== null) {
-            const title = match[1].trim();
-            if (title) apps.push(title);
-          }
-          finish(apps);
-        });
-        res.on("error", () => finish([]));
-      },
-    );
-    req.on("error", () => finish([]));
-    req.on("timeout", () => {
-      req.destroy();
-      finish([]);
-    });
-    req.end();
-  });
+  if (!creds) return false;
+  const res = await apolloHttpsGet(
+    meshIp,
+    httpsPort,
+    `/cancel?uniqueid=${encodeURIComponent(creds.uniqueId)}`,
+    creds,
+    timeoutMs,
+  );
+  return Boolean(res && res.statusCode === 200 && !/<cancel>\s*0\s*<\/cancel>/i.test(res.body));
 }
 
 /**
@@ -281,6 +331,7 @@ export function spawnMoonlightStreamProcess(
   if (!exe) {
     throw new Error("未找到远程画面引擎，请重新安装 SilkWarp。");
   }
+  ensureOptimizedMoonlightIni();
   const args = buildMoonlightStreamArgs(meshIp, preset, routeType, resolvedApp, linkQuality);
   return spawn(exe, args, {
     cwd: path.dirname(exe),
@@ -302,6 +353,7 @@ export function launchMoonlightStream(
   if (!exe) {
     throw new Error("未找到远程画面引擎，请重新安装 SilkWarp。");
   }
+  ensureOptimizedMoonlightIni();
   const args = buildMoonlightStreamArgs(device.mesh_ip, preset, routeType, resolvedApp, linkQuality);
   const child = spawn(exe, args, {
     cwd: path.dirname(exe),

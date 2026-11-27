@@ -682,7 +682,8 @@ export function SessionBar() {
     state.lossPercent != null && state.lossPercent >= 1 ? ` · 丢包 ${state.lossPercent.toFixed(0)}%` : "";
   const isFullscreen = preset.displayMode === "fullscreen";
   const cappedByRelay =
-    preset.adaptiveRelayCap && state.effectivePreset.fps < preset.fps;
+    state.effectivePreset.bitrateMbps < preset.bitrateMbps ||
+    state.effectivePreset.fps < preset.fps;
 
   const statusDot = state.reconnecting ? (
     <span className={`h-2 w-2 rounded-full ${pulse ? "bg-amber-300" : "bg-amber-500/40"} transition-colors`} />
@@ -736,9 +737,9 @@ export function SessionBar() {
           {cappedByRelay && (
             <span
               className="rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[9px] font-bold text-amber-200"
-              title={`保持原分辨率与原码率，当前链路/显示器自动稳帧在 ${state.effectivePreset.fps}FPS`}
+              title={`保持 ${state.effectivePreset.resolution} 原分辨率，自动稳流 ${state.effectivePreset.bitrateMbps}Mbps · ${state.effectivePreset.fps}FPS（手动拉高码率/帧率可解除）`}
             >
-              原画 {state.effectivePreset.fps}FPS
+              原画稳流
             </span>
           )}
 

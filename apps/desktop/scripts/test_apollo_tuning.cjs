@@ -9,7 +9,7 @@ const {
   buildOptimalApolloConfigPatch,
 } = require("../dist-electron/services/apolloTuning.js");
 
-test("buildOptimalApolloConfigPatch: strips readonly metadata, preserves user keys, and sets lossless WAN tuning", () => {
+test("buildOptimalApolloConfigPatch: strips readonly metadata (including vdisplayStatus), preserves user keys, and repairs v3.1.2 regressions", () => {
   const raw = {
     status: 200,
     status_code: 200,
@@ -17,11 +17,12 @@ test("buildOptimalApolloConfigPatch: strips readonly metadata, preserves user ke
     platform: "windows",
     has_session: false,
     login_pin: "",
+    vdisplayStatus: "1",
     output_name: "\\\\.\\DISPLAY1",
     server_cmd: [{ name: "Bubbles", cmd: "bubbles.scr" }],
-    fec_percentage: 20,
+    fec_percentage: 10,
     lan_encryption_mode: "1",
-    qsv_preset: "medium",
+    qsv_preset: "veryfast",
     minimum_fps_target: 15,
     hevc_mode: 1,
     ping_timeout: "10000",
@@ -43,25 +44,26 @@ test("buildOptimalApolloConfigPatch: strips readonly metadata, preserves user ke
   for (const k of APOLLO_READONLY_CONFIG_KEYS) {
     assert.equal(Object.prototype.hasOwnProperty.call(patch.nextConfig, k), false, `${k} must be stripped`);
   }
+  assert.equal(Object.prototype.hasOwnProperty.call(patch.nextConfig, "vdisplayStatus"), false);
   assert.equal(patch.nextConfig.output_name, "\\\\.\\DISPLAY1");
   assert.deepEqual(patch.nextConfig.server_cmd, [{ name: "Bubbles", cmd: "bubbles.scr" }]);
 
-  assert.equal(patch.nextConfig.fec_percentage, 10);
+  assert.equal(patch.nextConfig.fec_percentage, 20);
   assert.equal(patch.nextConfig.lan_encryption_mode, "0");
-  assert.equal(patch.nextConfig.qsv_preset, "veryfast");
+  assert.equal(patch.nextConfig.qsv_preset, "medium");
   assert.equal(patch.nextConfig.minimum_fps_target, 0);
   assert.equal(patch.nextConfig.hevc_mode, 0);
-  assert.equal(patch.nextConfig.ping_timeout, "15000");
+  assert.equal(patch.nextConfig.ping_timeout, "20000");
 });
 
 test("buildOptimalApolloConfigPatch: is idempotent even when Apollo returns stringified integers", () => {
   const alreadyTuned = {
-    fec_percentage: "10",
+    fec_percentage: "20",
     lan_encryption_mode: "0",
     qsv_preset: SILKWARP_APOLLO_TUNING.qsv_preset,
     minimum_fps_target: "0",
     hevc_mode: "0",
-    ping_timeout: "15000",
+    ping_timeout: "20000",
     output_name: "",
   };
 

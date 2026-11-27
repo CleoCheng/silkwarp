@@ -86,3 +86,45 @@ export function parseApolloServerInfoPermission(xml: string): {
   const hasInput = (permission & APOLLO_REQUIRED_INPUT_PERM) === APOLLO_REQUIRED_INPUT_PERM;
   return { paired, permission, hasInput };
 }
+
+/**
+ * Extracts `<currentgame>` from Apollo's `/serverinfo` XML (`0` when idle or absent).
+ */
+export function parseApolloCurrentGameId(xml: string): number {
+  const match = xml.match(/<currentgame>\s*(\d+)\s*<\/currentgame>/i);
+  if (!match) return 0;
+  const id = Number(match[1]);
+  return Number.isSafeInteger(id) && id > 0 ? id : 0;
+}
+
+export interface ApolloAppEntry {
+  title: string;
+  id: number;
+}
+
+/**
+ * Parses `<App>` entries from Apollo's `/applist` XML preserving title and numeric app ID.
+ */
+export function parseApolloAppEntries(xml: string): ApolloAppEntry[] {
+  const entries: ApolloAppEntry[] = [];
+  const blockRe = /<App>([\s\S]*?)<\/App>/gi;
+  let blockMatch: RegExpExecArray | null;
+  while ((blockMatch = blockRe.exec(xml)) !== null) {
+    const block = blockMatch[1];
+    const titleMatch = /<AppTitle>\s*([^<]+?)\s*<\/AppTitle>/i.exec(block);
+    const title = titleMatch?.[1]?.trim();
+    if (!title) continue;
+    const idMatch = /<ID>\s*(\d+)\s*<\/ID>/i.exec(block);
+    const id = idMatch ? Number(idMatch[1]) : 0;
+    entries.push({ title, id: Number.isSafeInteger(id) && id > 0 ? id : 0 });
+  }
+  if (entries.length > 0) return entries;
+
+  const titleRe = /<AppTitle>\s*([^<]+?)\s*<\/AppTitle>/gi;
+  let titleMatch: RegExpExecArray | null;
+  while ((titleMatch = titleRe.exec(xml)) !== null) {
+    const title = titleMatch[1].trim();
+    if (title) entries.push({ title, id: 0 });
+  }
+  return entries;
+}

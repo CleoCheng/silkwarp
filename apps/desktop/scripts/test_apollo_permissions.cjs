@@ -6,6 +6,8 @@ const assert = require("node:assert/strict");
 const {
   APOLLO_PERM_ALL,
   needsApolloPermissionUpgrade,
+  parseApolloAppEntries,
+  parseApolloCurrentGameId,
   parseApolloServerInfoPermission,
   parseMoonlightIniCredentials,
 } = require("../dist-electron/services/apolloPermissions.js");
@@ -118,4 +120,24 @@ test("parseApolloServerInfoPermission: standard Sunshine without Permission tag 
     permission: null,
     hasInput: true,
   });
+});
+
+test("parseApolloCurrentGameId: extracts running app ID and falls back to 0 when idle or invalid", () => {
+  assert.equal(parseApolloCurrentGameId("<root><currentgame>881448767</currentgame></root>"), 881448767);
+  assert.equal(parseApolloCurrentGameId("<root><currentgame>0</currentgame></root>"), 0);
+  assert.equal(parseApolloCurrentGameId("<root><state>SUNSHINE_SERVER_FREE</state></root>"), 0);
+});
+
+test("parseApolloAppEntries: extracts ordered title + numeric app ID from applist XML", () => {
+  const xml = [
+    '<root status_code="200">',
+    "<App><IsHdrSupported>1</IsHdrSupported><AppTitle>Desktop</AppTitle><ID>881448767</ID></App>",
+    "<App><IsHdrSupported>1</IsHdrSupported><AppTitle>Virtual Display</AppTitle><ID>382300562</ID></App>",
+    "</root>",
+  ].join("");
+  assert.deepEqual(parseApolloAppEntries(xml), [
+    { title: "Desktop", id: 881448767 },
+    { title: "Virtual Display", id: 382300562 },
+  ]);
+  assert.deepEqual(parseApolloAppEntries("<root></root>"), []);
 });

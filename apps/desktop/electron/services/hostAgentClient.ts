@@ -90,7 +90,7 @@ function requestRaw(
     }
 
     const req = http.request(
-      { host, port, method, path, headers, timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS },
+      { host, port, method, path, headers, agent: false, timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS },
       (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
