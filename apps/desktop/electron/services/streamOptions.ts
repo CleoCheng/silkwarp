@@ -20,8 +20,8 @@ import type {
 export const DEFAULT_STREAM_PRESET: StreamPreset = {
   resolution: "2560x1440",
   resolutionMode: "follow_client",
-  fps: 120,
-  bitrateMbps: 35,
+  fps: 60,
+  bitrateMbps: 20,
   codec: "hevc",
   displayMode: "windowed",
   streamApp: "Virtual Display",
@@ -33,6 +33,40 @@ export const DEFAULT_STREAM_PRESET: StreamPreset = {
   captureSystemKeys: "fullscreen",
   packetSize: "auto",
 };
+
+export interface StreamLinkQuality {
+  tunnel?: string | null;
+  latencyMs?: number | null;
+  lossPercent?: number | null;
+  clientRefreshHz?: number | null;
+}
+
+export function parseLossPercent(raw?: string | null): number | null {
+  if (typeof raw !== "string") return null;
+  const cleaned = raw.trim().replace(/%$/, "");
+  if (!cleaned || cleaned === "-") return null;
+  const val = Number.parseFloat(cleaned);
+  return Number.isFinite(val) && val >= 0 ? val : null;
+}
+
+export function isTcpOnlyTunnel(tunnel?: string | null): boolean {
+  if (typeof tunnel !== "string") return false;
+  const t = tunnel.trim().toLowerCase();
+  if (!t || t === "-") return false;
+  return t.includes("tcp") && !t.includes("udp");
+}
+
+export function isDegradedLink(routeType: string, link?: StreamLinkQuality | null): boolean {
+  if (routeType.trim().toLowerCase().startsWith("relay")) return true;
+  if (isTcpOnlyTunnel(link?.tunnel)) return true;
+  if (typeof link?.latencyMs === "number" && Number.isFinite(link.latencyMs) && link.latencyMs >= 60) {
+    return true;
+  }
+  if (typeof link?.lossPercent === "number" && Number.isFinite(link.lossPercent) && link.lossPercent >= 1) {
+    return true;
+  }
+  return false;
+}
 
 const RESOLUTION_RE = /^\d{3,4}x\d{3,4}$/;
 const ALLOWED_FPS = [30, 60, 120, 144] as const;
@@ -231,27 +265,66 @@ export function buildMoonlightSpawnEnv(baseEnv?: NodeJS.ProcessEnv): NodeJS.Proc
 /**
  * Resolves the UDP payload size passed to Moonlight. The default 1392-byte
  * payload fragments over SilkWarp's 1360-MTU Wintun adapter, so we stay below
- * it; relay hops get an even smaller payload to absorb tunnel overhead.
+ * it; degraded/TCP/relay hops get a smaller 1024-byte payload to avoid stutter.
  */
-export function resolvePacketSize(preset: StreamPreset, routeType: string): number {
+export function resolvePacketSize(
+  preset: StreamPreset,
+  routeType: string,
+  link?: StreamLinkQuality | null,
+): number {
   if (typeof preset.packetSize === "number" && Number.isFinite(preset.packetSize)) {
     return Math.min(MAX_PACKET_SIZE, Math.max(MIN_PACKET_SIZE, Math.round(preset.packetSize)));
   }
-  return routeType.trim().toLowerCase().startsWith("relay") ? 1024 : 1200;
+  return isDegradedLink(routeType, link) ? 1024 : 1200;
 }
 
 /**
- * Applies the relay guardrail. Only the effective command-line preset is
- * clamped; the user's persisted P2P preset is never mutated.
+ * Applies the relay & link-quality guardrail. Only the effective command-line
+ * preset is clamped; the user's persisted P2P preset is never mutated.
  */
-export function computeEffectivePreset(preset: StreamPreset, routeType: string): StreamPreset {
-  if (preset.adaptiveRelayCap && routeType.trim().toLowerCase().startsWith("relay")) {
+export function computeEffectivePreset(
+  preset: StreamPreset,
+  routeType: string,
+  link?: StreamLinkQuality | null,
+): StreamPreset {
+  if (!preset.adaptiveRelayCap) {
+    return { ...preset };
+  }
+
+  const loss = typeof link?.lossPercent === "number" && Number.isFinite(link.lossPercent) ? link.lossPercent : 0;
+  const latency = typeof link?.latencyMs === "number" && Number.isFinite(link.latencyMs) ? link.latencyMs : 0;
+  const tcpOnly = isTcpOnlyTunnel(link?.tunnel);
+  const isRelay = routeType.trim().toLowerCase().startsWith("relay");
+
+  if (tcpOnly || loss >= 2 || latency >= 100) {
+    return {
+      ...preset,
+      fps: preset.fps > 60 ? 60 : preset.fps,
+      bitrateMbps: Math.min(preset.bitrateMbps, 10),
+    };
+  }
+
+  if (isRelay || latency >= 60 || loss >= 1) {
     return {
       ...preset,
       fps: preset.fps > 60 ? 60 : preset.fps,
       bitrateMbps: Math.min(preset.bitrateMbps, 15),
     };
   }
+
+  if (
+    typeof link?.clientRefreshHz === "number" &&
+    Number.isFinite(link.clientRefreshHz) &&
+    link.clientRefreshHz > 0 &&
+    link.clientRefreshHz <= 65 &&
+    preset.fps > 60
+  ) {
+    return {
+      ...preset,
+      fps: 60,
+    };
+  }
+
   return { ...preset };
 }
 
@@ -277,9 +350,11 @@ export function buildMoonlightStreamArgs(
   preset: StreamPreset,
   routeType: string,
   resolvedApp: StreamAppTarget,
+  link?: StreamLinkQuality | null,
 ): string[] {
-  const effective = computeEffectivePreset(preset, routeType);
-  const packetSize = resolvePacketSize(effective, routeType);
+  const effective = computeEffectivePreset(preset, routeType, link);
+  const packetSize = resolvePacketSize(effective, routeType, link);
+  const degraded = isDegradedLink(routeType, link);
   const codecMap: Record<StreamPreset["codec"], string> = {
     hevc: "HEVC",
     av1: "AV1",
@@ -299,6 +374,10 @@ export function buildMoonlightStreamArgs(
     String(packetSize),
     "--display-mode",
     effective.displayMode,
+    "--audio-config",
+    "stereo",
+    "--no-hdr",
+    "--keep-awake",
     "--capture-system-keys",
     effective.captureSystemKeys,
     effective.absoluteMouse ? "--absolute-mouse" : "--no-absolute-mouse",
@@ -307,7 +386,13 @@ export function buildMoonlightStreamArgs(
   ];
 
   if (effective.lowLatency) {
-    args.push("--no-vsync", "--no-frame-pacing", "--no-game-optimization", "--video-decoder", "hardware");
+    args.push(
+      "--no-vsync",
+      degraded ? "--frame-pacing" : "--no-frame-pacing",
+      "--no-game-optimization",
+      "--video-decoder",
+      "hardware",
+    );
   } else {
     args.push("--vsync", "--frame-pacing", "--video-decoder", "auto");
   }

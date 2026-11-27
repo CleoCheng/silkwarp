@@ -75,9 +75,10 @@ interface DevicesViewProps {
 }
 
 const QUICK_PRESETS: Array<{ label: string; preset: Pick<StreamPreset, "resolution" | "fps" | "bitrateMbps"> }> = [
-  { label: "流畅省流 · 1080P 60帧", preset: { resolution: "1920x1080", fps: 60, bitrateMbps: 15 } },
-  { label: "超清高刷 · 2K 120帧", preset: { resolution: "2560x1440", fps: 120, bitrateMbps: 35 } },
-  { label: "极致原画 · 4K 60帧", preset: { resolution: "3840x2160", fps: 60, bitrateMbps: 60 } },
+  { label: "流畅 · 1080P60", preset: { resolution: "1920x1080", fps: 60, bitrateMbps: 15 } },
+  { label: "均衡 · 2K60", preset: { resolution: "2560x1440", fps: 60, bitrateMbps: 20 } },
+  { label: "高刷 · 2K120", preset: { resolution: "2560x1440", fps: 120, bitrateMbps: 35 } },
+  { label: "原画 · 4K60", preset: { resolution: "3840x2160", fps: 60, bitrateMbps: 60 } },
 ];
 
 /**

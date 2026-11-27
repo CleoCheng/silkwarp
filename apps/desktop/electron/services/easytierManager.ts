@@ -38,10 +38,10 @@ export function renderEasyTierConfig(cfg: BootstrapConfig, hostname = os.hostnam
     `dhcp = false`,
     ``,
     `listeners = [`,
-    `    "tcp://0.0.0.0:0",`,
     `    "udp://0.0.0.0:0",`,
-    `    "tcp://[::]:0",`,
     `    "udp://[::]:0",`,
+    `    "tcp://0.0.0.0:0",`,
+    `    "tcp://[::]:0",`,
     `]`,
     ``,
     `rpc_portal = "127.0.0.1:15888"`,
@@ -53,10 +53,12 @@ export function renderEasyTierConfig(cfg: BootstrapConfig, hostname = os.hostnam
     ``,
     `[flags]`,
     `dev_name = "SilkWarp"`,
+    `default_protocol = "udp"`,
     `enable_exit_node = false`,
     `accept_dns = false`,
-    `latency_first = true`,
+    `latency_first = false`,
     `multi_thread = true`,
+    `multi_thread_count = 4`,
     `enable_ipv6 = true`,
     `enable_encryption = true`,
     ``,
@@ -93,6 +95,12 @@ export class EasyTierManager {
   private lastConfigContent = "";
   private lastMachineConfigContent = "";
   private machineConfigChanged = false;
+  private userConfigChanged = false;
+  private lastBootstrapCfg: BootstrapConfig | null = null;
+  private lastElevated = false;
+  private intentionallyStopped = false;
+  private crashRestartAttempts = 0;
+  private crashRestartTimer: NodeJS.Timeout | null = null;
   private status: EasyTierStatus = {
     running: false,
     externalService: false,
@@ -121,9 +129,13 @@ export class EasyTierManager {
     const etDir = path.dirname(p);
     fs.mkdirSync(etDir, { recursive: true });
     const content = renderEasyTierConfig(cfg);
+    if (!this.lastConfigContent && fs.existsSync(p)) {
+      this.lastConfigContent = fs.readFileSync(p, "utf-8");
+    }
     if (content !== this.lastConfigContent || !fs.existsSync(p)) {
       fs.writeFileSync(p, content, { encoding: "utf-8", mode: 0o600 });
       this.lastConfigContent = content;
+      this.userConfigChanged = true;
     }
     return p;
   }
@@ -182,20 +194,49 @@ export class EasyTierManager {
     }
   }
 
+  private killChildOnly(): void {
+    if (this.proc) {
+      const child = this.proc;
+      this.proc = null;
+      try {
+        child.kill();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
   async ensureStarted(cfg: BootstrapConfig, isElevated: boolean): Promise<EasyTierStatus> {
+    this.lastBootstrapCfg = cfg;
+    this.lastElevated = isElevated;
+    this.intentionallyStopped = false;
+    if (this.crashRestartTimer) {
+      clearTimeout(this.crashRestartTimer);
+      this.crashRestartTimer = null;
+    }
+
     this.status.meshIp = cfg.mesh_ip;
     const cfgPath = this.writeConfig(cfg);
+    const shouldRestartManagedChild = Boolean(this.proc && this.userConfigChanged);
+    this.userConfigChanged = false;
+
     if (isElevated && (fs.existsSync(BOOT_TUNNEL_PROGRAM_DATA_DIR) || fs.existsSync(BOOT_TUNNEL_CONFIG_PATH))) {
       this.syncMachineConfig(cfg);
     }
 
-    const livePeers = await this.probePeersRpc();
-    if (livePeers !== null) {
-      this.status.running = true;
-      this.status.externalService = !this.proc;
-      this.status.needsElevation = false;
-      this.status.error = "";
-      return this.status;
+    if (shouldRestartManagedChild) {
+      this.killChildOnly();
+      await new Promise((r) => setTimeout(r, 300));
+    } else {
+      const livePeers = await this.probePeersRpc();
+      if (livePeers !== null) {
+        this.crashRestartAttempts = 0;
+        this.status.running = true;
+        this.status.externalService = !this.proc;
+        this.status.needsElevation = false;
+        this.status.error = "";
+        return this.status;
+      }
     }
 
     if (!isElevated) {
@@ -213,17 +254,18 @@ export class EasyTierManager {
       return this.status;
     }
 
-    this.stop();
+    this.killChildOnly();
     this.status.needsElevation = false;
     this.status.error = "";
 
-    this.proc = spawn(
+    const child = spawn(
       core,
       ["-c", cfgPath, "--rpc-portal", "127.0.0.1:15888", "--rpc-portal-whitelist", "127.0.0.1,127.0.0.0/8,::1/128"],
       { cwd: dir, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
     );
+    this.proc = child;
 
-    this.proc.stderr?.on("data", (chunk: Buffer) => {
+    child.stderr?.on("data", (chunk: Buffer) => {
       const msg = chunk.toString("utf-8").trim();
       if (msg.toLowerCase().includes("access is denied") || msg.includes("拒绝访问")) {
         this.status.needsElevation = true;
@@ -231,16 +273,31 @@ export class EasyTierManager {
       }
     });
 
-    this.proc.on("exit", (code) => {
+    child.on("exit", (code) => {
+      if (this.proc !== child) return;
       this.proc = null;
       this.status.running = false;
       if (code && code !== 0 && !this.status.error) {
         this.status.error = `EasyTier 进程退出 (code=${code})`;
       }
+      if (!this.intentionallyStopped && this.lastBootstrapCfg && this.lastElevated && this.crashRestartAttempts < 3) {
+        const attempt = ++this.crashRestartAttempts;
+        const delayMs = 2000 * attempt;
+        this.crashRestartTimer = setTimeout(() => {
+          this.crashRestartTimer = null;
+          if (!this.intentionallyStopped && this.lastBootstrapCfg && this.lastElevated) {
+            void this.ensureStarted(this.lastBootstrapCfg, this.lastElevated);
+          }
+        }, delayMs);
+        this.crashRestartTimer.unref?.();
+      }
     });
 
     await new Promise((r) => setTimeout(r, 1400));
     const startedPeers = await this.probePeersRpc();
+    if (startedPeers !== null) {
+      this.crashRestartAttempts = 0;
+    }
     this.status.running = startedPeers !== null || Boolean(this.proc);
     return this.status;
   }
@@ -250,14 +307,13 @@ export class EasyTierManager {
   }
 
   stop(): void {
-    if (this.proc) {
-      try {
-        this.proc.kill();
-      } catch {
-        // ignore
-      }
-      this.proc = null;
+    this.intentionallyStopped = true;
+    this.crashRestartAttempts = 0;
+    if (this.crashRestartTimer) {
+      clearTimeout(this.crashRestartTimer);
+      this.crashRestartTimer = null;
     }
+    this.killChildOnly();
     this.status.running = false;
   }
 }

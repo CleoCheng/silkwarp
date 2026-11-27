@@ -676,11 +676,14 @@ export function SessionBar() {
   const preset = state.preset;
   const route = routeLabel(state.routeType);
   const latency = state.latencyMs != null ? `${Math.round(state.latencyMs)}ms` : "--";
+  const protoUpper = (state.tunnelProto || "").toLowerCase();
+  const protoTag = protoUpper && protoUpper !== "-" ? (protoUpper.includes("udp") ? "UDP" : "TCP") : "";
+  const lossTag =
+    state.lossPercent != null && state.lossPercent >= 1 ? ` · 丢包 ${state.lossPercent.toFixed(0)}%` : "";
   const isFullscreen = preset.displayMode === "fullscreen";
   const cappedByRelay =
     preset.adaptiveRelayCap &&
-    state.routeType.toLowerCase().startsWith("relay") &&
-    (preset.fps > 60 || preset.bitrateMbps > 15);
+    (state.effectivePreset.fps < preset.fps || state.effectivePreset.bitrateMbps < preset.bitrateMbps);
 
   const statusDot = state.reconnecting ? (
     <span className={`h-2 w-2 rounded-full ${pulse ? "bg-amber-300" : "bg-amber-500/40"} transition-colors`} />
@@ -717,7 +720,8 @@ export function SessionBar() {
           <span className="min-w-0 flex-1 truncate text-[11px] font-semibold text-slate-100">
             {state.device.name}
             <span className="ml-1.5 font-normal text-slate-400">
-              · {state.reconnecting ? "重连中" : route} {latency}
+              · {state.reconnecting ? "重连中" : `${route}${protoTag ? ` · ${protoTag}` : ""}`} {latency}
+              {lossTag}
             </span>
           </span>
 
@@ -731,8 +735,11 @@ export function SessionBar() {
           </button>
 
           {cappedByRelay && (
-            <span className="rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[9px] font-bold text-amber-200">
-              中继保护
+            <span
+              className="rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[9px] font-bold text-amber-200"
+              title={`当前已自动调整为 ${state.effectivePreset.fps}FPS / ${state.effectivePreset.bitrateMbps}Mbps 保障流畅`}
+            >
+              智能稳帧
             </span>
           )}
 
@@ -807,11 +814,13 @@ export function SessionBar() {
           {statusDot}
           <span className="text-[11px] font-bold text-slate-100">{state.device.name}</span>
           <span className="rounded-full border border-white/10 bg-white/5 px-1.5 py-0.5 text-[9px] text-slate-300">
-            {route} {latency}
+            {route}
+            {protoTag ? ` · ${protoTag}` : ""} {latency}
+            {lossTag}
           </span>
           {state.reconnecting && (
             <span className="flex items-center gap-1 rounded-full border border-amber-400/30 bg-amber-400/10 px-1.5 py-0.5 text-[9px] font-semibold text-amber-200">
-              <RefreshCw className="h-2.5 w-2.5 animate-spin" /> 正在切换画面设置…
+              <RefreshCw className="h-2.5 w-2.5 animate-spin" /> {state.reconnectStatus || "正在切换画面设置…"}
             </span>
           )}
           <div className="ml-auto flex items-center gap-1">

@@ -7,10 +7,10 @@ ipv4 = "10.144.0.10/24"
 dhcp = false
 
 listeners = [
-    "tcp://0.0.0.0:0",
     "udp://0.0.0.0:0",
-    "tcp://[::]:0",
     "udp://[::]:0",
+    "tcp://0.0.0.0:0",
+    "tcp://[::]:0",
 ]
 
 rpc_portal = "127.0.0.1:15888"
@@ -32,7 +32,10 @@ network_name = "silkwarp-team"
 network_secret = "<REPLACE_WITH_SILKWARP_NETWORK_SECRET>"
 
 [flags]
-latency_first = true
+dev_name = "SilkWarp"
+default_protocol = "udp"
+latency_first = false
 multi_thread = true
+multi_thread_count = 4
 enable_ipv6 = true
 enable_encryption = true

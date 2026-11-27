@@ -8,8 +8,11 @@ const {
   buildMoonlightSpawnEnv,
   buildMoonlightStreamArgs,
   computeEffectivePreset,
+  isDegradedLink,
+  isTcpOnlyTunnel,
   normalizeStreamPreset,
   normalizeWindowResolution,
+  parseLossPercent,
   pickHostNativeDisplay,
   resolvePacketSize,
   resolveStreamAppTarget,
@@ -21,6 +24,8 @@ test("normalizeStreamPreset: undefined returns the full default preset", () => {
   assert.deepEqual(normalizeStreamPreset(null), DEFAULT_STREAM_PRESET);
   assert.equal(DEFAULT_STREAM_PRESET.displayMode, "windowed");
   assert.equal(DEFAULT_STREAM_PRESET.resolutionMode, "follow_client");
+  assert.equal(DEFAULT_STREAM_PRESET.fps, 60);
+  assert.equal(DEFAULT_STREAM_PRESET.bitrateMbps, 20);
   assert.equal(DEFAULT_STREAM_PRESET.muteHostAudio, true);
   assert.equal(DEFAULT_STREAM_PRESET.lowLatency, true);
   assert.equal(DEFAULT_STREAM_PRESET.streamApp, "Virtual Display");
@@ -46,10 +51,10 @@ test("normalizeStreamPreset: migrates legacy 4-field presets", () => {
 test("normalizeStreamPreset: clamps and falls back on invalid values", () => {
   assert.equal(normalizeStreamPreset({ resolution: "not-a-resolution" }).resolution, "2560x1440");
   assert.equal(normalizeStreamPreset({ resolution: "12x34" }).resolution, "2560x1440");
-  assert.equal(normalizeStreamPreset({ fps: 75 }).fps, 120);
+  assert.equal(normalizeStreamPreset({ fps: 75 }).fps, 60);
   assert.equal(normalizeStreamPreset({ bitrateMbps: 2 }).bitrateMbps, 4);
   assert.equal(normalizeStreamPreset({ bitrateMbps: 500 }).bitrateMbps, 100);
-  assert.equal(normalizeStreamPreset({ bitrateMbps: Number.NaN }).bitrateMbps, 35);
+  assert.equal(normalizeStreamPreset({ bitrateMbps: Number.NaN }).bitrateMbps, 20);
   assert.equal(normalizeStreamPreset({ codec: "vp9" }).codec, "hevc");
   assert.equal(normalizeStreamPreset({ displayMode: "picture-in-picture" }).displayMode, "windowed");
   assert.equal(normalizeStreamPreset({ streamApp: "Unknown" }).streamApp, "Virtual Display");
@@ -123,12 +128,15 @@ test("buildMoonlightStreamArgs: default low-latency windowed P2P session", () =>
   assert.equal(flagValue("--display-mode"), "windowed");
   assert.equal(flagValue("--packet-size"), "1200");
   assert.equal(flagValue("--resolution"), "2560x1440");
-  assert.equal(flagValue("--fps"), "120");
-  assert.equal(flagValue("--bitrate"), "35000");
+  assert.equal(flagValue("--fps"), "60");
+  assert.equal(flagValue("--bitrate"), "20000");
   assert.equal(flagValue("--video-codec"), "HEVC");
+  assert.equal(flagValue("--audio-config"), "stereo");
   assert.equal(flagValue("--capture-system-keys"), "fullscreen");
 
   for (const flag of [
+    "--no-hdr",
+    "--keep-awake",
     "--no-vsync",
     "--no-frame-pacing",
     "--no-game-optimization",
@@ -275,4 +283,58 @@ test("buildMoonlightSpawnEnv injects SDL3/SDL2 IME UI suppression hints", () => 
   assert.equal(env.PATH, "C:\\Windows");
   assert.equal(env.SDL_IME_SHOW_UI, "0");
   assert.equal(env.SDL_IME_IMPLEMENTED_UI, "composition,candidates");
+});
+
+test("parseLossPercent & isTcpOnlyTunnel & isDegradedLink classify link health accurately", () => {
+  assert.equal(parseLossPercent("0.0%"), 0);
+  assert.equal(parseLossPercent("2.5%"), 2.5);
+  assert.equal(parseLossPercent("-"), null);
+  assert.equal(parseLossPercent(undefined), null);
+
+  assert.equal(isTcpOnlyTunnel("tcp"), true);
+  assert.equal(isTcpOnlyTunnel("tcp,udp"), false);
+  assert.equal(isTcpOnlyTunnel("udp"), false);
+  assert.equal(isTcpOnlyTunnel("-"), false);
+
+  assert.equal(isDegradedLink("p2p", { tunnel: "udp", latencyMs: 5, lossPercent: 0 }), false);
+  assert.equal(isDegradedLink("p2p", { tunnel: "tcp", latencyMs: 2, lossPercent: 0 }), true);
+  assert.equal(isDegradedLink("p2p", { tunnel: "udp", latencyMs: 75, lossPercent: 0 }), true);
+  assert.equal(isDegradedLink("p2p", { tunnel: "udp", latencyMs: 5, lossPercent: 1.5 }), true);
+  assert.equal(isDegradedLink("relay(2)", { tunnel: "udp", latencyMs: 25, lossPercent: 0 }), true);
+});
+
+test("computeEffectivePreset & buildMoonlightStreamArgs adapt to TCP-only tunnels, jitter, and 60Hz panels", () => {
+  const highPreset = normalizeStreamPreset({ fps: 120, bitrateMbps: 35, adaptiveRelayCap: true });
+
+  const tcpCap = computeEffectivePreset(highPreset, "p2p", { tunnel: "tcp", latencyMs: 2, lossPercent: 0 });
+  assert.equal(tcpCap.fps, 60);
+  assert.equal(tcpCap.bitrateMbps, 10);
+
+  const highLatCap = computeEffectivePreset(highPreset, "p2p", { tunnel: "udp", latencyMs: 65, lossPercent: 0 });
+  assert.equal(highLatCap.fps, 60);
+  assert.equal(highLatCap.bitrateMbps, 15);
+
+  const hzCap = computeEffectivePreset(highPreset, "p2p", {
+    tunnel: "udp",
+    latencyMs: 2,
+    lossPercent: 0,
+    clientRefreshHz: 59,
+  });
+  assert.equal(hzCap.fps, 60);
+  assert.equal(hzCap.bitrateMbps, 35);
+
+  const tcpArgs = buildMoonlightStreamArgs("10.144.0.11", highPreset, "p2p", "Desktop", {
+    tunnel: "tcp",
+    latencyMs: 115,
+    lossPercent: 0,
+  });
+  const flagValue = (flag) => tcpArgs[tcpArgs.indexOf(flag) + 1];
+  assert.equal(flagValue("--packet-size"), "1024");
+  assert.equal(flagValue("--bitrate"), "10000");
+  assert.equal(flagValue("--fps"), "60");
+  assert.ok(tcpArgs.includes("--frame-pacing"));
+  assert.ok(!tcpArgs.includes("--no-frame-pacing"));
+  assert.ok(tcpArgs.includes("--no-hdr"));
+  assert.ok(tcpArgs.includes("--keep-awake"));
+  assert.equal(flagValue("--audio-config"), "stereo");
 });

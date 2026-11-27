@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import type { BootstrapConfig, DeviceInfo, StreamAppTarget, StreamPreset } from "../types";
 import { parseApolloServerInfoPermission, parseMoonlightIniCredentials } from "./apolloPermissions";
 import { configureRustDeskClient, findRustDeskExe } from "./hostManager";
-import { buildMoonlightSpawnEnv, buildMoonlightStreamArgs } from "./streamOptions";
+import { buildMoonlightSpawnEnv, buildMoonlightStreamArgs, type StreamLinkQuality } from "./streamOptions";
 
 const execFileAsync = promisify(execFile);
 
@@ -275,18 +275,19 @@ export function spawnMoonlightStreamProcess(
   preset: StreamPreset,
   routeType = "p2p",
   resolvedApp: StreamAppTarget = "Desktop",
+  linkQuality?: StreamLinkQuality | null,
 ): ChildProcess {
   const exe = resolveMoonlightExe();
   if (!exe) {
     throw new Error("未找到远程画面引擎，请重新安装 SilkWarp。");
   }
-  const args = buildMoonlightStreamArgs(meshIp, preset, routeType, resolvedApp);
+  const args = buildMoonlightStreamArgs(meshIp, preset, routeType, resolvedApp, linkQuality);
   return spawn(exe, args, {
     cwd: path.dirname(exe),
     env: buildMoonlightSpawnEnv(),
     detached: false,
     windowsHide: false,
-    stdio: "ignore",
+    stdio: ["ignore", "ignore", "pipe"],
   });
 }
 
@@ -295,12 +296,13 @@ export function launchMoonlightStream(
   preset: StreamPreset,
   routeType = "p2p",
   resolvedApp: StreamAppTarget = "Desktop",
+  linkQuality?: StreamLinkQuality | null,
 ): void {
   const exe = resolveMoonlightExe();
   if (!exe) {
     throw new Error("未找到远程画面引擎，请重新安装 SilkWarp。");
   }
-  const args = buildMoonlightStreamArgs(device.mesh_ip, preset, routeType, resolvedApp);
+  const args = buildMoonlightStreamArgs(device.mesh_ip, preset, routeType, resolvedApp, linkQuality);
   const child = spawn(exe, args, {
     cwd: path.dirname(exe),
     env: buildMoonlightSpawnEnv(),

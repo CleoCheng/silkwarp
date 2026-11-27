@@ -46,7 +46,7 @@ import {
 import { PrivacyScreenManager } from "./services/privacyScreenManager";
 import { StateStore } from "./services/store";
 import { StreamSessionManager } from "./services/streamSessionManager";
-import { normalizeStreamPreset } from "./services/streamOptions";
+import { normalizeStreamPreset, parseLossPercent, type StreamLinkQuality } from "./services/streamOptions";
 import {
   fetchAvailableApolloApps,
   isMoonlightHostPaired,
@@ -83,6 +83,7 @@ let tray: Tray | null = null;
 let isQuitting = false;
 let heartbeatTimer: NodeJS.Timeout | null = null;
 let pairPollTimer: NodeJS.Timeout | null = null;
+let sessionTelemetryTimer: NodeJS.Timeout | null = null;
 
 const store = new StateStore();
 const client = new ControlClient(
@@ -94,12 +95,60 @@ const easyTier = new EasyTierManager();
 const SESSION_FULLSCREEN_SHORTCUTS = ["CommandOrControl+Alt+F", "CommandOrControl+Alt+Return"] as const;
 let sessionShortcutsRegistered = false;
 
-const sessionManager = new StreamSessionManager(store, (sessionState: ActiveSessionState | null) => {
-  syncSessionGlobalShortcuts(Boolean(sessionState));
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send("session:stateChanged", sessionState);
+function syncSessionTelemetryLoop(active: boolean): void {
+  if (!active || isQuitting) {
+    if (sessionTelemetryTimer) {
+      clearInterval(sessionTelemetryTimer);
+      sessionTelemetryTimer = null;
+    }
+    return;
   }
-});
+  if (!sessionTelemetryTimer) {
+    sessionTelemetryTimer = setInterval(() => {
+      void easyTier
+        .refreshPeers()
+        .then((peers) => {
+          sessionManager.updateTelemetry(peers);
+        })
+        .catch(() => {});
+    }, 5_000);
+    sessionTelemetryTimer.unref?.();
+  }
+}
+
+function resolveLivePeerLink(device: DeviceInfo): {
+  routeType: string;
+  latencyMs: number | null;
+  linkQuality: StreamLinkQuality;
+} {
+  const peer = easyTier.getStatus().peers.find((p) => p.ipv4 === device.mesh_ip);
+  const routeType = peer?.cost || device.route_type || "p2p";
+  const latencyMs = peer?.latencyMs ?? device.latency_ms ?? null;
+  const tunnel = peer?.tunnel && peer.tunnel !== "-" ? peer.tunnel : undefined;
+  const lossPercent = peer ? parseLossPercent(peer.loss) : null;
+  return {
+    routeType,
+    latencyMs,
+    linkQuality: {
+      tunnel,
+      latencyMs,
+      lossPercent,
+    },
+  };
+}
+
+const sessionManager = new StreamSessionManager(
+  store,
+  (sessionState: ActiveSessionState | null) => {
+    syncSessionGlobalShortcuts(Boolean(sessionState));
+    syncSessionTelemetryLoop(Boolean(sessionState));
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("session:stateChanged", sessionState);
+    }
+  },
+  undefined,
+  { refreshPeers: () => easyTier.refreshPeers() },
+);
 
 function syncSessionGlobalShortcuts(active: boolean): void {
   if (!app.isReady()) return;
@@ -896,6 +945,7 @@ app.on("before-quit", () => {
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   pairPollStopped = true;
   stopPairPoll();
+  syncSessionTelemetryLoop(false);
   void sessionManager.disconnect();
   syncSessionGlobalShortcuts(false);
   easyTier.stop();
@@ -1394,6 +1444,7 @@ ipcMain.handle("app:relaunchAdmin", async () => {
   if (heartbeatTimer) clearInterval(heartbeatTimer);
   pairPollStopped = true;
   stopPairPoll();
+  syncSessionTelemetryLoop(false);
   void sessionManager.disconnect();
   easyTier.stop();
   tray?.destroy();
@@ -1539,6 +1590,7 @@ ipcMain.handle(
       throw new Error("本机高速传输通道尚未就绪，请先点击顶部【一键授权启用】。");
     }
 
+    const liveLink = resolveLivePeerLink(device);
     emitConnectProgress({
       deviceId: device.id,
       deviceName: device.name,
@@ -1547,8 +1599,8 @@ ipcMain.handle(
       totalSteps: 3,
       title: `正在连接 ${device.name}`,
       detail: "正在并行建立高速加密通道与安全验证…",
-      routeType: device.route_type,
-      latencyMs: device.latency_ms,
+      routeType: liveLink.routeType,
+      latencyMs: liveLink.latencyMs,
     });
 
     try {
@@ -1585,15 +1637,19 @@ ipcMain.handle(
           totalSteps: 3,
           title: `正在进入「${device.name}」桌面`,
           detail: "画面引擎准备就绪，即将显示远程桌面…",
-          routeType: device.route_type,
-          latencyMs: device.latency_ms,
+          routeType: liveLink.routeType,
+          latencyMs: liveLink.latencyMs,
         });
         await sessionManager.startSession(
           device,
-          device.route_type || "p2p",
-          device.latency_ms ?? null,
+          liveLink.routeType,
+          liveLink.latencyMs,
           agentContext,
-          { prefetchedApps: applist, onFirstWindow: () => emitConnectProgress(null) },
+          {
+            prefetchedApps: applist,
+            onFirstWindow: () => emitConnectProgress(null),
+            linkQuality: liveLink.linkQuality,
+          },
         );
         clearConnectProgressSoon();
         return { ok: true, stage: "streaming", message: `已连接「${device.name}」` };
@@ -1608,8 +1664,8 @@ ipcMain.handle(
         totalSteps: 3,
         title: `正在检测「${device.name}」连通性`,
         detail: "正在核验远程画面服务端口…",
-        routeType: device.route_type,
-        latencyMs: device.latency_ms,
+        routeType: liveLink.routeType,
+        latencyMs: liveLink.latencyMs,
       });
 
       const [okPrimary, okHttp] = await Promise.all([
@@ -1639,15 +1695,19 @@ ipcMain.handle(
           totalSteps: 3,
           title: `正在进入「${device.name}」桌面`,
           detail: "正在打开远程画面窗口…",
-          routeType: device.route_type,
-          latencyMs: device.latency_ms,
+          routeType: liveLink.routeType,
+          latencyMs: liveLink.latencyMs,
         });
         await sessionManager.startSession(
           device,
-          device.route_type || "p2p",
-          device.latency_ms ?? null,
+          liveLink.routeType,
+          liveLink.latencyMs,
           agentContext,
-          { prefetchedApps: applist, onFirstWindow: () => emitConnectProgress(null) },
+          {
+            prefetchedApps: applist,
+            onFirstWindow: () => emitConnectProgress(null),
+            linkQuality: liveLink.linkQuality,
+          },
         );
         clearConnectProgressSoon();
         return { ok: true, stage: "streaming", message: `已连接「${device.name}」` };
@@ -1661,8 +1721,8 @@ ipcMain.handle(
         totalSteps: 3,
         title: "正在完成首次安全配对",
         detail: "全自动静默交换加密凭据，无需手动输入 PIN 码…",
-        routeType: device.route_type,
-        latencyMs: device.latency_ms,
+        routeType: liveLink.routeType,
+        latencyMs: liveLink.latencyMs,
       });
 
       let lastReason = "安全配对未响应";
@@ -1705,15 +1765,18 @@ ipcMain.handle(
               totalSteps: 3,
               title: `首次配对成功，正在进入「${device.name}」`,
               detail: "即将开启远程桌面画面…",
-              routeType: device.route_type,
-              latencyMs: device.latency_ms,
+              routeType: liveLink.routeType,
+              latencyMs: liveLink.latencyMs,
             });
             await sessionManager.startSession(
               device,
-              device.route_type || "p2p",
-              device.latency_ms ?? null,
+              liveLink.routeType,
+              liveLink.latencyMs,
               agentContext,
-              { onFirstWindow: () => emitConnectProgress(null) },
+              {
+                onFirstWindow: () => emitConnectProgress(null),
+                linkQuality: liveLink.linkQuality,
+              },
             );
             clearConnectProgressSoon();
             return { ok: true, stage: "connected", message: `已成功连接「${device.name}」桌面` };
@@ -1738,6 +1801,7 @@ ipcMain.handle(
       throw new Error("本机高速传输通道尚未就绪，请先点击顶部【一键授权启用】。");
     }
 
+    const liveLink = resolveLivePeerLink(device);
     emitConnectProgress({
       deviceId: device.id,
       deviceName: device.name,
@@ -1746,8 +1810,8 @@ ipcMain.handle(
       totalSteps: 3,
       title: `正在连接 ${device.name}`,
       detail: "正在校验直连画面通道…",
-      routeType: device.route_type,
-      latencyMs: device.latency_ms,
+      routeType: liveLink.routeType,
+      latencyMs: liveLink.latencyMs,
     });
 
     try {
@@ -1789,20 +1853,24 @@ ipcMain.handle(
         totalSteps: 3,
         title: `正在打开「${device.name}」桌面`,
         detail: "画面引擎准备就绪…",
-        routeType: device.route_type,
-        latencyMs: device.latency_ms,
+        routeType: liveLink.routeType,
+        latencyMs: liveLink.latencyMs,
       });
 
       await sessionManager.startSession(
         device,
-        device.route_type || "p2p",
-        device.latency_ms ?? null,
+        liveLink.routeType,
+        liveLink.latencyMs,
         {
           agentConnected: agentSession.agentConnected,
           agentPort: agentSession.port,
           agentToken: agentSession.token,
         },
-        { prefetchedApps: applist, onFirstWindow: () => emitConnectProgress(null) },
+        {
+          prefetchedApps: applist,
+          onFirstWindow: () => emitConnectProgress(null),
+          linkQuality: liveLink.linkQuality,
+        },
       );
       clearConnectProgressSoon();
       return {

@@ -32,9 +32,11 @@ import {
   computeEffectivePreset,
   normalizeStreamPreset,
   normalizeWindowResolution,
+  parseLossPercent,
   pickHostNativeDisplay,
   resolveStreamAppTarget,
   resolveTargetResolution,
+  type StreamLinkQuality,
 } from "./streamOptions";
 import {
   fetchAvailableApolloApps,
@@ -73,6 +75,7 @@ export class StreamSessionManager {
   private readonly store: StateStore;
   private readonly onStateChange: (state: ActiveSessionState | null) => void;
   private readonly agentClient: HostAgentClient;
+  private readonly refreshPeersFn: (() => Promise<PeerStatus[]>) | null;
 
   private active: ActiveSessionState | null = null;
   private moonlight: ChildProcess | null = null;
@@ -88,7 +91,11 @@ export class StreamSessionManager {
   private generation = 0;
   private lifecycle: Promise<unknown> = Promise.resolve();
   private reloadTimer: NodeJS.Timeout | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
   private reloadChain: Promise<void> = Promise.resolve();
+  private autoReconnectCount = 0;
+  private degradedTicks = 0;
+  private stderrTail: string[] = [];
 
   private clipboardSync: ClipboardSyncManager | null = null;
   private clipboardAdapterOverride: ClipboardAdapter | null = null;
@@ -102,12 +109,13 @@ export class StreamSessionManager {
     store: StateStore,
     onStateChange: (state: ActiveSessionState | null) => void,
     agentClient = new HostAgentClient(),
-    options: { clipboardAdapter?: ClipboardAdapter } = {},
+    options: { clipboardAdapter?: ClipboardAdapter; refreshPeers?: () => Promise<PeerStatus[]> } = {},
   ) {
     this.store = store;
     this.onStateChange = onStateChange;
     this.agentClient = agentClient;
     this.clipboardAdapterOverride = options.clipboardAdapter ?? null;
+    this.refreshPeersFn = options.refreshPeers ?? null;
   }
 
   getState(): ActiveSessionState | null {
@@ -187,9 +195,8 @@ export class StreamSessionManager {
     return normalizeWindowResolution(size.width, size.height);
   }
 
-  private getClientDisplaySize(winRect: WindowRect | null): { width: number; height: number } {
+  private getClientDisplay(winRect: WindowRect | null): Electron.Display | null {
     try {
-      let disp: Electron.Display;
       if (winRect && winRect.width > 0 && winRect.height > 0) {
         const dip = screen.screenToDipRect(null, {
           x: winRect.x,
@@ -197,18 +204,38 @@ export class StreamSessionManager {
           width: winRect.width,
           height: winRect.height,
         });
-        disp = screen.getDisplayMatching(dip);
-      } else {
-        disp = screen.getPrimaryDisplay();
+        return screen.getDisplayMatching(dip);
       }
-      const scale = disp.scaleFactor || 1;
-      return {
-        width: Math.round(disp.size.width * scale),
-        height: Math.round(disp.size.height * scale),
-      };
+      return screen.getPrimaryDisplay();
     } catch {
-      return { width: 1920, height: 1080 };
+      return null;
     }
+  }
+
+  private getClientDisplaySize(winRect: WindowRect | null): { width: number; height: number } {
+    const disp = this.getClientDisplay(winRect);
+    if (!disp) return { width: 1920, height: 1080 };
+    const scale = disp.scaleFactor || 1;
+    return {
+      width: Math.round(disp.size.width * scale),
+      height: Math.round(disp.size.height * scale),
+    };
+  }
+
+  private getClientDisplayRefreshHz(winRect: WindowRect | null): number | null {
+    const disp = this.getClientDisplay(winRect);
+    if (!disp) return null;
+    const hz = (disp as Electron.Display & { displayFrequency?: number }).displayFrequency;
+    return typeof hz === "number" && Number.isFinite(hz) && hz > 0 ? hz : null;
+  }
+
+  private buildLinkQuality(active: ActiveSessionState): StreamLinkQuality {
+    return {
+      tunnel: active.tunnelProto,
+      latencyMs: active.latencyMs,
+      lossPercent: active.lossPercent,
+      clientRefreshHz: this.getClientDisplayRefreshHz(active.windowRect),
+    };
   }
 
   isSessionFocused(): boolean {
@@ -227,16 +254,53 @@ export class StreamSessionManager {
     return apps;
   }
 
+  private async performAutoReconnect(active: ActiveSessionState): Promise<void> {
+    if (this.closing || this.active !== active) return;
+    if (this.refreshPeersFn) {
+      const peers = await this.refreshPeersFn().catch(() => []);
+      if (this.closing || this.active !== active) return;
+      const peer = peers.find((p) => p.ipv4 === active.device.mesh_ip);
+      if (peer) {
+        active.routeType = peer.cost || active.routeType;
+        active.latencyMs = peer.latencyMs ?? active.latencyMs;
+        active.tunnelProto = peer.tunnel && peer.tunnel !== "-" ? peer.tunnel : active.tunnelProto;
+        active.lossPercent = parseLossPercent(peer.loss);
+      }
+    }
+    this.reloadChain = this.reloadChain.then(() => this.reloadCurrentStream()).catch(() => {});
+    await this.reloadChain;
+  }
+
   private spawnFor(active: ActiveSessionState, onFirstWindow?: () => void): void {
+    const linkQuality = this.buildLinkQuality(active);
     const child = spawnMoonlightStreamProcess(
       active.device.mesh_ip,
       active.preset,
       active.routeType,
       active.resolvedApp,
+      linkQuality,
     );
     this.moonlight = child;
+    this.stderrTail = [];
 
+    child.stderr?.on("data", (chunk: Buffer) => {
+      const lines = chunk
+        .toString("utf-8")
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+      if (lines.length === 0) return;
+      this.stderrTail.push(...lines);
+      if (this.stderrTail.length > 10) {
+        this.stderrTail.splice(0, this.stderrTail.length - 10);
+      }
+    });
+
+    const streamStartedAt = Date.now();
+    let sawWindow = false;
     let firstWindowFired = false;
+    let stabilityTimer: NodeJS.Timeout | null = null;
+
     const pid = child.pid;
     if (pid) {
       this.tracker = new WindowTracker(
@@ -244,16 +308,29 @@ export class StreamSessionManager {
         {
           onRect: (rect) => {
             if (this.active !== active) return;
+            sawWindow = true;
             if (!firstWindowFired) {
               firstWindowFired = true;
               onFirstWindow?.();
+              stabilityTimer = setTimeout(() => {
+                if (this.moonlight === child && this.active === active) {
+                  this.autoReconnectCount = 0;
+                  if (active.reconnectAttempt || active.reconnectStatus) {
+                    active.reconnectAttempt = undefined;
+                    active.reconnectStatus = "";
+                    this.broadcast();
+                  }
+                }
+              }, 10_000);
+              stabilityTimer.unref?.();
             }
             active.windowRect = rect;
             this.floatingBar?.updateAnchor(rect);
             this.broadcast();
           },
           onExit: () => {
-            if (this.closing || this.active !== active || active.reconnecting) return;
+            // Let child's exit handler own auto-reconnect vs clean user disconnect.
+            if (this.moonlight || this.closing || this.active !== active || active.reconnecting) return;
             void this.disconnect();
           },
         },
@@ -264,15 +341,44 @@ export class StreamSessionManager {
       );
     }
 
-    const handleUnexpectedExit = () => {
+    const handleUnexpectedExit = (code: number | null = null) => {
+      if (stabilityTimer) {
+        clearTimeout(stabilityTimer);
+        stabilityTimer = null;
+      }
       // A killed old process may report exit after its replacement spawned;
       // identity check keeps it from tearing down the live session.
       if (this.moonlight !== child) return;
       if (this.closing || this.active !== active || active.reconnecting) return;
+
+      if (code === 0 && sawWindow && Date.now() - streamStartedAt >= 4000) {
+        void this.disconnect();
+        return;
+      }
+
+      if (this.autoReconnectCount < 3) {
+        const attempt = ++this.autoReconnectCount;
+        this.moonlight = null;
+        this.tracker?.stop();
+        this.tracker = null;
+        active.reconnecting = true;
+        active.reconnectAttempt = attempt;
+        active.reconnectStatus = `网络波动，正在自动重连 (${attempt}/3)…`;
+        this.broadcast();
+
+        if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = setTimeout(() => {
+          this.reconnectTimer = null;
+          void this.performAutoReconnect(active);
+        }, 1000 * attempt);
+        this.reconnectTimer.unref?.();
+        return;
+      }
+
       void this.disconnect();
     };
-    child.on("exit", handleUnexpectedExit);
-    child.on("error", handleUnexpectedExit);
+    child.on("exit", (code) => handleUnexpectedExit(code));
+    child.on("error", () => handleUnexpectedExit(null));
   }
 
   async startSession(
@@ -280,7 +386,7 @@ export class StreamSessionManager {
     routeType: string,
     latencyMs: number | null,
     agentContext?: { agentConnected: boolean; agentPort: number; agentToken: string },
-    options?: { prefetchedApps?: string[]; onFirstWindow?: () => void },
+    options?: { prefetchedApps?: string[]; onFirstWindow?: () => void; linkQuality?: StreamLinkQuality },
   ): Promise<ActiveSessionState> {
     return this.runLifecycle(() =>
       this.startSessionInternal(device, routeType, latencyMs, agentContext, options),
@@ -292,9 +398,15 @@ export class StreamSessionManager {
     routeType: string,
     latencyMs: number | null,
     agentContext?: { agentConnected: boolean; agentPort: number; agentToken: string },
-    options?: { prefetchedApps?: string[]; onFirstWindow?: () => void },
+    options?: { prefetchedApps?: string[]; onFirstWindow?: () => void; linkQuality?: StreamLinkQuality },
   ): Promise<ActiveSessionState> {
     const generation = ++this.generation;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.autoReconnectCount = 0;
+    this.degradedTicks = 0;
 
     // A new session replaces the previous one without going through
     // disconnect(); tell the old host to restore mute/privacy and honour its
@@ -374,19 +486,33 @@ export class StreamSessionManager {
     }
     const resolvedApp = resolveStreamAppTarget(preset.streamApp, availableApps);
 
+    const tunnelProto =
+      options?.linkQuality?.tunnel && options.linkQuality.tunnel !== "-" ? options.linkQuality.tunnel : "";
+    const lossPercent = options?.linkQuality?.lossPercent ?? null;
+    const initialLink: StreamLinkQuality = {
+      tunnel: tunnelProto,
+      latencyMs,
+      lossPercent,
+      clientRefreshHz: this.getClientDisplayRefreshHz(null),
+    };
+
     const active: ActiveSessionState = {
       sessionId: crypto.randomUUID(),
       device,
       preset,
-      effectivePreset: computeEffectivePreset(preset, routeType),
+      effectivePreset: computeEffectivePreset(preset, routeType, initialLink),
       routeType,
       latencyMs,
+      tunnelProto,
+      lossPercent,
       resolvedApp,
       availableApps,
       clientDisplayResolution,
       hostDisplayResolution: cachedHostRes || undefined,
       windowRect: null,
       reconnecting: false,
+      reconnectAttempt: undefined,
+      reconnectStatus: "",
       startedAt: Date.now(),
       agentConnected: this.agentConnected,
       displays: [],
@@ -485,7 +611,7 @@ export class StreamSessionManager {
           });
           this.store.update({ preset: updated });
           active.preset = updated;
-          active.effectivePreset = computeEffectivePreset(updated, active.routeType);
+          active.effectivePreset = computeEffectivePreset(updated, active.routeType, this.buildLinkQuality(active));
           this.scheduleReload();
         }
       }
@@ -536,7 +662,7 @@ export class StreamSessionManager {
     }
 
     active.preset = preset;
-    active.effectivePreset = computeEffectivePreset(preset, active.routeType);
+    active.effectivePreset = computeEffectivePreset(preset, active.routeType, this.buildLinkQuality(active));
     this.broadcast();
     this.scheduleReload();
     return active;
@@ -572,7 +698,7 @@ export class StreamSessionManager {
 
     active.availableApps = availableApps;
     active.resolvedApp = resolveStreamAppTarget(active.preset.streamApp, availableApps);
-    active.effectivePreset = computeEffectivePreset(active.preset, active.routeType);
+    active.effectivePreset = computeEffectivePreset(active.preset, active.routeType, this.buildLinkQuality(active));
 
     try {
       this.spawnFor(active);
@@ -586,6 +712,8 @@ export class StreamSessionManager {
     }
 
     active.reconnecting = false;
+    active.reconnectAttempt = undefined;
+    active.reconnectStatus = "";
     this.broadcast();
   }
 
@@ -1072,7 +1200,7 @@ export class StreamSessionManager {
       const preset: StreamPreset = { ...active.preset, displayMode: nextMode };
       this.store.update({ preset });
       active.preset = preset;
-      active.effectivePreset = computeEffectivePreset(preset, active.routeType);
+      active.effectivePreset = computeEffectivePreset(preset, active.routeType, this.buildLinkQuality(active));
       this.broadcast();
       if (opts?.fromHotkey) {
         await new Promise((r) => setTimeout(r, 140));
@@ -1093,7 +1221,7 @@ export class StreamSessionManager {
       const preset: StreamPreset = { ...active.preset, showPerfOverlay: !active.preset.showPerfOverlay };
       this.store.update({ preset });
       active.preset = preset;
-      active.effectivePreset = computeEffectivePreset(preset, active.routeType);
+      active.effectivePreset = computeEffectivePreset(preset, active.routeType, this.buildLinkQuality(active));
       this.broadcast();
     }
 
@@ -1113,12 +1241,42 @@ export class StreamSessionManager {
 
     const nextRoute = peer.cost || active.routeType;
     const nextLatency = peer.latencyMs ?? null;
-    if (nextRoute === active.routeType && nextLatency === active.latencyMs) return;
+    const nextTunnel = peer.tunnel && peer.tunnel !== "-" ? peer.tunnel : active.tunnelProto || "";
+    const nextLoss = parseLossPercent(peer.loss);
+
+    const telemetryChanged =
+      nextRoute !== active.routeType ||
+      nextLatency !== active.latencyMs ||
+      nextTunnel !== (active.tunnelProto || "") ||
+      nextLoss !== (active.lossPercent ?? null);
 
     active.routeType = nextRoute;
     active.latencyMs = nextLatency;
-    active.effectivePreset = computeEffectivePreset(active.preset, nextRoute);
-    this.broadcast();
+    active.tunnelProto = nextTunnel;
+    active.lossPercent = nextLoss;
+
+    const nextEffective = computeEffectivePreset(active.preset, nextRoute, this.buildLinkQuality(active));
+    const degraded =
+      nextEffective.bitrateMbps < active.effectivePreset.bitrateMbps ||
+      nextEffective.fps < active.effectivePreset.fps;
+
+    if (degraded) {
+      this.degradedTicks += 1;
+      if (this.degradedTicks >= 2 && !active.reconnecting) {
+        this.degradedTicks = 0;
+        active.effectivePreset = nextEffective;
+        active.reconnectStatus = "链路波动，正在自动降码率保流畅…";
+        this.broadcast();
+        this.scheduleReload();
+        return;
+      }
+    } else {
+      this.degradedTicks = 0;
+    }
+
+    if (telemetryChanged) {
+      this.broadcast();
+    }
   }
 
   async switchToOfficeMode(bootstrap: BootstrapConfig): Promise<void> {
@@ -1158,6 +1316,13 @@ export class StreamSessionManager {
         clearTimeout(this.reloadTimer);
         this.reloadTimer = null;
       }
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      this.autoReconnectCount = 0;
+      this.degradedTicks = 0;
+      this.stderrTail = [];
 
       const closingSession = this.active;
       if (closingSession && this.agentConnected && this.agentToken) {

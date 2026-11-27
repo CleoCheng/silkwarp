@@ -1,5 +1,7 @@
 "use strict";
 
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
@@ -196,4 +198,13 @@ test("buildEasyTierBootTaskXml & xmlEscape: renders LocalSystem BootTrigger XML 
   assert.match(xml, /<UserId>S-1-5-18<\/UserId>/);
   assert.match(xml, /<RestartOnFailure>/);
   assert.match(xml, /-c &quot;C:\\ProgramData\\SilkWarp\\easytier\.toml&quot;/);
+});
+
+test("easytier-node.toml.example: enforces UDP-first listeners, default_protocol=udp, and latency_first=false", () => {
+  const examplePath = path.resolve(__dirname, "../../../configs/easytier-node.toml.example");
+  const text = fs.readFileSync(examplePath, "utf8");
+  assert.match(text, /default_protocol\s*=\s*"udp"/);
+  assert.match(text, /latency_first\s*=\s*false/);
+  assert.match(text, /multi_thread_count\s*=\s*4/);
+  assert.ok(text.indexOf('"udp://0.0.0.0:0"') < text.indexOf('"tcp://0.0.0.0:0"'));
 });

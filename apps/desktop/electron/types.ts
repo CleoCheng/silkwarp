@@ -119,12 +119,16 @@ export interface ActiveSessionState {
   effectivePreset: StreamPreset;
   routeType: string;
   latencyMs: number | null;
+  tunnelProto?: string;
+  lossPercent?: number | null;
   resolvedApp: StreamAppTarget;
   availableApps: string[];
   clientDisplayResolution?: string;
   hostDisplayResolution?: string;
   windowRect: WindowRect | null;
   reconnecting: boolean;
+  reconnectAttempt?: number;
+  reconnectStatus?: string;
   startedAt: number;
   agentConnected: boolean;
   displays: DisplayMonitorInfo[];
